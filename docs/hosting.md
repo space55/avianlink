@@ -163,3 +163,13 @@ routed traffic, so plain bridge networks are used.)
 interface (`sudo scripts/netem/disaster_cellular.sh eth0` on both). Each
 direction is impaired once, at its sender. The two outage schedules are
 then independent rather than shared.
+
+## 7. Acceptance results (Phase 6)
+
+| Run | Link | Result |
+|---|---|---|
+| `scripts/netem/docker-test.sh disaster_cellular 20 30` | Real `tc netem` on a router container. Two outages (28 s, 4.5 min); measured loss 34–47% | 20/20 each way received and acknowledged in 773 s. Slowest delivery 4m42s (sent into the 4.5-minute outage). 0 unauthenticated drops. |
+| `scripts/local-chat-test.sh disaster_cellular 20 1800 45` | `udp-impair`, the simulator's model in real time. About 12 minutes of outages; 63 packets lost to them | 20/20 each way in 245 s after the last send. Slowest delivery 7m38s. |
+| `cargo test -p avianlink-udp` (in-process `UdpHost` through the proxy) | `edge_2g`, and `disaster_cellular` without outages | 20 messages in 4.9 s and 9.8 s. |
+
+The two-machine setup in §6 is the same topology with physical hosts.
