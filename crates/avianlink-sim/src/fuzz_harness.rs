@@ -1,28 +1,41 @@
 //! Fuzz harnesses, shared by `fuzz/` (cargo-fuzz, nightly) and by ordinary
 //! tests so they cannot rot (`docs/decisions.md` D-019).
 //!
-//! Random bytes almost never pass the packet check, so the harness can also
-//! wrap fuzzer bytes in a correctly tagged and checked packet from a known
-//! contact. That exercises the frame, fragment and record paths behind the
-//! check.
+//! Random bytes never authenticate, so the harness can also encrypt fuzzer
+//! bytes as a genuine packet from a known contact (it holds the contact's
+//! identity). That exercises the frame, fragment and record paths behind the
+//! AEAD.
 
-use avianlink_core::wire::{self, begin_packet, seal_packet};
+use avianlink_core::crypto::PairKeys;
+use avianlink_core::wire::{self, begin_packet, header_len};
 use avianlink_core::{
-    hashes, Config, Engine, Event, LinkBudget, LinkConfig, LinkId, MemoryStorage, PublicKey,
+    Config, Engine, Event, Identity, LinkBudget, LinkConfig, LinkId, MemoryStorage, PublicKey,
     Timestamp,
 };
 use rand_chacha::ChaCha20Rng;
 
 use crate::seeded_rng;
 
-const PEER: PublicKey = PublicKey([0xa1; 32]);
-const LOCAL: PublicKey = PublicKey([0xb2; 32]);
+const PEER_SEED: [u8; 32] = [0xa1; 32];
+const LOCAL_SEED: [u8; 32] = [0xb2; 32];
+
+fn peer() -> Identity {
+    Identity::from_secret_bytes(&PEER_SEED)
+}
+
+fn local() -> Identity {
+    Identity::from_secret_bytes(&LOCAL_SEED)
+}
+
+fn local_key() -> PublicKey {
+    local().public_key()
+}
 const MTUS: [u16; 2] = [48, 1200];
 
 /// Runs every standalone parser over `data`.
 pub fn decode(data: &[u8]) {
     let _ = wire::peek_tag(data);
-    let _ = wire::split_verified(data);
+    let _ = wire::parse_header(data);
     let _ = wire::validate_frames(data);
     for f in wire::Frames::new(data) {
         if let Ok(wire::Frame::Ack(a)) = f {
@@ -46,7 +59,7 @@ pub fn decode(data: &[u8]) {
 pub fn handle_packet(data: &[u8]) {
     let mut e: Engine<MemoryStorage, ChaCha20Rng> = Engine::new(
         Config::default(),
-        LOCAL,
+        local(),
         MemoryStorage::new(),
         seeded_rng(0),
     )
@@ -59,8 +72,8 @@ pub fn handle_packet(data: &[u8]) {
         };
         e.add_link(LinkId(i as u16), link).expect("link");
     }
-    let conv = e.add_contact(PEER).expect("contact");
-    let tag = hashes::pair_tag(&PEER, &LOCAL);
+    let conv = e.add_contact(peer().public_key()).expect("contact");
+    let keys = PairKeys::derive(&peer(), &local_key()).expect("valid keys");
 
     let mut now = crate::SIM_EPOCH_MS;
     let mut counter = 0u64;
@@ -76,10 +89,11 @@ pub fn handle_packet(data: &[u8]) {
             0 => e.handle_packet(link, chunk, t),
             1 => {
                 let mut pkt = Vec::new();
-                begin_packet(&mut pkt, tag, counter);
-                counter += 1;
+                begin_packet(&mut pkt, keys.tx_tag, counter);
                 pkt.extend_from_slice(chunk);
-                seal_packet(&mut pkt, &PEER, &LOCAL);
+                keys.seal(&mut pkt, header_len(counter), counter)
+                    .expect("seal");
+                counter += 1;
                 e.handle_packet(link, &pkt, t);
             }
             2 => {
@@ -126,8 +140,8 @@ pub fn restore(data: &[u8]) {
     };
     storage.begin().expect("batch");
     if with_version {
-        let mut v = vec![1u8];
-        v.extend_from_slice(&LOCAL.0);
+        let mut v = vec![2u8];
+        v.extend_from_slice(&local_key().0);
         storage.store(b"v", &v).expect("store");
     }
     while let [klen, lo, hi, tail @ ..] = rest {
@@ -139,7 +153,7 @@ pub fn restore(data: &[u8]) {
         rest = tail;
     }
     storage.commit().expect("commit");
-    let Ok(mut e) = Engine::restore(Config::default(), LOCAL, storage, seeded_rng(0)) else {
+    let Ok(mut e) = Engine::restore(Config::default(), local(), storage, seeded_rng(0)) else {
         return;
     };
     let link = LinkConfig {
@@ -196,7 +210,7 @@ mod tests {
     fn restore_survives_mangled_real_state() {
         let mut e: Engine<MemoryStorage, ChaCha20Rng> = Engine::new(
             Config::default(),
-            LOCAL,
+            local(),
             MemoryStorage::new(),
             seeded_rng(1),
         )
@@ -207,7 +221,7 @@ mod tests {
             cost: 0,
         };
         e.add_link(LinkId(0), link).unwrap();
-        let conv = e.add_contact(PEER).unwrap();
+        let conv = e.add_contact(peer().public_key()).unwrap();
         let now = Timestamp::from_millis(crate::SIM_EPOCH_MS);
         for i in 0..5 {
             e.send_text(conv, &"y".repeat(i * 40), now).unwrap();

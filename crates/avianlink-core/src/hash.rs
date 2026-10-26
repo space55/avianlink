@@ -2,7 +2,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::wire::{put_varint, PairTag, CHECK_LEN, TAG_LEN};
+use crate::wire::put_varint;
 use crate::{ConversationId, MessageId, PublicKey};
 
 fn digest(label: &[u8], parts: &[&[u8]]) -> [u8; 32] {
@@ -18,19 +18,6 @@ fn truncate<const N: usize>(d: [u8; 32]) -> [u8; N] {
     let mut out = [0u8; N];
     out.iter_mut().zip(d).for_each(|(o, b)| *o = b);
     out
-}
-
-/// Tag on packets from `sender` to `recipient`.
-pub fn pair_tag(sender: &PublicKey, recipient: &PublicKey) -> PairTag {
-    truncate::<TAG_LEN>(digest(b"avianlink/v1/tag", &[&sender.0, &recipient.0]))
-}
-
-/// Phase 1 integrity check over a packet body.
-pub fn packet_check(sender: &PublicKey, recipient: &PublicKey, body: &[u8]) -> [u8; CHECK_LEN] {
-    truncate::<CHECK_LEN>(digest(
-        b"avianlink/v1/chk",
-        &[&sender.0, &recipient.0, body],
-    ))
 }
 
 /// The conversation between `a` and `b`; symmetric.

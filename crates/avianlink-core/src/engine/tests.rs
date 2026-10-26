@@ -1,4 +1,5 @@
 use super::*;
+use crate::crypto::PairKeys;
 use crate::{AirtimeModel, LinkBudget, MemoryStorage};
 use alloc::string::String;
 use rand_chacha::rand_core::SeedableRng;
@@ -6,8 +7,21 @@ use rand_chacha::ChaCha20Rng;
 
 type E = Engine<MemoryStorage, ChaCha20Rng>;
 
-const A: PublicKey = PublicKey([0xaa; 32]);
-const B: PublicKey = PublicKey([0xbb; 32]);
+/// Identity seeds of the two test peers.
+const A: u8 = 0xaa;
+const B: u8 = 0xbb;
+
+fn id(who: u8) -> Identity {
+    Identity::from_secret_bytes(&[who; 32])
+}
+
+fn pk(who: u8) -> PublicKey {
+    id(who).public_key()
+}
+
+fn who(key: PublicKey) -> u8 {
+    [A, B, 0xcc].into_iter().find(|&w| pk(w) == key).unwrap()
+}
 const L: LinkId = LinkId(0);
 
 fn link(mtu: u16) -> LinkConfig {
@@ -18,26 +32,26 @@ fn link(mtu: u16) -> LinkConfig {
     }
 }
 
-fn rng(key: PublicKey) -> ChaCha20Rng {
-    ChaCha20Rng::seed_from_u64(u64::from(key.0[0]))
+fn rng(who: u8) -> ChaCha20Rng {
+    ChaCha20Rng::seed_from_u64(u64::from(who))
 }
 
-fn engine_with(cfg: Config, key: PublicKey, peer: PublicKey, mtu: u16) -> (E, ConversationId) {
-    let mut e = Engine::new(cfg, key, MemoryStorage::new(), rng(key)).unwrap();
+fn engine_with(cfg: Config, key: u8, peer: u8, mtu: u16) -> (E, ConversationId) {
+    let mut e = Engine::new(cfg, id(key), MemoryStorage::new(), rng(key)).unwrap();
     e.add_link(L, link(mtu)).unwrap();
-    let conv = e.add_contact(peer).unwrap();
+    let conv = e.add_contact(pk(peer)).unwrap();
     (e, conv)
 }
 
-fn engine(key: PublicKey, peer: PublicKey, mtu: u16) -> (E, ConversationId) {
+fn engine(key: u8, peer: u8, mtu: u16) -> (E, ConversationId) {
     engine_with(Config::default(), key, peer, mtu)
 }
 
 /// Simulates a crash: rebuild from what storage had committed.
 fn crash_and_restore(e: &E, mtu: u16) -> E {
     let storage = e.storage().crash_snapshot();
-    let key = e.local_key();
-    let mut r = Engine::restore(*e.config(), key, storage, rng(key)).unwrap();
+    let w = who(e.local_key());
+    let mut r = Engine::restore(*e.config(), id(w), storage, rng(w)).unwrap();
     r.add_link(L, link(mtu)).unwrap();
     r
 }
@@ -54,8 +68,12 @@ fn drain_tx(e: &mut E, now: Timestamp) -> Vec<Vec<u8>> {
     out
 }
 
+/// Pending events, minus the best-effort `MessageTransmitted` notices
+/// (tested separately).
 fn drain_events(e: &mut E) -> Vec<Event> {
-    core::iter::from_fn(|| e.poll_event()).collect()
+    core::iter::from_fn(|| e.poll_event())
+        .filter(|e| !matches!(e, Event::MessageTransmitted { .. }))
+        .collect()
 }
 
 fn deliver(to: &mut E, pkts: &[Vec<u8>], now: Timestamp) {
@@ -303,9 +321,9 @@ fn restore_resumes_outbox_without_loss_or_duplication() {
     // with fresh counters.
     let mut a = crash_and_restore(&a, 64);
     assert_eq!(a.outbox_len(), 3);
-    assert_eq!(a.contacts().collect::<Vec<_>>(), [(conv, B)]);
+    assert_eq!(a.contacts().collect::<Vec<_>>(), [(conv, pk(B))]);
     let resent = drain_tx(&mut a, t(100));
-    let counter = |p: &[u8]| wire::split_verified(p).unwrap().0;
+    let counter = |p: &[u8]| wire::parse_header(p).unwrap().1;
     assert!(resent.iter().all(|p| counter(p) >= 1024));
     deliver(&mut b, &resent, t(105));
     // Message 0 is a duplicate; 1 and 2 are new.
@@ -345,7 +363,12 @@ fn storage_failure_changes_nothing() {
     deliver(&mut b, &pkts, t(1));
     assert!(drain_events(&mut b).is_empty());
     assert_eq!(b.stats().storage_errors, 1);
-    deliver(&mut b, &pkts, t(2)); // the retransmission succeeds
+    // Re-delivering the same packet is a replay now; A's retransmission
+    // (fresh counter) gets through.
+    deliver(&mut b, &pkts, t(2));
+    assert!(drain_events(&mut b).is_empty());
+    let rto = a.next_timeout().unwrap();
+    deliver(&mut b, &drain_tx(&mut a, rto), rto);
     assert_eq!(received(&drain_events(&mut b)).len(), 1);
 }
 
@@ -354,15 +377,15 @@ fn new_and_restore_check_storage() {
     let (a, _) = engine(A, B, 64);
     let used = a.storage().crash_snapshot();
     assert_eq!(
-        Engine::new(Config::default(), A, used.clone(), rng(A)).err(),
+        Engine::new(Config::default(), id(A), used.clone(), rng(A)).err(),
         Some(Error::StorageNotEmpty)
     );
     assert_eq!(
-        Engine::restore(Config::default(), B, used, rng(B)).err(),
+        Engine::restore(Config::default(), id(B), used, rng(B)).err(),
         Some(Error::IdentityMismatch)
     );
     assert_eq!(
-        Engine::restore(Config::default(), A, MemoryStorage::new(), rng(A)).err(),
+        Engine::restore(Config::default(), id(A), MemoryStorage::new(), rng(A)).err(),
         Some(Error::CorruptStorage)
     );
 }
@@ -426,7 +449,7 @@ fn garbage_and_tampering_are_counted_not_fatal() {
 
 #[test]
 fn rate_budget_paces_and_reports_timeout() {
-    let mut a = Engine::new(Config::default(), A, MemoryStorage::new(), rng(A)).unwrap();
+    let mut a = Engine::new(Config::default(), id(A), MemoryStorage::new(), rng(A)).unwrap();
     a.add_link(
         L,
         LinkConfig {
@@ -436,7 +459,7 @@ fn rate_budget_paces_and_reports_timeout() {
         },
     )
     .unwrap();
-    let conv = a.add_contact(B).unwrap();
+    let conv = a.add_contact(pk(B)).unwrap();
     for _ in 0..5 {
         a.send_text(conv, &"z".repeat(80), t(0)).unwrap();
     }
@@ -449,7 +472,7 @@ fn rate_budget_paces_and_reports_timeout() {
 
 #[test]
 fn duty_cycle_link_must_fit_one_packet() {
-    let mut a = Engine::new(Config::default(), A, MemoryStorage::new(), rng(A)).unwrap();
+    let mut a = Engine::new(Config::default(), id(A), MemoryStorage::new(), rng(A)).unwrap();
     let cfg = LinkConfig {
         mtu: 255,
         budget: LinkBudget::DutyCycle {
@@ -472,14 +495,12 @@ fn limits_are_enforced() {
         max_contacts: 1,
         ..Config::default()
     };
-    let mut a = Engine::new(cfg, A, MemoryStorage::new(), rng(A)).unwrap();
-    assert_eq!(a.add_contact(A), Err(Error::InvalidContact));
-    let conv = a.add_contact(B).unwrap();
-    assert_eq!(a.add_contact(B), Err(Error::InvalidContact));
-    assert_eq!(
-        a.add_contact(PublicKey([1; 32])),
-        Err(Error::TooManyContacts)
-    );
+    let mut a = Engine::new(cfg, id(A), MemoryStorage::new(), rng(A)).unwrap();
+    assert_eq!(a.add_contact(pk(A)), Err(Error::InvalidContact));
+    assert_eq!(a.add_contact(not_a_point()), Err(Error::InvalidContact));
+    let conv = a.add_contact(pk(B)).unwrap();
+    assert_eq!(a.add_contact(pk(B)), Err(Error::InvalidContact));
+    assert_eq!(a.add_contact(pk(0xcc)), Err(Error::TooManyContacts));
     assert_eq!(
         a.send_text(conv, &"x".repeat(5000), t(0)),
         Err(Error::TextTooLong)
@@ -543,10 +564,11 @@ fn oversized_frag_ack_does_not_livelock() {
     let (mut b, _) = engine(B, A, 48);
     // One fragment of a 250-fragment message: its FRAG_ACK bitmap is 32
     // bytes, which cannot share a 48-byte packet with an ACK.
+    let keys = PairKeys::derive(&id(A), &pk(B)).unwrap();
     let mut pkt = Vec::new();
-    begin_packet(&mut pkt, hash::pair_tag(&A, &B), 0);
+    begin_packet(&mut pkt, keys.tx_tag, 0);
     put_msg_frame(&mut pkt, 0, 250, 0, b"x");
-    seal_packet(&mut pkt, &A, &B);
+    keys.seal(&mut pkt, header_len(0), 0).unwrap();
     b.handle_packet(L, &pkt, t(1));
     let at = b.next_timeout().unwrap();
     let mut n = 0;
@@ -556,4 +578,194 @@ fn oversized_frag_ack_does_not_livelock() {
         assert!(n < 10, "poll_transmit never ran dry");
     }
     assert!(b.next_timeout().is_none_or(|t| t > at));
+}
+
+/// Sends one message A→B and returns the packet.
+fn one_packet() -> (E, E, Vec<u8>) {
+    let (mut a, conv) = engine(A, B, 128);
+    let (b, _) = engine(B, A, 128);
+    a.send_text(conv, "secret text", t(0)).unwrap();
+    let pkt = drain_tx(&mut a, t(0)).remove(0);
+    (a, b, pkt)
+}
+
+#[test]
+fn packets_are_encrypted() {
+    let (_, _, pkt) = one_packet();
+    assert!(!pkt.windows(6).any(|w| w == b"secret"));
+}
+
+#[test]
+fn every_tampered_byte_is_rejected() {
+    let (_, mut b, pkt) = one_packet();
+    for i in 0..pkt.len() {
+        for bit in [0x01, 0x80] {
+            let mut bad = pkt.clone();
+            bad[i] ^= bit;
+            b.handle_packet(L, &bad, t(1));
+        }
+    }
+    assert!(drain_events(&mut b).is_empty());
+    let s = b.stats();
+    assert_eq!(s.messages_received, 0);
+    assert_eq!(
+        s.packets_dropped_unauthenticated + s.packets_dropped_version + s.packets_dropped_malformed,
+        2 * pkt.len() as u64
+    );
+    // The genuine packet still gets through afterwards.
+    b.handle_packet(L, &pkt, t(2));
+    assert_eq!(received(&drain_events(&mut b)).len(), 1);
+}
+
+#[test]
+fn every_truncation_is_rejected() {
+    let (_, mut b, pkt) = one_packet();
+    for n in 0..pkt.len() {
+        b.handle_packet(L, &pkt[..n], t(1));
+    }
+    let mut long = pkt.clone();
+    long.push(0);
+    b.handle_packet(L, &long, t(1));
+    assert!(drain_events(&mut b).is_empty());
+    assert_eq!(b.stats().messages_received, 0);
+}
+
+#[test]
+fn replays_are_rejected_even_after_restore() {
+    let (_, mut b, pkt) = one_packet();
+    b.handle_packet(L, &pkt, t(1));
+    b.handle_packet(L, &pkt, t(2));
+    assert_eq!(received(&drain_events(&mut b)).len(), 1);
+    assert_eq!(b.stats().packets_dropped_replay, 1);
+    let mut b = crash_and_restore(&b, 128);
+    b.handle_packet(L, &pkt, t(3));
+    assert!(drain_events(&mut b).is_empty());
+    assert_eq!(b.stats().packets_dropped_replay, 1);
+}
+
+#[test]
+fn misrouted_and_forged_packets_are_rejected() {
+    let (_, _, pkt) = one_packet();
+    // C knows A but the packet was for B.
+    let (mut c, _) = engine(0xcc, A, 128);
+    c.handle_packet(L, &pkt, t(1));
+    // A B that knows only C: A's packet matches no tag.
+    let (mut b_other, _) = engine(B, 0xcc, 128);
+    b_other.handle_packet(L, &pkt, t(1));
+    for e in [&mut c, &mut b_other] {
+        assert!(drain_events(e).is_empty());
+        assert_eq!(e.stats().packets_dropped_unauthenticated, 1);
+    }
+    // A forger who copies a real header but knows no secret.
+    let (mut b, _) = engine(B, A, 128);
+    let mut forged = pkt.clone();
+    for x in forged[5..].iter_mut() {
+        *x = 0x5a;
+    }
+    b.handle_packet(L, &forged, t(1));
+    assert_eq!(b.stats().packets_dropped_unauthenticated, 1);
+}
+
+#[test]
+fn transmitted_event_fires_once_per_message() {
+    let (mut a, conv) = engine(A, B, 64);
+    let q = a.send_text(conv, "hi", t(0)).unwrap();
+    assert_eq!(a.poll_event(), None);
+    drain_tx(&mut a, t(0));
+    assert_eq!(
+        a.poll_event(),
+        Some(Event::MessageTransmitted {
+            conversation: conv,
+            id: q.id
+        })
+    );
+    let rto = a.next_timeout().unwrap();
+    drain_tx(&mut a, rto);
+    assert_eq!(a.poll_event(), None, "retransmission is not re-announced");
+    let st = a.outgoing(conv).unwrap();
+    assert_eq!(
+        (st[0].id, st[0].transmissions, st[0].fragments),
+        (q.id, 2, 1)
+    );
+    // Transient events are never persisted; a restored engine announces
+    // its first transmission again.
+    let mut r = crash_and_restore(&a, 64);
+    assert_eq!(r.poll_event(), None);
+    drain_tx(&mut r, t(rto.as_millis() + 1));
+    assert!(matches!(
+        r.poll_event(),
+        Some(Event::MessageTransmitted { .. })
+    ));
+}
+
+#[test]
+fn remove_contact_abandons_outbox_and_persists() {
+    let (mut a, conv) = engine(A, B, 64);
+    let ids: Vec<MessageId> = (0..3)
+        .map(|i| a.send_text(conv, &alloc::format!("{i}"), t(0)).unwrap().id)
+        .collect();
+    assert_eq!(a.contact_key(conv), Some(pk(B)));
+    assert_eq!(a.remove_contact(conv), Ok(ids));
+    assert_eq!(a.outbox_len(), 0);
+    assert_eq!(a.contact_key(conv), None);
+    assert_eq!(a.remove_contact(conv), Err(Error::UnknownConversation));
+    assert_eq!(a.poll_transmit(t(0)), None);
+    let r = crash_and_restore(&a, 64);
+    assert_eq!(r.contacts().count(), 0);
+    assert_eq!(r.outbox_len(), 0);
+    // B's packets are now unauthenticated for A.
+    let (mut b, cb) = engine(B, A, 64);
+    b.send_text(cb, "anyone?", t(0)).unwrap();
+    deliver(&mut a, &drain_tx(&mut b, t(0)), t(1));
+    assert_eq!(a.stats().packets_dropped_unauthenticated, 1);
+    // And A can add B again.
+    assert_eq!(a.add_contact(pk(B)), Ok(conv));
+}
+
+#[test]
+fn link_and_contact_status_queries() {
+    let mut a = Engine::new(Config::default(), id(A), MemoryStorage::new(), rng(A)).unwrap();
+    let rate = LinkConfig {
+        mtu: 100,
+        budget: LinkBudget::BytesPerSecond(100),
+        cost: 1,
+    };
+    a.add_link(L, rate).unwrap();
+    let conv = a.add_contact(pk(B)).unwrap();
+    let (mut b, cb) = engine(B, A, 100);
+    assert_eq!(a.link_stats(LinkId(7)), None);
+    let st = a.contact_status(conv).unwrap();
+    assert_eq!(
+        (st.last_heard, st.srtt_ms, st.unreachable),
+        (None, None, false)
+    );
+    assert_eq!(st.rto_ms, 3000);
+
+    a.send_text(conv, &"z".repeat(70), t(0)).unwrap();
+    let sent = drain_tx(&mut a, t(0));
+    let ls = a.link_stats(L).unwrap();
+    assert_eq!(ls.packets_sent, 1);
+    assert_eq!(ls.bytes_sent, sent[0].len() as u64);
+    assert!(ls.budget_blocked_until.is_some_and(|t0| t0 > t(0)));
+
+    b.send_text(cb, "hello", t(0)).unwrap();
+    let from_b = drain_tx(&mut b, t(0));
+    a.handle_packet(L, &from_b[0], t(50));
+    a.handle_packet(L, &from_b[0], t(51)); // a duplicate
+    let ls = a.link_stats(L).unwrap();
+    assert_eq!((ls.packets_received, ls.packets_dropped), (2, 1));
+    let st = a.contact_status(conv).unwrap();
+    assert_eq!((st.last_heard, st.outbox_len), (Some(t(50)), 1));
+}
+
+/// A 32-byte string that is not a valid Ed25519 point encoding.
+fn not_a_point() -> PublicKey {
+    (0u8..=255)
+        .map(|b| {
+            let mut k = [0u8; 32];
+            k[0] = b;
+            PublicKey(k)
+        })
+        .find(|k| ed25519_dalek::VerifyingKey::from_bytes(&k.0).is_err())
+        .unwrap()
 }

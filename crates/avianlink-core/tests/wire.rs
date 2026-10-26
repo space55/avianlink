@@ -77,7 +77,7 @@ proptest! {
     #[test]
     fn parsers_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..300)) {
         let _ = wire::peek_tag(&bytes);
-        let _ = wire::split_verified(&bytes);
+        let _ = wire::parse_header(&bytes);
         let _ = wire::validate_frames(&bytes);
         let _ = Frames::new(&bytes).count();
         let _ = decode_record(&bytes, 4096);
@@ -181,18 +181,19 @@ fn fragment_payload(space: usize) -> usize {
 
 fn overhead_rows() -> String {
     let mut out = String::from(
-        "| MTU | text₁ (P1) | frag (P1) | eff (P1) | text₁ (P3, +12) | frag (P3) | eff (P3) |\n\
+        "| MTU | text₁ | frag | eff | text₁ (P2) | frag (P2) | eff (P2) |\n\
          |---|--:|--:|--:|--:|--:|--:|\n",
     );
     for mtu in [48usize, 51, 64, 128, 222, 255, 512, 1200] {
-        let p1 = frame_space(mtu);
-        let p3 = p1 - 12;
-        let (t1, f1) = (single_packet_text(p1), fragment_payload(p1));
-        let (t3, f3) = (single_packet_text(p3), fragment_payload(p3));
+        let now = frame_space(mtu);
+        // Phase 2's 4-byte placeholder check left 12 more bytes.
+        let p2 = now + 12;
+        let (t1, f1) = (single_packet_text(now), fragment_payload(now));
+        let (t2, f2) = (single_packet_text(p2), fragment_payload(p2));
         out.push_str(&format!(
-            "| {mtu} | {t1} | {f1} | {}% | {t3} | {f3} | {}% |\n",
+            "| {mtu} | {t1} | {f1} | {}% | {t2} | {f2} | {}% |\n",
             f1 * 100 / mtu,
-            f3 * 100 / mtu
+            f2 * 100 / mtu
         ));
     }
     out

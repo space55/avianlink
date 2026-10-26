@@ -2,11 +2,12 @@
 //!
 //! ```text
 //! simrun [--profile NAME|all|everything] [--seed N] [--seeds K] [--messages N]
-//!        [--interval-ms N] [--verbose]
+//!        [--interval-ms N] [--verbose] [--csv]
 //!        [--max-rto MS] [--min-rto MS] [--initial-rto MS] [--var-mult N] [--grace N]
 //!
 //! NAME is a profile (clean, geo_satellite, edge_2g, disaster_cellular,
-//! lora_like) or a stress scenario (harsh_64, harsh_64_crashy). `all` runs
+//! lora_like) or a stress scenario (harsh_64, harsh_64_crashy,
+//! disaster_hostile). `all` runs
 //! the profiles; `everything` adds the stress scenarios.
 //! ```
 
@@ -19,6 +20,7 @@ fn main() {
     let mut messages = None;
     let mut interval = None;
     let mut verbose = false;
+    let mut csv = false;
     let mut tweak: Vec<(String, u64)> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -43,13 +45,18 @@ fn main() {
             "--messages" => messages = Some(num(&val()) as usize),
             "--interval-ms" => interval = Some(num(&val())),
             "--verbose" | "-v" => verbose = true,
+            "--csv" => csv = true,
             "--max-rto" | "--min-rto" | "--initial-rto" | "--var-mult" | "--grace" => {
                 tweak.push((a.clone(), num(&val())))
             }
             _ => usage(&format!("unknown argument {a}")),
         }
     }
-    println!("{}", Report::table_header());
+    if csv {
+        println!("{}", Report::csv_header());
+    } else {
+        println!("{}", Report::table_header());
+    }
     let mut failed = false;
     let mut details = Vec::new();
     for p in profiles {
@@ -71,7 +78,11 @@ fn main() {
                 }
             }
             let r = sc.run();
-            println!("{}", r.table_row());
+            if csv {
+                println!("{}", r.csv_row());
+            } else {
+                println!("{}", r.table_row());
+            }
             failed |= r.delivered != r.messages || r.bugs() != 0;
             details.push(r);
         }

@@ -145,6 +145,18 @@ impl Reassembly {
         Some((p.count, bitmap))
     }
 
+    /// Drops every partial of `conv` (contact removed).
+    pub(crate) fn discard_conversation(&mut self, conv: ConversationId) {
+        let keys: Vec<_> = self
+            .partials
+            .range((conv, 0)..=(conv, u64::MAX))
+            .map(|(k, _)| *k)
+            .collect();
+        for k in keys {
+            self.remove(&k);
+        }
+    }
+
     fn remove(&mut self, key: &(ConversationId, u64)) -> Option<Partial> {
         let p = self.partials.remove(key)?;
         self.total_bytes = self.total_bytes.saturating_sub(p.bytes);

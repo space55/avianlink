@@ -1,9 +1,9 @@
-use super::{msg_frame_len, varint_len, CHECK_LEN, MAX_HEADER_LEN};
+use super::{msg_frame_len, varint_len, AEAD_TAG_LEN, MAX_HEADER_LEN};
 
 /// Bytes available for frames in a packet on a link with this MTU, assuming
 /// the worst-case header used for sizing.
 pub fn frame_space(mtu: usize) -> usize {
-    mtu.saturating_sub(MAX_HEADER_LEN.saturating_add(CHECK_LEN))
+    mtu.saturating_sub(MAX_HEADER_LEN.saturating_add(AEAD_TAG_LEN))
 }
 
 /// How a record is split into MSG fragments.
@@ -75,7 +75,7 @@ mod tests {
     fn plans_fit_space() {
         for mtu in [48usize, 51, 64, 128, 256, 1200] {
             let space = frame_space(mtu);
-            for seq in [0u64, 200, u64::MAX] {
+            for seq in [0u64, 200, (1 << 35) - 1] {
                 for len in [1usize, 10, 40, 100, 4200] {
                     let plan = plan_fragments(space, seq, len).unwrap();
                     assert!(plan.frag_size > 0);

@@ -14,8 +14,9 @@
 //! A host loop, after any input: call `poll_transmit` until `None`, drain
 //! `poll_event`, then sleep until `next_timeout` or the next packet.
 //!
-//! **Phase 1 status:** messages are plaintext, protected only against
-//! corruption. See `docs/security.md`.
+//! Every packet is end-to-end encrypted and authenticated between two
+//! contacts' static keys. Read `docs/security.md` for what that does and
+//! does not protect — notably, v1 has no forward secrecy.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -39,6 +40,7 @@ extern crate alloc;
 extern crate std;
 
 mod config;
+pub mod crypto;
 mod engine;
 mod error;
 mod event;
@@ -52,7 +54,7 @@ mod types;
 pub mod wire;
 
 pub use config::Config;
-pub use engine::{Engine, Queued, Stats, Transmit};
+pub use engine::{ContactStatus, Engine, LinkStats, OutgoingStatus, Queued, Stats, Transmit};
 pub use error::Error;
 pub use event::{Event, ReceivedMessage};
 pub use link::{AirtimeModel, LinkBudget, LinkConfig, LinkId, MIN_MTU};
@@ -60,8 +62,9 @@ pub use storage::{MemoryStorage, MemoryStorageError, Storage};
 pub use time::Timestamp;
 pub use types::{ConversationId, MessageId, Packet, PublicKey};
 
-/// Hash helpers, exposed for tests and tooling (fuzz harnesses need to build
-/// valid packets). Not a stable API.
+pub use crypto::{format_fingerprint, Identity, FINGERPRINT_LEN};
+
+/// Hash helpers, exposed for tests and tooling. Not a stable API.
 pub mod hashes {
-    pub use crate::hash::{conversation_id, message_id, packet_check, pair_tag};
+    pub use crate::hash::{conversation_id, message_id};
 }

@@ -72,7 +72,7 @@ impl Default for Config {
             max_outbox_messages: 1024,
             max_pending_events: 256,
             max_text_len: 4096,
-            max_fragments: 256,
+            max_fragments: 512,
             max_reassembly_bytes: 64 * 1024,
             max_reorder_window: 4096,
             max_ack_bitmap_bytes: 32,
@@ -90,6 +90,10 @@ impl Default for Config {
         }
     }
 }
+
+/// Largest message sequence number per conversation (D-033); bounds the
+/// seq varint at 5 bytes.
+pub(crate) const MAX_SEQ: u64 = (1 << 35) - 1;
 
 /// Room for record fields other than the text: flags, Lamport, timestamp,
 /// and modest extension blocks from future peers.
@@ -115,7 +119,7 @@ impl Config {
         }
         let worst_record =
             usize::try_from(self.max_record_len()).map_err(|_| Error::InvalidConfig)?;
-        let plan = plan_fragments(frame_space(usize::from(MIN_MTU)), u64::MAX, worst_record)
+        let plan = plan_fragments(frame_space(usize::from(MIN_MTU)), MAX_SEQ, worst_record)
             .ok_or(Error::InvalidConfig)?;
         if plan.count > u64::from(self.max_fragments) {
             return Err(Error::InvalidConfig);
@@ -140,7 +144,7 @@ mod tests {
     #[test]
     fn rejects_unfragmentable_text() {
         let c = Config {
-            max_fragments: 4,
+            max_fragments: 300,
             ..Config::default()
         };
         assert_eq!(c.validate(), Err(Error::InvalidConfig));

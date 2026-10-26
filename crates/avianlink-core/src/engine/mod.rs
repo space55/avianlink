@@ -6,14 +6,16 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 use rand_core::CryptoRngCore;
 
+use crate::config::MAX_SEQ;
+use crate::crypto::{Identity, PairKeys};
 use crate::hash;
 use crate::pacer::Pacer;
 use crate::reassembly::{Insert, Reassembly};
 use crate::wire::{
     self, ack_frame_len, begin_packet, decode_record, encode_record, frag_ack_frame_len,
-    frame_space, msg_frame_len, plan_fragments, put_ack_frame, put_frag_ack_frame, put_msg_frame,
-    seal_packet, AckFrame, DecodeError, FragAckFrame, Frame, Frames, MsgFrame, PairTag, Record,
-    CHECK_LEN, TIMESTAMP_EPOCH_UNIX_SECS,
+    frame_space, header_len, msg_frame_len, plan_fragments, put_ack_frame, put_frag_ack_frame,
+    put_msg_frame, AckFrame, DecodeError, FragAckFrame, Frame, Frames, MsgFrame, PairTag, Record,
+    AEAD_TAG_LEN, TIMESTAMP_EPOCH_UNIX_SECS,
 };
 use crate::{
     Config, ConversationId, Error, Event, LinkConfig, LinkId, MessageId, Packet, PublicKey,
@@ -25,7 +27,7 @@ use persist::{
     parse_outbox_key, version_record, ContactRecord, Op, KEY_VERSION, PREFIX_CONTACT, PREFIX_EVENT,
     PREFIX_INBOX, PREFIX_OUTBOX, SCHEMA,
 };
-use state::{Contact, FragState, OutMsg, Planned, Timers};
+use state::{Contact, FragState, OutMsg, Planned, Replay, Timers};
 
 /// A packet the host should send.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +54,62 @@ pub struct Queued {
     pub lamport: u64,
 }
 
+/// Delivery progress of one undelivered outgoing message
+/// ([`Engine::outgoing`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutgoingStatus {
+    /// The message.
+    pub id: MessageId,
+    /// Its sequence number.
+    pub seq: u64,
+    /// When `send_text` queued it.
+    pub queued_at: Timestamp,
+    /// How many times it has been (re)transmitted in this incarnation: the
+    /// most any one fragment was sent. 0 until first transmission.
+    pub transmissions: u32,
+    /// Fragments, once planned (0 before first transmission).
+    pub fragments: u32,
+    /// Fragments the peer reported holding (FRAG_ACK).
+    pub fragments_held: u32,
+}
+
+/// Per-link counters ([`Engine::link_stats`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkStats {
+    /// Packets handed to the host for this link.
+    pub packets_sent: u64,
+    /// Bytes handed to the host for this link.
+    pub bytes_sent: u64,
+    /// Packets received on this link.
+    pub packets_received: u64,
+    /// Bytes received on this link.
+    pub bytes_received: u64,
+    /// Received packets that were dropped (malformed, unauthenticated,
+    /// replayed).
+    pub packets_dropped: u64,
+    /// If the link's rate or duty-cycle budget is exhausted: when an
+    /// MTU-sized packet next fits. `None` when it fits now.
+    pub budget_blocked_until: Option<Timestamp>,
+}
+
+/// What the engine knows about a contact's reachability
+/// ([`Engine::contact_status`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContactStatus {
+    /// Last authenticated packet from the contact (any kind, ACK-only
+    /// included), in this incarnation.
+    pub last_heard: Option<Timestamp>,
+    /// Smoothed round-trip time, once measured.
+    pub srtt_ms: Option<u64>,
+    /// Current retransmission timeout.
+    pub rto_ms: u64,
+    /// Whether the engine currently believes the contact unreachable and is
+    /// only probing (`docs/reliability.md` §3).
+    pub unreachable: bool,
+    /// Undelivered outgoing messages to this contact.
+    pub outbox_len: usize,
+}
+
 /// Diagnostic counters. All counters saturate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
@@ -61,10 +119,14 @@ pub struct Stats {
     pub packets_dropped_unknown_link: u64,
     /// Dropped: unknown version byte.
     pub packets_dropped_version: u64,
-    /// Dropped: too short, or structurally malformed after the check passed.
+    /// Dropped: too short, or structurally malformed after decryption.
     pub packets_dropped_malformed: u64,
-    /// Dropped: no contact's tag and check matched.
+    /// Dropped: no contact's routing tag matched, or decryption failed for
+    /// every candidate (tampered, truncated, misrouted or forged).
     pub packets_dropped_unauthenticated: u64,
+    /// Dropped: counter already seen or below the replay window
+    /// (replays and network duplicates).
+    pub packets_dropped_replay: u64,
     /// Frames of unknown type skipped.
     pub frames_unknown: u64,
     /// MSG frames with invalid fragment fields.
@@ -141,6 +203,7 @@ fn commit<S: Storage>(storage: &mut S, ops: Vec<Op>) -> Result<(), Error> {
 struct LinkState {
     config: LinkConfig,
     pacer: Pacer,
+    stats: LinkStats,
 }
 
 /// The sans-IO messaging engine.
@@ -150,6 +213,7 @@ struct LinkState {
 /// `docs/reliability.md` for what is persisted.
 pub struct Engine<S, R> {
     config: Config,
+    identity: Identity,
     local: PublicKey,
     storage: S,
     rng: R,
@@ -157,8 +221,8 @@ pub struct Engine<S, R> {
     contacts: BTreeMap<ConversationId, Contact>,
     by_tag: BTreeMap<PairTag, Vec<ConversationId>>,
     reassembly: Reassembly,
-    /// Pending events with their storage key number.
-    events: VecDeque<(u64, Event)>,
+    /// Pending events with their storage key number (`None`: transient).
+    events: VecDeque<(Option<u64>, Event)>,
     next_event_key: u64,
     stats: Stats,
     /// Latest time seen from the host; never decreases.
@@ -169,12 +233,14 @@ pub struct Engine<S, R> {
 }
 
 impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
-    /// Creates an engine for identity `local` on empty storage.
+    /// Creates an engine for `identity` on empty storage.
     ///
     /// Fails with [`Error::StorageNotEmpty`] if `storage` already holds an
-    /// engine; use [`Engine::restore`] for that.
-    pub fn new(config: Config, local: PublicKey, mut storage: S, rng: R) -> Result<Self, Error> {
+    /// engine; use [`Engine::restore`] for that. The identity's secret is
+    /// never written to storage.
+    pub fn new(config: Config, identity: Identity, mut storage: S, rng: R) -> Result<Self, Error> {
         config.validate()?;
+        let local = identity.public_key();
         if storage
             .load(KEY_VERSION)
             .map_err(|_| Error::Storage)?
@@ -186,7 +252,7 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
             &mut storage,
             alloc::vec![(KEY_VERSION.to_vec(), Some(version_record(&local)))],
         )?;
-        Ok(Self::empty(config, local, storage, rng))
+        Ok(Self::empty(config, identity, storage, rng))
     }
 
     /// Resumes an engine from `storage` after a restart or crash: contacts,
@@ -194,11 +260,12 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
     /// Links are not persisted; register them again.
     pub fn restore(
         config: Config,
-        local: PublicKey,
+        identity: Identity,
         mut storage: S,
         rng: R,
     ) -> Result<Self, Error> {
         config.validate()?;
+        let local = identity.public_key();
         let version = storage
             .load(KEY_VERSION)
             .map_err(|_| Error::Storage)?
@@ -258,13 +325,13 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
             return Err(Error::CorruptStorage);
         }
 
-        let mut e = Self::empty(config, local, storage, rng);
+        let mut e = Self::empty(config, identity, storage, rng);
         for (conv, rec) in contacts {
             if conv != hash::conversation_id(&local, &rec.key) || rec.key == local {
                 return Err(Error::CorruptStorage);
             }
-            let contact = Contact::from_record(&rec, hash::pair_tag(&local, &rec.key));
-            e.insert_contact(conv, contact);
+            let keys = PairKeys::derive(&e.identity, &rec.key).ok_or(Error::CorruptStorage)?;
+            e.insert_contact(conv, Contact::from_record(&rec, keys));
         }
         for (conv, seq, queued_at, record) in outbox {
             let contact = e.contacts.get_mut(&conv).ok_or(Error::CorruptStorage)?;
@@ -279,25 +346,27 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
                     record,
                     queued_at,
                     plan: None,
+                    announced: false,
                 },
             );
             e.outbox_len = e.outbox_len.saturating_add(1);
         }
-        for (conv, inbox) in inboxes {
-            e.contacts
-                .get_mut(&conv)
-                .ok_or(Error::CorruptStorage)?
-                .inbox = inbox;
+        for (conv, (inbox, replay_high)) in inboxes {
+            let contact = e.contacts.get_mut(&conv).ok_or(Error::CorruptStorage)?;
+            contact.inbox = inbox;
+            contact.replay = Replay::with_floor(replay_high);
         }
         for (n, ev) in events {
             e.next_event_key = e.next_event_key.max(n.saturating_add(1));
-            e.events.push_back((n, ev));
+            e.events.push_back((Some(n), ev));
         }
         Ok(e)
     }
 
-    fn empty(config: Config, local: PublicKey, storage: S, rng: R) -> Self {
+    fn empty(config: Config, identity: Identity, storage: S, rng: R) -> Self {
+        let local = identity.public_key();
         Self {
+            identity,
             reassembly: Reassembly::new(
                 usize_of(config.max_reassembly_bytes),
                 u64::from(config.max_fragments),
@@ -320,7 +389,7 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
     }
 
     fn insert_contact(&mut self, conv: ConversationId, contact: Contact) {
-        let rx_tag = hash::pair_tag(&contact.key, &self.local);
+        let rx_tag = contact.keys.rx_tag;
         self.contacts.insert(conv, contact);
         self.by_tag.entry(rx_tag).or_default().push(conv);
     }
@@ -348,6 +417,7 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
             LinkState {
                 config: link,
                 pacer,
+                stats: LinkStats::default(),
             },
         );
         Ok(())
@@ -360,11 +430,14 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
     }
 
     /// Adds a contact by public key (obtained out of band) and returns the
-    /// conversation with them. Persisted.
+    /// conversation with them. Persisted. Fails with
+    /// [`Error::InvalidContact`] for our own key, a duplicate, or a key that
+    /// is not a valid, non-weak Ed25519 point.
     pub fn add_contact(&mut self, key: PublicKey) -> Result<ConversationId, Error> {
         if key == self.local {
             return Err(Error::InvalidContact);
         }
+        let keys = PairKeys::derive(&self.identity, &key).ok_or(Error::InvalidContact)?;
         let conv = hash::conversation_id(&self.local, &key);
         if self.contacts.contains_key(&conv) {
             return Err(Error::InvalidContact);
@@ -372,7 +445,7 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
         if self.contacts.len() >= usize_of(self.config.max_contacts) {
             return Err(Error::TooManyContacts);
         }
-        let contact = Contact::new(key, hash::pair_tag(&self.local, &key));
+        let contact = Contact::new(key, keys);
         commit(
             &mut self.storage,
             alloc::vec![(contact_key(&conv), Some(contact.record().encode()))],
@@ -413,6 +486,9 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
             return Err(Error::OutboxFull);
         }
         let seq = contact.next_seq;
+        if seq > MAX_SEQ {
+            return Err(Error::Exhausted);
+        }
         let next_seq = seq.checked_add(1).ok_or(Error::Exhausted)?;
         let lamport = contact.lamport.checked_add(1).ok_or(Error::Exhausted)?;
         let mut record = Vec::new();
@@ -447,6 +523,7 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
                 record,
                 queued_at: now,
                 plan: None,
+                announced: false,
             },
         );
         self.outbox_len = self.outbox_len.saturating_add(1);
@@ -459,46 +536,75 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
     pub fn handle_packet(&mut self, link: LinkId, bytes: &[u8], now: Timestamp) {
         self.observe(now);
         bump(&mut self.stats.packets_received);
-        if !self.links.contains_key(&link) {
+        let Some(l) = self.links.get_mut(&link) else {
             bump(&mut self.stats.packets_dropped_unknown_link);
             return;
+        };
+        bump(&mut l.stats.packets_received);
+        l.stats.bytes_received = l.stats.bytes_received.saturating_add(u64_of(bytes.len()));
+        if !self.process_packet(link, bytes) {
+            if let Some(l) = self.links.get_mut(&link) {
+                bump(&mut l.stats.packets_dropped);
+            }
         }
+    }
+
+    /// Authenticates and applies one packet. Returns whether it was
+    /// accepted.
+    fn process_packet(&mut self, link: LinkId, bytes: &[u8]) -> bool {
         let tag = match wire::peek_tag(bytes) {
             Ok(tag) => tag,
             Err(DecodeError::UnknownVersion(_)) => {
                 bump(&mut self.stats.packets_dropped_version);
-                return;
+                return false;
             }
             Err(_) => {
                 bump(&mut self.stats.packets_dropped_malformed);
-                return;
+                return false;
             }
         };
-        let local = self.local;
-        let contacts = &self.contacts;
-        let sender = self.by_tag.get(&tag).and_then(|candidates| {
-            candidates.iter().copied().find(|c| {
-                contacts
-                    .get(c)
-                    .is_some_and(|ct| wire::verify_check(bytes, &ct.key, &local))
-            })
-        });
-        let Some(conv) = sender else {
-            bump(&mut self.stats.packets_dropped_unauthenticated);
-            return;
+        let Ok((_, counter, hlen)) = wire::parse_header(bytes) else {
+            bump(&mut self.stats.packets_dropped_malformed);
+            return false;
         };
-        let (counter, frames) = match wire::split_verified(bytes) {
-            Ok((counter, frames)) if wire::validate_frames(frames).is_ok() => (counter, frames),
-            _ => {
-                bump(&mut self.stats.packets_dropped_malformed);
-                return;
+        // Trial decryption over the (usually single) contact with this tag.
+        // The replay check is cheap and comes first, but the window only
+        // moves once the packet authenticates.
+        let mut replayed = false;
+        let mut opened = None;
+        for conv in self.by_tag.get(&tag).into_iter().flatten() {
+            let Some(contact) = self.contacts.get(conv) else {
+                continue;
+            };
+            if !contact.replay.fresh(counter) {
+                replayed = true;
+                continue;
             }
+            if let Some(plain) = contact.keys.open(bytes, hlen, counter) {
+                opened = Some((*conv, plain));
+                break;
+            }
+        }
+        let Some((conv, frames)) = opened else {
+            if replayed {
+                bump(&mut self.stats.packets_dropped_replay);
+            } else {
+                bump(&mut self.stats.packets_dropped_unauthenticated);
+            }
+            return false;
         };
+        if let Some(contact) = self.contacts.get_mut(&conv) {
+            contact.replay.mark(counter);
+        }
+        if wire::validate_frames(&frames).is_err() {
+            bump(&mut self.stats.packets_dropped_malformed);
+            return false;
+        }
         if let Some(contact) = self.contacts.get_mut(&conv) {
             contact.route = Some(link);
             contact.heard(self.now, counter);
         }
-        for frame in Frames::new(frames).flatten() {
+        for frame in Frames::new(&frames).flatten() {
             match frame {
                 Frame::Padding => {}
                 Frame::Unknown { .. } => bump(&mut self.stats.frames_unknown),
@@ -507,6 +613,7 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
                 Frame::FragAck(fa) => self.on_frag_ack(conv, fa),
             }
         }
+        true
     }
 
     fn on_msg(&mut self, conv: ConversationId, msg: MsgFrame<'_>) {
@@ -579,8 +686,11 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
         let lamport = contact.lamport.max(rec.lamport);
         let n = self.next_event_key;
         let mut ops = alloc::vec![
-            (inbox_key(&conv), Some(encode_inbox(&inbox, window_bytes))),
-            (event_key(n), Some(encode_event(&event))),
+            (
+                inbox_key(&conv),
+                Some(encode_inbox(&inbox, window_bytes, contact.replay.high()))
+            ),
+            (event_key(n), encode_event(&event)),
         ];
         if lamport != contact.lamport {
             let mut cr = contact.record();
@@ -597,7 +707,7 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
         contact.frag_ack_pending.remove(&msg.seq);
         schedule_ack(contact);
         self.next_event_key = n.saturating_add(1);
-        self.events.push_back((n, event));
+        self.events.push_back((Some(n), event));
         bump(&mut self.stats.messages_received);
     }
 
@@ -640,8 +750,8 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
                 id,
             };
             ops.push((outbox_key(&conv, seq), None));
-            ops.push((event_key(n), Some(encode_event(&event))));
-            events.push((n, event));
+            ops.push((event_key(n), encode_event(&event)));
+            events.push((Some(n), event));
             n = n.saturating_add(1);
         }
         if commit(&mut self.storage, ops).is_err() {
@@ -770,7 +880,6 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
         self.reserve_counter(conv)?;
 
         let ctx = BuildCtx {
-            local: &self.local,
             conv,
             mtu: usize::from(mtu),
             min_space,
@@ -782,18 +891,31 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
         };
         let contact = self.contacts.get_mut(&conv)?;
         let counter = contact.tx_counter;
+        let mut announced = Vec::new();
         let bytes = build_packet(
             contact,
             &ctx,
             &self.reassembly,
             &mut self.rng,
             &mut self.stats,
+            &mut announced,
         )?;
+        let room = usize_of(self.config.max_pending_events).saturating_sub(self.events.len());
+        self.events
+            .extend(announced.into_iter().take(room).map(|id| {
+                (
+                    None,
+                    Event::MessageTransmitted {
+                        conversation: conv,
+                        id,
+                    },
+                )
+            }));
         contact.log_sent(counter, now, usize::from(self.config.max_sent_log));
-        self.links
-            .get_mut(&link_id)?
-            .pacer
-            .consume(now, bytes.len());
+        let link = self.links.get_mut(&link_id)?;
+        link.pacer.consume(now, bytes.len());
+        bump(&mut link.stats.packets_sent);
+        link.stats.bytes_sent = link.stats.bytes_sent.saturating_add(u64_of(bytes.len()));
         bump(&mut self.stats.packets_sent);
         self.stats.bytes_sent = self.stats.bytes_sent.saturating_add(u64_of(bytes.len()));
         self.last_served = Some(conv);
@@ -832,9 +954,11 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
     /// (`docs/reliability.md` §4).
     pub fn poll_event(&mut self) -> Option<Event> {
         let (n, event) = self.events.pop_front()?;
-        if commit(&mut self.storage, alloc::vec![(event_key(n), None)]).is_err() {
-            // The event may be redelivered after a restore.
-            bump(&mut self.stats.storage_errors);
+        if let Some(n) = n {
+            if commit(&mut self.storage, alloc::vec![(event_key(n), None)]).is_err() {
+                // The event may be redelivered after a restore.
+                bump(&mut self.stats.storage_errors);
+            }
         }
         Some(event)
     }
@@ -856,6 +980,94 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
                 Some(work.max(link.pacer.ready_at(self.now, link.config.mtu)))
             })
             .min()
+    }
+
+    /// Removes a contact: its outbox (undelivered messages are abandoned
+    /// and their IDs returned), receive window and partial reassemblies, in
+    /// one storage batch. Already-queued events are kept.
+    pub fn remove_contact(
+        &mut self,
+        conversation: ConversationId,
+    ) -> Result<Vec<MessageId>, Error> {
+        let contact = self
+            .contacts
+            .get(&conversation)
+            .ok_or(Error::UnknownConversation)?;
+        let mut ops: Vec<Op> = contact
+            .outbox
+            .keys()
+            .map(|&seq| (outbox_key(&conversation, seq), None))
+            .collect();
+        ops.push((contact_key(&conversation), None));
+        ops.push((inbox_key(&conversation), None));
+        commit(&mut self.storage, ops)?;
+        let contact = self
+            .contacts
+            .remove(&conversation)
+            .ok_or(Error::UnknownConversation)?;
+        if let Some(convs) = self.by_tag.get_mut(&contact.keys.rx_tag) {
+            convs.retain(|c| *c != conversation);
+            if convs.is_empty() {
+                self.by_tag.remove(&contact.keys.rx_tag);
+            }
+        }
+        self.reassembly.discard_conversation(conversation);
+        self.outbox_len = self.outbox_len.saturating_sub(contact.outbox.len());
+        if self.last_served == Some(conversation) {
+            self.last_served = None;
+        }
+        Ok(contact.outbox.values().map(|m| m.id).collect())
+    }
+
+    /// The public key behind a conversation.
+    pub fn contact_key(&self, conversation: ConversationId) -> Option<PublicKey> {
+        self.contacts.get(&conversation).map(|c| c.key)
+    }
+
+    /// Delivery progress of every undelivered message to `conversation`, in
+    /// sequence order.
+    pub fn outgoing(&self, conversation: ConversationId) -> Option<Vec<OutgoingStatus>> {
+        let contact = self.contacts.get(&conversation)?;
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        Some(
+            contact
+                .outbox
+                .iter()
+                .map(|(&seq, m)| {
+                    let frags = m.plan.as_ref().map_or(&[][..], |p| &p.frags[..]);
+                    OutgoingStatus {
+                        id: m.id,
+                        seq,
+                        queued_at: m.queued_at,
+                        transmissions: frags.iter().map(|f| f.sends).max().unwrap_or(0),
+                        fragments: count(frags.len()),
+                        fragments_held: count(frags.iter().filter(|f| f.held_at.is_some()).count()),
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// Counters and budget state of one link.
+    pub fn link_stats(&self, link: LinkId) -> Option<LinkStats> {
+        let l = self.links.get(&link)?;
+        let ready = l.pacer.ready_at(self.now, l.config.mtu);
+        Some(LinkStats {
+            budget_blocked_until: (ready > self.now).then_some(ready),
+            ..l.stats
+        })
+    }
+
+    /// Reachability and timers of one contact.
+    pub fn contact_status(&self, conversation: ConversationId) -> Option<ContactStatus> {
+        let c = self.contacts.get(&conversation)?;
+        Some(ContactStatus {
+            last_heard: c.last_heard,
+            srtt_ms: c.rtt.srtt(),
+            rto_ms: self.timers(c).rto,
+            unreachable: c.backoff > 0,
+            outbox_len: c.outbox.len(),
+        })
     }
 
     /// Diagnostic counters.
@@ -903,8 +1115,7 @@ impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
     }
 }
 
-struct BuildCtx<'a> {
-    local: &'a PublicKey,
+struct BuildCtx {
     conv: ConversationId,
     mtu: usize,
     min_space: usize,
@@ -921,15 +1132,17 @@ struct BuildCtx<'a> {
 /// single probe's worth in backoff. Returns `None` if nothing was written.
 fn build_packet<R: CryptoRngCore>(
     contact: &mut Contact,
-    ctx: &BuildCtx<'_>,
+    ctx: &BuildCtx,
     reassembly: &Reassembly,
     rng: &mut R,
     stats: &mut Stats,
+    announced: &mut Vec<MessageId>,
 ) -> Option<Vec<u8>> {
     let now = ctx.now;
-    let limit = ctx.mtu.saturating_sub(CHECK_LEN);
+    let limit = ctx.mtu.saturating_sub(AEAD_TAG_LEN);
     let mut out = Vec::with_capacity(ctx.mtu);
-    begin_packet(&mut out, contact.tx_tag, contact.tx_counter);
+    let counter = contact.tx_counter;
+    begin_packet(&mut out, contact.keys.tx_tag, counter);
     let mut wrote = false;
 
     if contact.ack_due.is_some() {
@@ -983,25 +1196,26 @@ fn build_packet<R: CryptoRngCore>(
     }
 
     if ctx.data && !contact.outbox.is_empty() {
-        wrote |= write_data(contact, ctx, &mut out, limit, rng, stats);
+        wrote |= write_data(contact, ctx, &mut out, limit, rng, stats, announced);
     }
 
     if !wrote {
         return None;
     }
-    seal_packet(&mut out, ctx.local, &contact.key);
-    contact.tx_counter = contact.tx_counter.saturating_add(1);
+    contact.keys.seal(&mut out, header_len(counter), counter)?;
+    contact.tx_counter = counter.saturating_add(1);
     Some(out)
 }
 
 /// Writes due fragments into `out`. Returns whether any were written.
 fn write_data<R: CryptoRngCore>(
     contact: &mut Contact,
-    ctx: &BuildCtx<'_>,
+    ctx: &BuildCtx,
     out: &mut Vec<u8>,
     limit: usize,
     rng: &mut R,
     stats: &mut Stats,
+    announced: &mut Vec<MessageId>,
 ) -> bool {
     let now = ctx.now;
     let t = ctx.timers;
@@ -1026,7 +1240,7 @@ fn write_data<R: CryptoRngCore>(
     // since that send means the peer is unreachable: switch to probing.
     let mut probe = contact.backoff > 0;
     if !probe {
-        let heard = contact.last_heard;
+        let heard = contact.last_fresh;
         probe = contact.outbox.values().any(|m| {
             m.plan.as_ref().is_some_and(|p| {
                 p.frags.iter().any(|f| {
@@ -1096,6 +1310,10 @@ fn write_data<R: CryptoRngCore>(
         };
         put_msg_frame(out, seq, plan.count, index, data);
         wrote = true;
+        if !msg.announced {
+            msg.announced = true;
+            announced.push(msg.id);
+        }
         bump(&mut stats.fragments_sent);
         if frag.sends > 0 {
             bump(&mut stats.retransmissions);

@@ -11,7 +11,7 @@ use crate::wire::{put_varint, DecodeError, Reader};
 use crate::{ConversationId, Event, MessageId, PublicKey, ReceivedMessage, Timestamp};
 
 /// Bumped on incompatible layout changes.
-pub(super) const SCHEMA: u8 = 1;
+pub(super) const SCHEMA: u8 = 2;
 
 pub(super) const KEY_VERSION: &[u8] = b"v";
 pub(super) const PREFIX_CONTACT: &[u8] = b"c";
@@ -118,15 +118,23 @@ pub(super) fn parse_event_key(k: &[u8]) -> Option<u64> {
     r.is_empty().then_some(n)
 }
 
-pub(super) fn encode_inbox(inbox: &Inbox, window_bytes: usize) -> Vec<u8> {
+/// Receive window plus the replay floor (highest accepted packet counter,
+/// stored +1 so 0 means none).
+pub(super) fn encode_inbox(
+    inbox: &Inbox,
+    window_bytes: usize,
+    replay_high: Option<u64>,
+) -> Vec<u8> {
     let mut v = Vec::new();
+    put_varint(&mut v, replay_high.map_or(0, |h| h.saturating_add(1)));
     put_varint(&mut v, inbox.cum);
     v.extend_from_slice(&inbox.bitmap(window_bytes));
     v
 }
 
-pub(super) fn decode_inbox(v: &[u8]) -> Result<Inbox, DecodeError> {
+pub(super) fn decode_inbox(v: &[u8]) -> Result<(Inbox, Option<u64>), DecodeError> {
     let mut r = Reader::new(v);
+    let replay_high = r.varint()?.checked_sub(1);
     let cum = r.varint()?;
     let mut inbox = Inbox {
         cum,
@@ -145,13 +153,14 @@ pub(super) fn decode_inbox(v: &[u8]) -> Result<Inbox, DecodeError> {
             }
         }
     }
-    Ok(inbox)
+    Ok((inbox, replay_high))
 }
 
 const EVENT_RECEIVED: u8 = 1;
 const EVENT_DELIVERED: u8 = 2;
 
-pub(super) fn encode_event(ev: &Event) -> Vec<u8> {
+/// Encodes a durable event; `None` for transient ones (never persisted).
+pub(super) fn encode_event(ev: &Event) -> Option<Vec<u8>> {
     let mut v = Vec::new();
     match ev {
         Event::MessageReceived(m) => {
@@ -176,8 +185,9 @@ pub(super) fn encode_event(ev: &Event) -> Vec<u8> {
             v.extend_from_slice(&conversation.0);
             v.extend_from_slice(&id.0);
         }
+        Event::MessageTransmitted { .. } => return None,
     }
-    v
+    Some(v)
 }
 
 pub(super) fn decode_event(v: &[u8]) -> Result<Event, DecodeError> {
@@ -233,8 +243,13 @@ mod tests {
         for s in [0, 1, 2, 5, 9, 40] {
             inbox.insert(s);
         }
-        let back = decode_inbox(&encode_inbox(&inbox, 512)).unwrap();
-        assert_eq!((back.cum, &back.above), (inbox.cum, &inbox.above));
+        let (back, high) = decode_inbox(&encode_inbox(&inbox, 512, Some(77))).unwrap();
+        assert_eq!(
+            (back.cum, &back.above, high),
+            (inbox.cum, &inbox.above, Some(77))
+        );
+        let (_, none) = decode_inbox(&encode_inbox(&inbox, 512, None)).unwrap();
+        assert_eq!(none, None);
 
         let conv = ConversationId([3; 16]);
         assert_eq!(parse_outbox_key(&outbox_key(&conv, 77)), Some((conv, 77)));
@@ -258,7 +273,7 @@ mod tests {
                 id: MessageId([5; 16]),
             },
         ] {
-            assert_eq!(decode_event(&encode_event(&ev)), Ok(ev));
+            assert_eq!(decode_event(&encode_event(&ev).unwrap()), Ok(ev));
         }
         assert!(decode_event(&[9; 40]).is_err());
     }

@@ -66,6 +66,8 @@ pub struct Report {
     pub out_of_order: u64,
     /// Simulated process crashes.
     pub crashes: u64,
+    /// Packets injected or tampered with by the adversary.
+    pub injected: u64,
     /// Largest committed storage footprint of either node, in bytes.
     pub max_storage_bytes: usize,
     /// Per-direction channel counters (0: peer A → B).
@@ -121,6 +123,30 @@ impl Report {
     pub fn table_header() -> &'static str {
         "| scenario | seed | delivered | p50 | p95 | p99 | max | wire/payload | pkts/msg | sim time | sim h/wall min |\n\
          |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|"
+    }
+
+    /// CSV header matching [`Report::csv_row`].
+    pub fn csv_header() -> &'static str {
+        "scenario,seed,messages,delivered,p50_ms,p95_ms,p99_ms,max_ms,payload_bytes,wire_bytes,packets,sim_ms"
+    }
+
+    /// One CSV row of raw values.
+    pub fn csv_row(&self) -> String {
+        format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{}",
+            self.name,
+            self.seed,
+            self.messages,
+            self.delivered,
+            self.latency_p50_ms,
+            self.latency_p95_ms,
+            self.latency_p99_ms,
+            self.latency_max_ms,
+            self.payload_bytes,
+            self.wire_bytes,
+            self.packets,
+            self.sim_duration_ms
+        )
     }
 
     /// One Markdown table row.
@@ -194,21 +220,22 @@ impl fmt::Display for Report {
         )?;
         writeln!(
             f,
-            "  engine          retx {} probes {} acks {} frag-acks {} rtt-samples {} unauth-drops {} dup-msgs {} reasm-full {} storage-errors {}",
+            "  engine          retx {} probes {} acks {} frag-acks {} rtt-samples {} unauth-drops {} replay-drops {} dup-msgs {} reasm-full {} storage-errors {}",
             e(|s| s.retransmissions),
             e(|s| s.probes_sent),
             e(|s| s.acks_sent),
             e(|s| s.frag_acks_sent),
             e(|s| s.rtt_samples),
             e(|s| s.packets_dropped_unauthenticated),
+            e(|s| s.packets_dropped_replay),
             e(|s| s.messages_duplicate),
             e(|s| s.fragments_dropped_reassembly_full),
             e(|s| s.storage_errors)
         )?;
         writeln!(
             f,
-            "  host            crashes {}, out-of-order arrivals {}, max storage {} B, outbox-full retries {}",
-            self.crashes, self.out_of_order, self.max_storage_bytes, self.outbox_full_retries
+            "  host            crashes {}, adversary packets {}, out-of-order arrivals {}, max storage {} B, outbox-full retries {}",
+            self.crashes, self.injected, self.out_of_order, self.max_storage_bytes, self.outbox_full_retries
         )?;
         writeln!(
             f,

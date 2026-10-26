@@ -10,6 +10,16 @@ pub enum Event {
     /// A new message arrived. Messages arrive in network order, not causal
     /// order; sort by [`ReceivedMessage::lamport`] for display.
     MessageReceived(ReceivedMessage),
+    /// One of our messages went out for the first time since it was queued
+    /// (or since this engine was restored). Best-effort: not persisted, and
+    /// skipped if the event queue is full. Retry counts are available from
+    /// [`crate::Engine::outgoing`].
+    MessageTransmitted {
+        /// Conversation the message belongs to.
+        conversation: ConversationId,
+        /// The transmitted message.
+        id: MessageId,
+    },
     /// The peer acknowledged one of our messages.
     MessageDelivered {
         /// Conversation the message belongs to.

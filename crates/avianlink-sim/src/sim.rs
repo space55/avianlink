@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::time::Instant;
 
 use avianlink_core::{
-    Config, ConversationId, Engine, Error, Event, LinkBudget, LinkConfig, LinkId, MemoryStorage,
-    MessageId, PublicKey, Stats, Timestamp,
+    Config, ConversationId, Engine, Error, Event, Identity, LinkBudget, LinkConfig, LinkId,
+    MemoryStorage, MessageId, Stats, Timestamp,
 };
 use rand_chacha::ChaCha20Rng;
 use rand_core::RngCore;
@@ -74,6 +74,21 @@ pub struct CrashModel {
     pub downtime_ms: u64,
 }
 
+/// An on-path attacker. It sees every packet on the link and can inject
+/// its own, but holds no keys.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Adversary {
+    /// Per packet sent: probability of later re-injecting a copy of some
+    /// earlier packet (a replay).
+    pub replay_prob: f64,
+    /// Per packet sent: probability of injecting a forgery that reuses the
+    /// packet's header with random ciphertext.
+    pub forge_prob: f64,
+    /// Per delivered packet: probability of flipping one bit (tampering);
+    /// unlike link corruption, aimed at the header and tag too.
+    pub tamper_prob: f64,
+}
+
 /// A complete, reproducible simulation setup.
 #[derive(Clone, Debug)]
 pub struct Scenario {
@@ -95,6 +110,8 @@ pub struct Scenario {
     pub deadline_ms: u64,
     /// Process crashes, if any.
     pub crashes: Option<CrashModel>,
+    /// On-path attacker, if any.
+    pub adversary: Option<Adversary>,
 }
 
 impl Scenario {
@@ -116,6 +133,7 @@ impl Scenario {
             lengths: LengthMix::default(),
             deadline_ms: 30 * 24 * 3_600_000,
             crashes: None,
+            adversary: None,
         }
     }
 
@@ -152,8 +170,21 @@ impl Scenario {
         sc
     }
 
+    /// `disaster_cellular` with an on-path attacker replaying 20% and
+    /// forging 20% of packets, and tampering with 10% of deliveries.
+    pub fn disaster_hostile(seed: u64) -> Self {
+        let mut sc = Self::new(Profile::DisasterCellular, seed);
+        sc.name = "disaster_hostile".to_string();
+        sc.adversary = Some(Adversary {
+            replay_prob: 0.2,
+            forge_prob: 0.2,
+            tamper_prob: 0.1,
+        });
+        sc
+    }
+
     /// Scenario names accepted by [`Scenario::named`].
-    pub const NAMES: [&'static str; 7] = [
+    pub const NAMES: [&'static str; 8] = [
         "clean",
         "geo_satellite",
         "edge_2g",
@@ -161,6 +192,7 @@ impl Scenario {
         "lora_like",
         "harsh_64",
         "harsh_64_crashy",
+        "disaster_hostile",
     ];
 
     /// A profile's default scenario, or one of the stress scenarios.
@@ -168,6 +200,7 @@ impl Scenario {
         match name {
             "harsh_64" => Some(Self::harsh_64(seed)),
             "harsh_64_crashy" => Some(Self::harsh_64_crashy(seed)),
+            "disaster_hostile" => Some(Self::disaster_hostile(seed)),
             _ => Profile::from_name(name).map(|p| Self::new(p, seed)),
         }
     }
@@ -211,7 +244,8 @@ struct Scheduled {
 type SimEngine = Engine<MemoryStorage, ChaCha20Rng>;
 
 struct Node {
-    key: PublicKey,
+    /// Identity seed; the host's "keychain".
+    secret: [u8; 32],
     /// `None` while crashed.
     engine: Option<SimEngine>,
     /// Storage left behind by a crash, waiting for the restart.
@@ -244,6 +278,10 @@ struct Sim<'a> {
     channels: [Channel; 2],
     outages: Outages,
     crash_rng: ChaCha20Rng,
+    adv_rng: ChaCha20Rng,
+    /// Recent packets the adversary has recorded, per direction.
+    recorded: [Vec<Vec<u8>>; 2],
+    injected: u64,
     msgs: Vec<Msg>,
     by_id: BTreeMap<MessageId, usize>,
     delivered: usize,
@@ -325,6 +363,7 @@ pub fn add_stats(a: &Stats, b: &Stats) -> Stats {
         packets_dropped_version,
         packets_dropped_malformed,
         packets_dropped_unauthenticated,
+        packets_dropped_replay,
         frames_unknown,
         frames_dropped_invalid,
         frames_dropped_window,
@@ -348,16 +387,17 @@ pub fn add_stats(a: &Stats, b: &Stats) -> Stats {
 
 impl<'a> Sim<'a> {
     fn new(sc: &'a Scenario) -> Self {
-        let mut keys = [PublicKey([0; 32]); 2];
+        let mut secrets = [[0u8; 32]; 2];
         let mut key_rng = stream(sc.seed, 1);
-        for k in &mut keys {
-            key_rng.fill_bytes(&mut k.0);
+        for k in &mut secrets {
+            key_rng.fill_bytes(k);
         }
+        let keys = secrets.map(|s| Identity::from_secret_bytes(&s).public_key());
         let nodes = (0..2)
             .map(|i| {
                 let mut engine = Engine::new(
                     sc.config,
-                    keys[i],
+                    Identity::from_secret_bytes(&secrets[i]),
                     MemoryStorage::new(),
                     stream(sc.seed, 10 + i as u64),
                 )
@@ -367,7 +407,7 @@ impl<'a> Sim<'a> {
                     .expect("valid profile link");
                 let conv = engine.add_contact(keys[1 - i]).expect("fresh contact");
                 Node {
-                    key: keys[i],
+                    secret: secrets[i],
                     engine: Some(engine),
                     wreck: None,
                     conv,
@@ -417,6 +457,9 @@ impl<'a> Sim<'a> {
             ],
             outages: Outages::new(sc.link.outage, stream(sc.seed, 5), SIM_EPOCH_MS),
             crash_rng: stream(sc.seed, 6),
+            adv_rng: stream(sc.seed, 7),
+            recorded: [Vec::new(), Vec::new()],
+            injected: 0,
             msgs,
             by_id: BTreeMap::new(),
             delivered: 0,
@@ -561,7 +604,8 @@ impl<'a> Sim<'a> {
         };
         n.incarnation += 1;
         let rng = stream(sc.seed, 100 + 2 * n.incarnation + node as u64);
-        let mut engine = Engine::restore(sc.config, n.key, storage, rng).expect("restore");
+        let identity = Identity::from_secret_bytes(&n.secret);
+        let mut engine = Engine::restore(sc.config, identity, storage, rng).expect("restore");
         engine
             .add_link(LINK, sc.link.engine_link())
             .expect("valid profile link");
@@ -588,8 +632,16 @@ impl<'a> Sim<'a> {
         for bytes in sent {
             self.packets += 1;
             self.wire_bytes += bytes.len() as u64;
+            self.attack(node, &bytes);
             let copies = self.channels[node].send(self.now, bytes, &mut self.outages);
-            for (at, bytes) in copies {
+            for (at, mut bytes) in copies {
+                if let Some(adv) = self.sc.adversary {
+                    if unit(&mut self.adv_rng) < adv.tamper_prob && !bytes.is_empty() {
+                        let bit = below(&mut self.adv_rng, bytes.len() as u64 * 8);
+                        bytes[(bit / 8) as usize] ^= 1 << (bit % 8);
+                        self.injected += 1;
+                    }
+                }
                 self.schedule(
                     at,
                     Ev::Arrive {
@@ -619,6 +671,48 @@ impl<'a> Sim<'a> {
             if let Some(at) = next {
                 self.schedule(at, Ev::Wake { node, generation });
             }
+        }
+    }
+
+    /// Records `bytes` and maybe injects a replay or a forgery toward the
+    /// other node. Injected packets bypass loss and outages.
+    fn attack(&mut self, from: usize, bytes: &[u8]) {
+        let Some(adv) = self.sc.adversary else {
+            return;
+        };
+        let rec = &mut self.recorded[from];
+        if rec.len() < 256 {
+            rec.push(bytes.to_vec());
+        } else {
+            let i = below(&mut self.adv_rng, rec.len() as u64) as usize;
+            rec[i] = bytes.to_vec();
+        }
+        let delay = 1 + below(&mut self.adv_rng, 600_000);
+        if unit(&mut self.adv_rng) < adv.replay_prob {
+            let i = below(&mut self.adv_rng, self.recorded[from].len() as u64) as usize;
+            let old = self.recorded[from][i].clone();
+            self.injected += 1;
+            self.schedule(
+                self.now + delay,
+                Ev::Arrive {
+                    node: 1 - from,
+                    bytes: old,
+                },
+            );
+        }
+        if unit(&mut self.adv_rng) < adv.forge_prob {
+            let mut forged = bytes.to_vec();
+            for b in forged.iter_mut().skip(5) {
+                *b = self.adv_rng.next_u32() as u8;
+            }
+            self.injected += 1;
+            self.schedule(
+                self.now + delay,
+                Ev::Arrive {
+                    node: 1 - from,
+                    bytes: forged,
+                },
+            );
         }
     }
 
@@ -715,6 +809,7 @@ impl<'a> Sim<'a> {
             integrity_violations: self.integrity_violations,
             out_of_order: self.out_of_order,
             crashes: self.crashes,
+            injected: self.injected,
             max_storage_bytes: self.max_storage_bytes,
             channels: [self.channels[0].stats, self.channels[1].stats],
             engines: [stats[0], stats[1]],

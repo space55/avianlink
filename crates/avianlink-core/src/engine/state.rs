@@ -4,7 +4,8 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use super::persist::ContactRecord;
-use crate::wire::{FragmentPlan, PairTag};
+use crate::crypto::PairKeys;
+use crate::wire::FragmentPlan;
 use crate::{LinkId, MessageId, PublicKey, Timestamp};
 
 /// Clock granularity term in the RTO (RFC 6298's `G`).
@@ -31,6 +32,8 @@ pub(super) struct OutMsg {
     pub(super) queued_at: Timestamp,
     /// Set on first transmission (D-017).
     pub(super) plan: Option<Planned>,
+    /// `MessageTransmitted` already reported in this incarnation.
+    pub(super) announced: bool,
 }
 
 #[derive(Debug)]
@@ -154,6 +157,10 @@ impl Rtt {
         }
     }
 
+    pub(super) fn srtt(&self) -> Option<u64> {
+        self.srtt
+    }
+
     pub(super) fn rto(&self, initial: u64, min: u64, max: u64, var_mult: u64) -> u64 {
         match self.srtt {
             None => initial.clamp(min, max),
@@ -164,11 +171,105 @@ impl Rtt {
     }
 }
 
+/// Replay window size in packets (`security.md` §6).
+pub(super) const REPLAY_WINDOW: u64 = 512;
+const REPLAY_WORDS: usize = 8;
+
+/// Highest accepted counter plus a 512-packet bitmap below it. Bit `k` set:
+/// counter `high - k` was accepted.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Replay {
+    high: Option<u64>,
+    bits: [u64; REPLAY_WORDS],
+}
+
+impl Replay {
+    /// A window that rejects everything at or below `floor` (after restore).
+    pub(super) fn with_floor(floor: Option<u64>) -> Self {
+        Self {
+            high: floor,
+            bits: [u64::MAX; REPLAY_WORDS],
+        }
+    }
+
+    pub(super) fn high(&self) -> Option<u64> {
+        self.high
+    }
+
+    /// Whether `counter` would be accepted. Does not change the window.
+    pub(super) fn fresh(&self, counter: u64) -> bool {
+        let Some(high) = self.high else {
+            return true;
+        };
+        if counter > high {
+            return true;
+        }
+        let k = high.saturating_sub(counter);
+        if k >= REPLAY_WINDOW {
+            return false;
+        }
+        let (w, b) = (k / 64, k % 64);
+        usize::try_from(w)
+            .ok()
+            .and_then(|w| self.bits.get(w))
+            .is_some_and(|word| word & (1u64 << b) == 0)
+    }
+
+    /// Records `counter` as accepted. Call only after authentication.
+    pub(super) fn mark(&mut self, counter: u64) {
+        match self.high {
+            Some(high) if counter <= high => {
+                let k = high.saturating_sub(counter);
+                if let Some(word) = usize::try_from(k / 64)
+                    .ok()
+                    .and_then(|w| self.bits.get_mut(w))
+                {
+                    *word |= 1u64 << (k % 64);
+                }
+            }
+            prev => {
+                let shift = prev.map_or(REPLAY_WINDOW, |h| counter.saturating_sub(h));
+                self.shift(shift);
+                self.high = Some(counter);
+                if let Some(w0) = self.bits.first_mut() {
+                    *w0 |= 1;
+                }
+            }
+        }
+    }
+
+    /// Ages every entry by `d` packets.
+    fn shift(&mut self, d: u64) {
+        if d >= REPLAY_WINDOW {
+            self.bits = [0; REPLAY_WORDS];
+            return;
+        }
+        let words = usize::try_from(d / 64).unwrap_or(REPLAY_WORDS);
+        let bits = u32::try_from(d % 64).unwrap_or(0);
+        let old = self.bits;
+        for (i, slot) in self.bits.iter_mut().enumerate() {
+            let src = i.checked_sub(words);
+            let hi = src.and_then(|s| old.get(s)).copied().unwrap_or(0);
+            let lo = src
+                .and_then(|s| s.checked_sub(1))
+                .and_then(|s| old.get(s))
+                .copied()
+                .unwrap_or(0);
+            *slot = if bits == 0 {
+                hi
+            } else {
+                hi.wrapping_shl(bits) | lo.wrapping_shr(64u32.saturating_sub(bits))
+            };
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct Contact {
     pub(super) key: PublicKey,
-    /// Tag on packets we send to this contact.
-    pub(super) tx_tag: PairTag,
+    /// Directional keys and routing tags.
+    pub(super) keys: PairKeys,
+    pub(super) replay: Replay,
     /// Link we last heard this contact on.
     pub(super) route: Option<LinkId>,
     pub(super) lamport: u64,
@@ -190,16 +291,19 @@ pub(super) struct Contact {
     pub(super) rx_largest: Option<(u64, Timestamp)>,
     /// Last authenticated packet from the peer.
     pub(super) last_heard: Option<Timestamp>,
+    /// Last packet from the peer with a new highest counter.
+    pub(super) last_fresh: Option<Timestamp>,
     /// 0: normal. k > 0: peer unreachable, probing every `rto * 2^k`.
     pub(super) backoff: u32,
     pub(super) probe_due: Timestamp,
 }
 
 impl Contact {
-    pub(super) fn new(key: PublicKey, tx_tag: PairTag) -> Self {
+    pub(super) fn new(key: PublicKey, keys: PairKeys) -> Self {
         Self {
             key,
-            tx_tag,
+            keys,
+            replay: Replay::default(),
             route: None,
             lamport: 0,
             next_seq: 0,
@@ -214,13 +318,14 @@ impl Contact {
             sent_log: VecDeque::new(),
             rx_largest: None,
             last_heard: None,
+            last_fresh: None,
             backoff: 0,
             probe_due: Timestamp::ZERO,
         }
     }
 
-    pub(super) fn from_record(r: &ContactRecord, tx_tag: PairTag) -> Self {
-        let mut c = Self::new(r.key, tx_tag);
+    pub(super) fn from_record(r: &ContactRecord, keys: PairKeys) -> Self {
+        let mut c = Self::new(r.key, keys);
         c.next_seq = r.next_seq;
         c.lamport = r.lamport;
         // Skip everything that might have been used before the crash.
@@ -271,11 +376,16 @@ impl Contact {
     }
 
     /// An authenticated packet with `counter` arrived from the peer.
+    /// Only a packet with a new highest counter is evidence that the
+    /// peer is sending *now*. An older one (a late reordered packet, or an
+    /// attacker replaying a packet whose original was lost) still
+    /// authenticates, but must not pull us out of backoff (security.md §9).
     pub(super) fn heard(&mut self, now: Timestamp, counter: u64) {
         self.last_heard = Some(now);
-        self.backoff = 0;
         if self.rx_largest.is_none_or(|(c, _)| counter > c) {
             self.rx_largest = Some((counter, now));
+            self.last_fresh = Some(now);
+            self.backoff = 0;
         }
     }
 
@@ -319,6 +429,29 @@ mod tests {
     }
 
     #[test]
+    fn replay_window_rejects_repeats_and_ancient_counters() {
+        let mut r = Replay::default();
+        assert!(r.fresh(5));
+        r.mark(5);
+        assert!(!r.fresh(5));
+        assert!(r.fresh(4) && r.fresh(6));
+        r.mark(3);
+        assert!(!r.fresh(3) && r.fresh(4));
+        r.mark(600);
+        assert!(!r.fresh(5) && !r.fresh(3), "5 and 3 fell out of the window");
+        assert!(r.fresh(100), "100 is inside the window and unseen");
+        r.mark(100);
+        assert!(!r.fresh(100) && !r.fresh(600) && r.fresh(599));
+        // Shifts that cross word boundaries keep earlier marks.
+        r.mark(670);
+        assert!(!r.fresh(600) && r.fresh(601) && !r.fresh(670));
+        assert!(!r.fresh(158), "below the window");
+        let f = Replay::with_floor(Some(1000));
+        assert!(!f.fresh(1000) && !f.fresh(999) && f.fresh(1001));
+        assert!(Replay::with_floor(None).fresh(0));
+    }
+
+    #[test]
     fn rtt_estimator_converges_and_clamps() {
         let mut r = Rtt::default();
         assert_eq!(r.rto(3000, 1000, 60_000, 4), 3000);
@@ -336,7 +469,14 @@ mod tests {
 
     #[test]
     fn probe_interval_doubles_to_cap() {
-        let mut c = Contact::new(PublicKey([0; 32]), [0; 3]);
+        let mut rng =
+            <rand_chacha::ChaCha20Rng as rand_chacha::rand_core::SeedableRng>::seed_from_u64(3);
+        let (a, b) = (
+            crate::Identity::generate(&mut rng),
+            crate::Identity::generate(&mut rng),
+        );
+        let keys = PairKeys::derive(&a, &b.public_key()).unwrap();
+        let mut c = Contact::new(b.public_key(), keys);
         let t = Timers {
             rto: 1000,
             max_rto: 10_000,

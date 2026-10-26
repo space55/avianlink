@@ -17,8 +17,8 @@ pub use frame::{
     FRAME_FRAG_ACK, FRAME_MSG, FRAME_PADDING,
 };
 pub use packet::{
-    begin_packet, header_len, peek_tag, seal_packet, split_verified, verify_check, PairTag,
-    CHECK_LEN, MAX_HEADER_LEN, MIN_PACKET_LEN, SIZING_COUNTER_LEN, TAG_LEN, VERSION,
+    begin_packet, header_len, parse_header, peek_tag, PairTag, AEAD_TAG_LEN, MAX_HEADER_LEN,
+    MIN_PACKET_LEN, SIZING_COUNTER_LEN, TAG_LEN, VERSION,
 };
 pub use reader::Reader;
 pub use record::{
