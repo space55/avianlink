@@ -112,6 +112,12 @@ pub struct Scenario {
     pub crashes: Option<CrashModel>,
     /// On-path attacker, if any.
     pub adversary: Option<Adversary>,
+    /// Scheduled outages as (start offset, duration) in ms, on top of the
+    /// profile's outage model.
+    pub fixed_outages: Vec<(u64, u64)>,
+    /// Whether hosts call `Engine::nudge` when a scheduled outage ends (as
+    /// an OS reporting "network available" would).
+    pub nudge_on_reconnect: bool,
 }
 
 impl Scenario {
@@ -134,6 +140,8 @@ impl Scenario {
             deadline_ms: 30 * 24 * 3_600_000,
             crashes: None,
             adversary: None,
+            fixed_outages: Vec::new(),
+            nudge_on_reconnect: false,
         }
     }
 
@@ -192,8 +200,21 @@ impl Scenario {
         sc
     }
 
+    /// Phase 5: an `edge_2g` link that goes down for a full week. 1000
+    /// messages are written over 9 days, most of them while the link is
+    /// down; both peers must converge afterwards with bounded bytes.
+    pub fn week_offline(seed: u64) -> Self {
+        const DAY: u64 = 24 * 3_600_000;
+        let mut sc = Self::new(Profile::Edge2g, seed);
+        sc.name = "week_offline".to_string();
+        sc.link.outage = None;
+        sc.mean_interval_ms = 9 * DAY / 1000;
+        sc.fixed_outages = vec![(DAY, 7 * DAY)];
+        sc
+    }
+
     /// Scenario names accepted by [`Scenario::named`].
-    pub const NAMES: [&'static str; 9] = [
+    pub const NAMES: [&'static str; 10] = [
         "clean",
         "geo_satellite",
         "edge_2g",
@@ -203,6 +224,7 @@ impl Scenario {
         "harsh_64_crashy",
         "disaster_hostile",
         "bursty_loss",
+        "week_offline",
     ];
 
     /// A profile's default scenario, or one of the stress scenarios.
@@ -212,6 +234,7 @@ impl Scenario {
             "harsh_64_crashy" => Some(Self::harsh_64_crashy(seed)),
             "disaster_hostile" => Some(Self::disaster_hostile(seed)),
             "bursty_loss" => Some(Self::bursty_loss(seed)),
+            "week_offline" => Some(Self::week_offline(seed)),
             _ => Profile::from_name(name).map(|p| Self::new(p, seed)),
         }
     }
@@ -241,6 +264,9 @@ enum Ev {
         node: usize,
     },
     Restart {
+        node: usize,
+    },
+    Nudge {
         node: usize,
     },
 }
@@ -306,6 +332,9 @@ struct Sim<'a> {
     out_of_order: u64,
     crashes: u64,
     max_storage_bytes: usize,
+    outage_wire_bytes: u64,
+    outage_packets: u64,
+    sync_anomalies: u64,
 }
 
 fn stream(seed: u64, n: u64) -> ChaCha20Rng {
@@ -398,7 +427,9 @@ pub fn add_stats(a: &Stats, b: &Stats) -> Stats {
         fec_repairs_dropped,
         fec_repairs_received,
         fec_recovered,
-        loss_reports_sent
+        loss_reports_sent,
+        syncs_sent,
+        syncs_received
     )
 }
 
@@ -490,7 +521,19 @@ impl<'a> Sim<'a> {
             out_of_order: 0,
             crashes: 0,
             max_storage_bytes: 0,
+            outage_wire_bytes: 0,
+            outage_packets: 0,
+            sync_anomalies: 0,
         };
+        for &(start, len) in &sc.fixed_outages {
+            let end = SIM_EPOCH_MS + start + len;
+            sim.outages.add_fixed(SIM_EPOCH_MS + start, end);
+            if sc.nudge_on_reconnect {
+                for node in 0..2 {
+                    sim.schedule(end, Ev::Nudge { node });
+                }
+            }
+        }
         for i in 0..sim.msgs.len() {
             let at = sim.msgs[i].scheduled_at;
             sim.schedule(at, Ev::Send { msg: i });
@@ -593,6 +636,10 @@ impl<'a> Sim<'a> {
                 self.restart(node);
                 Some(node)
             }
+            Ev::Nudge { node } => {
+                self.nodes[node].engine.as_mut()?.nudge(now);
+                Some(node)
+            }
         }
     }
 
@@ -646,9 +693,14 @@ impl<'a> Sim<'a> {
         let next = engine.next_timeout().map(|t| t.as_millis());
         self.max_storage_bytes = self.max_storage_bytes.max(engine.storage().bytes());
 
+        let in_outage = self.outages.in_fixed(self.now);
         for bytes in sent {
             self.packets += 1;
             self.wire_bytes += bytes.len() as u64;
+            if in_outage {
+                self.outage_packets += 1;
+                self.outage_wire_bytes += bytes.len() as u64;
+            }
             self.attack(node, &bytes);
             let copies = self.channels[node].send(self.now, bytes, &mut self.outages);
             for (at, mut bytes) in copies {
@@ -755,6 +807,11 @@ impl<'a> Sim<'a> {
                 msg.delivered_at = Some(self.now);
                 self.delivered += 1;
             }
+            Event::MessagesSkipped { .. } | Event::SyncDiverged { .. } => {
+                // Only state loss or rollback cause these; no scenario has
+                // either, so any occurrence is a bug.
+                self.sync_anomalies += 1;
+            }
             Event::MessageDelivered { id, .. } => {
                 let Some(&i) = self.by_id.get(&id) else {
                     self.integrity_violations += 1;
@@ -800,6 +857,22 @@ impl<'a> Sim<'a> {
             })
             .collect();
         let duration = self.now - SIM_EPOCH_MS;
+        // Convergence after the last scheduled outage: how long until every
+        // message sent before it ended had been delivered.
+        let converge_ms = self
+            .sc
+            .fixed_outages
+            .iter()
+            .map(|&(s, l)| SIM_EPOCH_MS + s + l)
+            .max()
+            .map(|end| {
+                self.msgs
+                    .iter()
+                    .filter(|m| m.sent_at.is_some_and(|t| t < end))
+                    .filter_map(|m| m.delivered_at)
+                    .max()
+                    .map_or(0, |d| d.saturating_sub(end))
+            });
         let downtime = self.outages.downtime(SIM_EPOCH_MS, self.now);
         let n = self.msgs.len();
         Report {
@@ -827,6 +900,10 @@ impl<'a> Sim<'a> {
             out_of_order: self.out_of_order,
             crashes: self.crashes,
             injected: self.injected,
+            outage_wire_bytes: self.outage_wire_bytes,
+            outage_packets: self.outage_packets,
+            converge_ms,
+            sync_anomalies: self.sync_anomalies,
             max_storage_bytes: self.max_storage_bytes,
             channels: [self.channels[0].stats, self.channels[1].stats],
             engines: [stats[0], stats[1]],

@@ -189,6 +189,8 @@ pub struct ChannelStats {
 #[derive(Debug)]
 pub(crate) struct Outages {
     model: Option<OutageModel>,
+    /// Scheduled [start, end) outages in addition to the model.
+    fixed: Vec<(u64, u64)>,
     rng: ChaCha20Rng,
     /// Sorted, non-overlapping [start, end) down intervals.
     down: Vec<(u64, u64)>,
@@ -199,13 +201,27 @@ impl Outages {
     pub(crate) fn new(model: Option<OutageModel>, rng: ChaCha20Rng, start: u64) -> Self {
         Self {
             model,
+            fixed: Vec::new(),
             rng,
             down: Vec::new(),
             generated_until: start,
         }
     }
 
+    /// Adds a scheduled outage [start, end).
+    pub(crate) fn add_fixed(&mut self, start: u64, end: u64) {
+        self.fixed.push((start, end));
+    }
+
+    /// Whether `t` falls in a scheduled outage.
+    pub(crate) fn in_fixed(&self, t: u64) -> bool {
+        self.fixed.iter().any(|&(s, e)| s <= t && t < e)
+    }
+
     pub(crate) fn is_down(&mut self, t: u64) -> bool {
+        if self.in_fixed(t) {
+            return true;
+        }
         let Some(m) = self.model else {
             return false;
         };
@@ -228,14 +244,23 @@ impl Outages {
 
     /// Total down time within `[from, to)`.
     pub(crate) fn downtime(&mut self, from: u64, to: u64) -> u64 {
-        if self.model.is_none() {
-            return 0;
-        }
-        self.is_down(to);
-        self.down
+        let fixed: u64 = self
+            .fixed
             .iter()
             .map(|&(s, e)| e.min(to).saturating_sub(s.max(from)))
-            .sum()
+            .sum();
+        if self.model.is_none() {
+            return fixed;
+        }
+        self.is_down(to);
+        // Overlaps between scheduled and modelled outages are counted twice;
+        // scenarios use one or the other.
+        fixed
+            + self
+                .down
+                .iter()
+                .map(|&(s, e)| e.min(to).saturating_sub(s.max(from)))
+                .sum::<u64>()
     }
 }
 

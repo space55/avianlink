@@ -4,6 +4,7 @@
 //! simrun [--profile NAME|all|everything] [--seed N] [--seeds K] [--messages N]
 //!        [--interval-ms N] [--verbose] [--csv] [--fec off|xor|rs]
 //!        [--mix SHORT,MEDIUM] [--fec-sources K] [--fec-flush MS] [--mtu BYTES]
+//!        [--deep-after MS] [--max-probe MS] [--nudge]
 //!        [--max-rto MS] [--min-rto MS] [--initial-rto MS] [--var-mult N] [--grace N]
 //!
 //! NAME is a profile (clean, geo_satellite, edge_2g, disaster_cellular,
@@ -25,6 +26,7 @@ fn main() {
     let mut csv = false;
     let mut fec = None;
     let mut mix: Option<(f64, f64)> = None;
+    let mut nudge = false;
     let mut tweak: Vec<(String, u64)> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -50,6 +52,7 @@ fn main() {
             "--interval-ms" => interval = Some(num(&val())),
             "--verbose" | "-v" => verbose = true,
             "--csv" => csv = true,
+            "--nudge" => nudge = true,
             "--mix" => {
                 let v = val();
                 let parts: Vec<f64> = v.split(',').filter_map(|x| x.parse().ok()).collect();
@@ -67,7 +70,9 @@ fn main() {
                 })
             }
             "--max-rto" | "--min-rto" | "--initial-rto" | "--var-mult" | "--grace"
-            | "--fec-sources" | "--fec-flush" | "--mtu" => tweak.push((a.clone(), num(&val()))),
+            | "--fec-sources" | "--fec-flush" | "--mtu" | "--deep-after" | "--max-probe" => {
+                tweak.push((a.clone(), num(&val())))
+            }
             _ => usage(&format!("unknown argument {a}")),
         }
     }
@@ -90,6 +95,7 @@ fn main() {
             if let Some(f) = fec {
                 sc.config.fec = f;
             }
+            sc.nudge_on_reconnect |= nudge;
             if let Some((short, medium)) = mix {
                 sc.lengths = avianlink_sim::LengthMix { short, medium };
             }
@@ -102,6 +108,8 @@ fn main() {
                     "--fec-sources" => sc.config.fec_max_sources = *v as u8,
                     "--fec-flush" => sc.config.fec_flush_ms = *v,
                     "--mtu" => sc.link.mtu = *v as u16,
+                    "--deep-after" => sc.config.deep_backoff_after_ms = *v,
+                    "--max-probe" => sc.config.max_probe_interval_ms = *v,
                     _ => sc.config.backoff_grace = *v as u8,
                 }
             }

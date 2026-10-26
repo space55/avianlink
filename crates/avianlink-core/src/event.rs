@@ -20,6 +20,29 @@ pub enum Event {
         /// The transmitted message.
         id: MessageId,
     },
+    /// The peer will never send these messages: they were acknowledged by,
+    /// or abandoned toward, a previous state of this engine (for example a
+    /// reinstall with the same identity). Reported once.
+    MessagesSkipped {
+        /// Conversation.
+        conversation: ConversationId,
+        /// First skipped seq.
+        first_seq: u64,
+        /// How many seqs at or after `first_seq` (below the peer's floor)
+        /// will never arrive.
+        count: u64,
+    },
+    /// Both sides hold different messages under the same seqs
+    /// (`docs/reliability.md` §7), e.g. after the peer restored old
+    /// storage. Detected, not repaired. Reported once per block.
+    SyncDiverged {
+        /// Conversation.
+        conversation: ConversationId,
+        /// First seq of the mismatched block.
+        first_seq: u64,
+        /// Last seq of the mismatched block.
+        last_seq: u64,
+    },
     /// The peer acknowledged one of our messages.
     MessageDelivered {
         /// Conversation the message belongs to.

@@ -61,6 +61,12 @@ pub struct Config {
     /// Probes to an unreachable peer sent at the plain RTO before the
     /// interval starts doubling.
     pub backoff_grace: u8,
+    /// After this long in backoff without a fresh packet, probes carry only
+    /// a SYNC frame instead of data (deep backoff). `u64::MAX` disables it.
+    pub deep_backoff_after_ms: u64,
+    /// Upper bound on the probe interval. In long silences the interval is
+    /// 1/64 of the silence so far, up to this.
+    pub max_probe_interval_ms: u64,
     /// Packet send times remembered per contact for RTT sampling. ACKs for
     /// older packets yield no sample.
     pub max_sent_log: u16,
@@ -112,6 +118,8 @@ impl Default for Config {
             max_rto_ms: 30_000,
             rttvar_multiplier: 2,
             backoff_grace: 2,
+            deep_backoff_after_ms: 3_600_000,
+            max_probe_interval_ms: 3_600_000,
             max_sent_log: 256,
             max_frag_acks_per_packet: 2,
             counter_reservation: 1024,
@@ -148,6 +156,7 @@ impl Config {
             || self.max_duty_log_entries == 0
             || self.min_rto_ms == 0
             || self.min_rto_ms > self.max_rto_ms
+            || self.max_probe_interval_ms < self.max_rto_ms
             || self.initial_rto_ms == 0
             || self.max_sent_log == 0
             || self.counter_reservation == 0

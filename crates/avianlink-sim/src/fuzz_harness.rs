@@ -38,8 +38,17 @@ pub fn decode(data: &[u8]) {
     let _ = wire::parse_header(data);
     let _ = wire::validate_frames(data);
     for f in wire::Frames::new(data) {
-        if let Ok(wire::Frame::Ack(a)) = f {
-            let _ = (a.covers(0), a.covers(u64::MAX), a.horizon());
+        match f {
+            Ok(wire::Frame::Ack(a)) => {
+                let _ = (a.covers(0), a.covers(u64::MAX), a.horizon());
+            }
+            Ok(wire::Frame::Sync(s)) => {
+                let _ = s.digests();
+            }
+            Ok(wire::Frame::Repair(r)) => {
+                let _ = r.sources();
+            }
+            _ => {}
         }
     }
     let _ = wire::decode_record(data, 4096);

@@ -216,7 +216,13 @@ fn unreachable_peer_gets_doubling_probes_then_full_resend_on_contact() {
         gaps.iter().any(|&g| g >= cap),
         "capped at max_rto: {gaps:?}"
     );
-    assert!(gaps.iter().all(|&g| g <= cap + cap / 8), "{gaps:?}");
+    // Within the first minutes the cap holds; after that the interval
+    // follows 1/16 of the silence (it began when the first probe went out).
+    let start = sends[0];
+    for (w, &g) in sends.windows(2).zip(&gaps) {
+        let silence = w[0] - start + 3_000;
+        assert!(g <= (cap + cap / 8).max(silence / 64 + 1_000), "{gaps:?}");
+    }
     assert!(a.stats().probes_sent as usize >= sends.len() - 1);
 
     // The peer speaks: A leaves backoff and resends everything at once.
@@ -921,4 +927,160 @@ fn fec_stays_off_on_budget_poor_links_and_in_backoff() {
         repairs,
         "no repairs into an outage"
     );
+}
+
+/// Exchanges packets between `a` and `b` (losslessly) until both are quiet
+/// or `until` is reached; returns the time reached.
+fn converse(a: &mut E, b: &mut E, mut now: u64, until: u64) -> u64 {
+    while now < until {
+        let pa = drain_tx(a, t(now));
+        deliver(b, &pa, t(now));
+        let pb = drain_tx(b, t(now));
+        deliver(a, &pb, t(now));
+        let next = [a.next_timeout(), b.next_timeout()]
+            .into_iter()
+            .flatten()
+            .min();
+        match next {
+            Some(n) if n.as_millis() < until => now = n.as_millis().max(now + 1),
+            _ if pa.is_empty() && pb.is_empty() => break,
+            _ => now += 1,
+        }
+    }
+    now
+}
+
+#[test]
+fn wiped_receiver_skips_unrecoverable_gap_instead_of_stalling() {
+    let cfg = Config {
+        max_reorder_window: 64,
+        ..Config::default()
+    };
+    let (mut a, ca) = engine_with(cfg, A, B, 256);
+    let (mut b, _) = engine_with(cfg, B, A, 256);
+    for i in 0..100 {
+        a.send_text(ca, &alloc::format!("old {i}"), t(i)).unwrap();
+    }
+    let now = converse(&mut a, &mut b, 0, 600_000);
+    assert_eq!(a.outbox_len(), 0, "all 100 delivered to the old install");
+    // B reinstalls: same identity, empty storage.
+    let (mut b, _) = engine_with(cfg, B, A, 256);
+    let q = a.send_text(ca, "after reinstall", t(now)).unwrap();
+    assert_eq!(q.seq, 100);
+    converse(&mut a, &mut b, now, now + 3_600_000);
+    let ev = drain_events(&mut b);
+    assert!(
+        ev.iter().any(|e| matches!(
+            e,
+            Event::MessagesSkipped {
+                first_seq: 0,
+                count: 100,
+                ..
+            }
+        )),
+        "{ev:?}"
+    );
+    assert!(ev
+        .iter()
+        .any(|e| matches!(e, Event::MessageReceived(m) if m.id == q.id)));
+    assert_eq!(a.outbox_len(), 0);
+}
+
+#[test]
+fn storage_rollback_is_detected_as_divergence() {
+    let (mut a, ca) = engine(A, B, 256);
+    let (mut b, _) = engine(B, A, 256);
+    a.send_text(ca, "original 0", t(0)).unwrap();
+    let now = converse(&mut a, &mut b, 0, 600_000);
+    // The backup postdates a counter reservation, so the restored engine's
+    // packets get past B's replay window (an earlier backup would reuse
+    // counters and be rejected outright, security.md §4).
+    let backup = a.storage().crash_snapshot();
+    for i in 1..64 {
+        a.send_text(ca, &alloc::format!("original {i}"), t(now + i))
+            .unwrap();
+    }
+    let now = converse(&mut a, &mut b, now, now + 600_000);
+    assert_eq!(received(&drain_events(&mut b)).len(), 64);
+    // A restores the old backup and writes different messages under the
+    // same seqs; B dedupes them by seq, and only the digest can tell.
+    let mut a = Engine::restore(*a.config(), id(A), backup, rng(A)).unwrap();
+    a.add_link(L, link(256)).unwrap();
+    for i in 1..64 {
+        a.send_text(ca, &alloc::format!("rewritten {i}"), t(now + i))
+            .unwrap();
+    }
+    converse(&mut a, &mut b, now, now + 600_000);
+    let ev = drain_events(&mut b);
+    assert!(received(&ev).is_empty(), "duplicates by seq, as feared");
+    assert!(
+        ev.iter().any(|e| matches!(
+            e,
+            Event::SyncDiverged {
+                first_seq: 0,
+                last_seq: 63,
+                ..
+            }
+        )),
+        "{ev:?}"
+    );
+}
+
+#[test]
+fn a_week_of_silence_costs_little_and_nudge_wakes_probing() {
+    let (mut a, ca) = engine(A, B, 256);
+    a.send_text(ca, &"into the void ".repeat(10), t(0)).unwrap();
+    let week = 7 * 24 * 3_600_000u64;
+    let (mut packets, mut bytes, mut late_max) = (0u64, 0u64, 0usize);
+    let mut now = 0;
+    while now < week {
+        for p in drain_tx(&mut a, t(now)) {
+            packets += 1;
+            bytes += p.len() as u64;
+            if now > 2 * 3_600_000 {
+                late_max = late_max.max(p.len());
+            }
+        }
+        now = a.next_timeout().unwrap().as_millis().max(now + 1);
+    }
+    // Phase 4 behaviour: ~20,000 MTU-sized probes (3.4 MB). Now an hour of
+    // data probes, then bare SYNCs at 1/64 of the silence.
+    assert!(packets < 700, "{packets} packets");
+    assert!(bytes < 64 * 1024, "{bytes} bytes");
+    assert!(
+        late_max < 40,
+        "deep probes are SYNC-only, got {late_max} bytes"
+    );
+    let st = a.contact_status(ca).unwrap();
+    assert!(st.unreachable);
+    drain_tx(&mut a, t(now)); // the probe due at the end of the week
+    let next = a.next_timeout().unwrap();
+    assert!(
+        next.as_millis() > now + 60_000,
+        "deep backoff: next probe far away"
+    );
+    a.nudge(t(now));
+    assert_eq!(a.next_timeout(), Some(t(now)), "nudge probes now");
+    assert_eq!(drain_tx(&mut a, t(now)).len(), 1);
+}
+
+#[test]
+fn sync_reveals_tail_loss() {
+    let (mut a, ca) = engine(A, B, 256);
+    let (mut b, _) = engine(B, A, 256);
+    for i in 0..3 {
+        a.send_text(ca, &alloc::format!("m{i} {}", "x".repeat(180)), t(0))
+            .unwrap();
+    }
+    assert_eq!(drain_tx(&mut a, t(0)).len(), 3); // all lost
+                                                 // A's probe carries the oldest message plus a SYNC; B learns from it
+                                                 // that two newer messages exist and ACKs at once, so A resends them.
+    let mut now = a.next_timeout().unwrap().as_millis();
+    let probe = drain_tx(&mut a, t(now));
+    deliver(&mut b, &probe, t(now));
+    assert_eq!(b.next_timeout(), Some(t(now)), "reply is immediate");
+    now = converse(&mut a, &mut b, now, now + 60_000);
+    assert_eq!(received(&drain_events(&mut b)).len(), 3);
+    assert!(b.stats().syncs_received >= 1);
+    let _ = now;
 }

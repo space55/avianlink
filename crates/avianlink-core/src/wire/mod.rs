@@ -13,9 +13,10 @@ use core::fmt;
 
 pub use frame::{
     ack_frame_len, frag_ack_frame_len, loss_frame_len, msg_frame_len, put_ack_frame,
-    put_frag_ack_frame, put_loss_frame, put_msg_frame, put_repair_frame, repair_frame_len,
-    validate_frames, AckFrame, FragAckFrame, Frame, Frames, MsgFrame, Part, RepairFrame, FRAME_ACK,
-    FRAME_FRAG_ACK, FRAME_LOSS, FRAME_MSG, FRAME_PADDING, FRAME_REPAIR,
+    put_frag_ack_frame, put_loss_frame, put_msg_frame, put_repair_frame, put_sync_frame,
+    repair_frame_len, sync_frame_len, validate_frames, AckFrame, FragAckFrame, Frame, Frames,
+    MsgFrame, Part, RepairFrame, SyncFrame, FRAME_ACK, FRAME_FRAG_ACK, FRAME_LOSS, FRAME_MSG,
+    FRAME_PADDING, FRAME_REPAIR, FRAME_SYNC, MAX_SYNC_DIGESTS, SYNC_BLOCK, SYNC_REPLY_WANTED,
 };
 pub use packet::{
     begin_packet, header_len, parse_header, peek_tag, PairTag, AEAD_TAG_LEN, MAX_HEADER_LEN,

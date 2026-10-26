@@ -3,15 +3,23 @@
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
-use super::persist::ContactRecord;
+use super::persist::{BlockDigest, ContactRecord, RecvDigest};
 use crate::crypto::PairKeys;
 use crate::wire::FragmentPlan;
 use crate::{LinkId, MessageId, PublicKey, Timestamp};
+
+fn id8(id: &crate::MessageId) -> [u8; 8] {
+    let mut h = [0u8; 8];
+    h.iter_mut().zip(id.0).for_each(|(o, b)| *o = b);
+    h
+}
 
 /// Clock granularity term in the RTO (RFC 6298's `G`).
 const RTO_GRANULARITY_MS: u64 = 100;
 /// Backoff exponent cap; the interval is capped by `max_rto_ms` long before.
 const MAX_BACKOFF: u32 = 20;
+/// In long silences the probe interval is this fraction of the silence.
+const PROBE_SILENCE_DIVISOR: u64 = 64;
 
 /// One fragment's retransmission state.
 #[derive(Debug, Clone, Copy, Default)]
@@ -53,6 +61,13 @@ pub(super) struct Timers {
     pub(super) grace: u32,
     /// Lower bound on the probe interval from the link's budget.
     pub(super) probe_floor: u64,
+    /// Upper bound on the probe interval (`max_probe_interval`).
+    pub(super) probe_cap: u64,
+    /// How long the current backoff has lasted (0 when not in backoff).
+    pub(super) silence: u64,
+    /// Whether the silence has reached `deep_backoff_after_ms`: probes then
+    /// carry only a SYNC.
+    pub(super) deep: bool,
 }
 
 impl OutMsg {
@@ -351,6 +366,16 @@ pub(super) struct Contact {
     /// Last loss we reported, and packets received since.
     pub(super) loss_reported: Option<u64>,
     pub(super) rx_since_report: u32,
+    /// When the current backoff began (deep backoff, `reliability.md` §3).
+    pub(super) backoff_since: Option<Timestamp>,
+    /// A SYNC frame should ride on the next packet to this contact.
+    pub(super) sync_due: bool,
+    /// Digests of our last sent blocks (persisted in the contact record).
+    pub(super) sent_digests: Vec<BlockDigest>,
+    /// Digests of the peer's last received blocks (persisted with the inbox).
+    pub(super) recv_digests: Vec<RecvDigest>,
+    /// Blocks already reported as diverged.
+    pub(super) diverged: Vec<u64>,
 }
 
 impl Contact {
@@ -381,6 +406,11 @@ impl Contact {
             arrivals: Replay::default(),
             loss_reported: None,
             rx_since_report: 0,
+            backoff_since: None,
+            sync_due: false,
+            sent_digests: Vec::new(),
+            recv_digests: Vec::new(),
+            diverged: Vec::new(),
         }
     }
 
@@ -391,6 +421,9 @@ impl Contact {
         // Skip everything that might have been used before the crash.
         c.tx_counter = r.counter_reserved;
         c.counter_reserved = r.counter_reserved;
+        c.sent_digests = r.sent_digests.clone();
+        // Announce the restored floor and next.
+        c.sync_due = true;
         c
     }
 
@@ -400,7 +433,58 @@ impl Contact {
             next_seq: self.next_seq,
             lamport: self.lamport,
             counter_reserved: self.counter_reserved,
+            sent_digests: self.sent_digests.clone(),
         }
+    }
+
+    /// Folds message `id` with `seq` into our sent-block digests.
+    pub(super) fn fold_sent(ds: &mut Vec<BlockDigest>, seq: u64, id: &crate::MessageId) {
+        let block = seq / crate::wire::SYNC_BLOCK;
+        let h = id8(id);
+        match ds.iter_mut().find(|d| d.0 == block) {
+            Some(d) => d.1.iter_mut().zip(h).for_each(|(a, b)| *a ^= b),
+            None => ds.push((block, h)),
+        }
+        while ds.len() > crate::wire::MAX_SYNC_DIGESTS {
+            ds.remove(0);
+        }
+    }
+
+    /// Folds a received message into the received-block digests.
+    pub(super) fn fold_recv(ds: &mut Vec<RecvDigest>, seq: u64, id: &crate::MessageId) {
+        let block = seq / crate::wire::SYNC_BLOCK;
+        let h = id8(id);
+        match ds.iter_mut().find(|d| d.0 == block) {
+            Some(d) => {
+                d.1.iter_mut().zip(h).for_each(|(a, b)| *a ^= b);
+                d.2 = d.2.saturating_add(1);
+            }
+            None => ds.push((block, h, 1)),
+        }
+        ds.sort_unstable_by_key(|d| d.0);
+        while ds.len() > crate::wire::MAX_SYNC_DIGESTS {
+            ds.remove(0);
+        }
+    }
+
+    /// Sent-block digests the peer can compare: the two most recent
+    /// completed blocks.
+    pub(super) fn sync_digests(&self) -> Vec<BlockDigest> {
+        let done = self.next_seq / crate::wire::SYNC_BLOCK;
+        let mut ds: Vec<BlockDigest> = self
+            .sent_digests
+            .iter()
+            .filter(|d| d.0 < done)
+            .copied()
+            .collect();
+        let excess = ds.len().saturating_sub(2);
+        ds.drain(..excess);
+        ds
+    }
+
+    /// Lowest seq we can still deliver to the peer.
+    pub(super) fn floor(&self) -> u64 {
+        self.outbox.keys().next().copied().unwrap_or(self.next_seq)
     }
 
     /// When outgoing data is next due, if there is any.
@@ -422,16 +506,20 @@ impl Contact {
         }
     }
 
-    /// Probe interval at the current backoff level.
+    /// Probe interval at the current backoff level: the short-term doubling
+    /// (capped at `max_rto`), or 1/64 of the silence so far once that is
+    /// longer, at most `max_probe_interval` (`reliability.md` §3, D-040).
     pub(super) fn probe_interval(&self, t: Timers) -> u64 {
         let shift = self.backoff.saturating_sub(t.grace).min(MAX_BACKOFF);
-        t.rto
-            .saturating_mul(1u64 << shift)
-            .min(t.max_rto)
-            .max(t.probe_floor)
+        let short = t.rto.saturating_mul(1u64 << shift).min(t.max_rto);
+        let long = t.silence / PROBE_SILENCE_DIVISOR;
+        short.max(long).min(t.probe_cap).max(t.probe_floor)
     }
 
-    pub(super) fn deepen_backoff(&mut self) {
+    pub(super) fn deepen_backoff(&mut self, now: Timestamp) {
+        if self.backoff == 0 {
+            self.backoff_since = Some(now);
+        }
         self.backoff = self.backoff.saturating_add(1).min(MAX_BACKOFF);
     }
 
@@ -446,6 +534,7 @@ impl Contact {
             self.rx_largest = Some((counter, now));
             self.last_fresh = Some(now);
             self.backoff = 0;
+            self.backoff_since = None;
         }
     }
 
@@ -551,15 +640,29 @@ mod tests {
             max_rto: 10_000,
             grace: 0,
             probe_floor: 0,
+            probe_cap: 3_600_000,
+            silence: 0,
+            deep: false,
         };
-        c.deepen_backoff();
+        c.deepen_backoff(Timestamp::ZERO);
         assert_eq!(c.probe_interval(t), 2000);
-        c.deepen_backoff();
+        c.deepen_backoff(Timestamp::ZERO);
         assert_eq!(c.probe_interval(t), 4000);
         for _ in 0..30 {
-            c.deepen_backoff();
+            c.deepen_backoff(Timestamp::ZERO);
         }
         assert_eq!(c.probe_interval(t), 10_000);
+        // A long silence stretches the interval to 1/64 of it, up to the cap.
+        let long = Timers {
+            silence: 128 * 60_000,
+            ..t
+        };
+        assert_eq!(c.probe_interval(long), 120_000);
+        let longer = Timers {
+            silence: 7 * 24 * 3_600_000,
+            ..t
+        };
+        assert_eq!(c.probe_interval(longer), 3_600_000);
         let floored = Timers {
             probe_floor: 50_000,
             ..t

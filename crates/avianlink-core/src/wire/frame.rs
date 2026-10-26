@@ -10,6 +10,14 @@ pub const FRAME_MSG: u64 = 0x01;
 pub const FRAME_ACK: u64 = 0x02;
 /// REPAIR frame type: FEC repair symbol.
 pub const FRAME_REPAIR: u64 = 0x03;
+/// SYNC frame type: the sender's reconciliation summary.
+pub const FRAME_SYNC: u64 = 0x04;
+/// SYNC flag: the recipient should reply with its ACK and SYNC.
+pub const SYNC_REPLY_WANTED: u64 = 1;
+/// Seqs per SYNC digest block.
+pub const SYNC_BLOCK: u64 = 64;
+/// Most digests in one SYNC frame.
+pub const MAX_SYNC_DIGESTS: usize = 4;
 /// FRAG_ACK frame type: per-fragment acknowledgement.
 pub const FRAME_FRAG_ACK: u64 = 0x05;
 /// LOSS frame type: receiver's measured loss.
@@ -135,6 +143,40 @@ impl RepairFrame<'_> {
     }
 }
 
+/// The sender's reconciliation summary (wire §3.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyncFrame<'a> {
+    /// Flag bits ([`SYNC_REPLY_WANTED`]).
+    pub flags: u64,
+    /// Lowest seq the sender can still deliver.
+    pub floor: u64,
+    /// Sender's next unused seq.
+    pub next: u64,
+    digests: &'a [u8],
+}
+
+impl SyncFrame<'_> {
+    /// Whether the sender asked for a reply.
+    pub fn reply_wanted(&self) -> bool {
+        self.flags & SYNC_REPLY_WANTED != 0
+    }
+
+    /// The `(block, hash)` digests, at most [`MAX_SYNC_DIGESTS`]. Malformed
+    /// trailing data ends the list.
+    pub fn digests(&self) -> alloc::vec::Vec<(u64, [u8; 8])> {
+        let mut r = Reader::new(self.digests);
+        let n = r.varint().unwrap_or(0);
+        let mut out = alloc::vec::Vec::new();
+        for _ in 0..n.min(MAX_SYNC_DIGESTS as u64) {
+            let (Ok(block), Ok(hash)) = (r.varint(), r.array::<8>()) else {
+                break;
+            };
+            out.push((block, hash));
+        }
+        out
+    }
+}
+
 /// A decoded frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Frame<'a> {
@@ -150,6 +192,8 @@ pub enum Frame<'a> {
     Repair(RepairFrame<'a>),
     /// Receiver's measured loss, in permille.
     Loss(u64),
+    /// Reconciliation summary.
+    Sync(SyncFrame<'a>),
     /// A frame type this version does not know; skipped.
     Unknown {
         /// The unknown type.
@@ -222,6 +266,17 @@ impl<'a> Frames<'a> {
                 })
             }
             FRAME_LOSS => Frame::Loss(b.varint()?),
+            FRAME_SYNC => {
+                let flags = b.varint()?;
+                let floor = b.varint()?;
+                let next = b.varint()?;
+                Frame::Sync(SyncFrame {
+                    flags,
+                    floor,
+                    next,
+                    digests: b.rest(),
+                })
+            }
             FRAME_FRAG_ACK => {
                 let seq = b.varint()?;
                 let unit = b.varint()?;
@@ -337,6 +392,39 @@ pub fn put_repair_frame(out: &mut Vec<u8>, base: u64, mask: u64, shape: u8, data
     put_varint(out, mask);
     out.push(shape);
     out.extend_from_slice(data);
+}
+
+fn sync_body(flags: u64, floor: u64, next: u64, digests: &[(u64, [u8; 8])]) -> Vec<u8> {
+    let mut body = Vec::new();
+    put_varint(&mut body, flags);
+    put_varint(&mut body, floor);
+    put_varint(&mut body, next);
+    let n = digests.len().min(MAX_SYNC_DIGESTS);
+    put_varint(&mut body, u64::try_from(n).unwrap_or(0));
+    for (block, hash) in digests.iter().take(n) {
+        put_varint(&mut body, *block);
+        body.extend_from_slice(hash);
+    }
+    body
+}
+
+/// Encoded length of a SYNC frame.
+pub fn sync_frame_len(flags: u64, floor: u64, next: u64, digests: &[(u64, [u8; 8])]) -> usize {
+    frame_len(FRAME_SYNC, sync_body(flags, floor, next, digests).len())
+}
+
+/// Appends a SYNC frame.
+pub fn put_sync_frame(
+    out: &mut Vec<u8>,
+    flags: u64,
+    floor: u64,
+    next: u64,
+    digests: &[(u64, [u8; 8])],
+) {
+    let body = sync_body(flags, floor, next, digests);
+    put_varint(out, FRAME_SYNC);
+    put_varint(out, u64::try_from(body.len()).unwrap_or(u64::MAX));
+    out.extend_from_slice(&body);
 }
 
 /// Encoded length of a LOSS frame.
@@ -476,6 +564,28 @@ mod tests {
             ..bad
         };
         assert_eq!(bad.sources(), None, "j >= m");
+    }
+
+    #[test]
+    fn sync_frame_round_trips() {
+        let mut out = Vec::new();
+        let digests = [(3u64, [1u8; 8]), (4, [2; 8])];
+        put_sync_frame(&mut out, SYNC_REPLY_WANTED, 200, 300, &digests);
+        assert_eq!(out.len(), sync_frame_len(1, 200, 300, &digests));
+        let frames: Vec<_> = Frames::new(&out).collect::<Result<_, _>>().unwrap();
+        let Frame::Sync(s) = frames[0] else {
+            panic!("{frames:?}")
+        };
+        assert!(s.reply_wanted());
+        assert_eq!((s.floor, s.next, s.digests()), (200, 300, digests.to_vec()));
+        // Truncated digests end the list, they don't fail the frame.
+        let short = SyncFrame {
+            flags: 0,
+            floor: 0,
+            next: 0,
+            digests: &[2, 7, 1, 2],
+        };
+        assert!(short.digests().is_empty());
     }
 
     #[test]

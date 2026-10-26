@@ -68,6 +68,16 @@ pub struct Report {
     pub crashes: u64,
     /// Packets injected or tampered with by the adversary.
     pub injected: u64,
+    /// Bytes engines sent while a scheduled outage was in progress.
+    pub outage_wire_bytes: u64,
+    /// Packets engines sent while a scheduled outage was in progress.
+    pub outage_packets: u64,
+    /// Time from the end of the last scheduled outage until every message
+    /// sent before then was delivered.
+    pub converge_ms: Option<u64>,
+    /// `MessagesSkipped` / `SyncDiverged` events (bug: no scenario loses or
+    /// rolls back state).
+    pub sync_anomalies: u64,
     /// Largest committed storage footprint of either node, in bytes.
     pub max_storage_bytes: usize,
     /// Per-direction channel counters (0: peer A → B).
@@ -107,6 +117,7 @@ impl Report {
         self.stalls
             + self.duplicate_deliveries
             + self.integrity_violations
+            + self.sync_anomalies
             + ch.oversize
             + ch.duty_violations
     }
@@ -247,6 +258,16 @@ impl fmt::Display for Report {
             "  host            crashes {}, adversary packets {}, out-of-order arrivals {}, max storage {} B, outbox-full retries {}",
             self.crashes, self.injected, self.out_of_order, self.max_storage_bytes, self.outbox_full_retries
         )?;
+        if let Some(c) = self.converge_ms {
+            writeln!(
+                f,
+                "  long outage     {} packets / {} B sent while down; converged {} after it ended; syncs sent {}",
+                self.outage_packets,
+                self.outage_wire_bytes,
+                fmt_ms(c),
+                e(|s| s.syncs_sent)
+            )?;
+        }
         writeln!(
             f,
             "  time            sim {} (down {}), wall {:.0} ms, {:.0} sim-hours/wall-minute",

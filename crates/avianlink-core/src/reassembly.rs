@@ -205,6 +205,19 @@ impl Reassembly {
         Some((u64::try_from(p.unit).unwrap_or(u64::MAX), bitmap))
     }
 
+    /// Drops partials of `conv` below `seq` (the peer will never complete
+    /// them).
+    pub(crate) fn discard_below(&mut self, conv: ConversationId, seq: u64) {
+        let keys: Vec<_> = self
+            .partials
+            .range((conv, 0)..(conv, seq))
+            .map(|(k, _)| *k)
+            .collect();
+        for k in keys {
+            self.remove(&k);
+        }
+    }
+
     /// Drops every partial of `conv` (contact removed).
     pub(crate) fn discard_conversation(&mut self, conv: ConversationId) {
         let keys: Vec<_> = self

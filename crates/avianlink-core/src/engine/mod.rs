@@ -17,9 +17,10 @@ use crate::wire::{
     self, ack_frame_len, begin_packet, decode_record, encode_record, frag_ack_frame_len,
     frame_space, header_len, loss_frame_len, msg_frame_len, plan_fragments, put_ack_frame,
     put_frag_ack_frame, put_loss_frame, put_msg_frame, put_repair_frame, repair_frame_len,
-    AckFrame, DecodeError, FragAckFrame, Frame, Frames, MsgFrame, PairTag, Record, AEAD_TAG_LEN,
-    TIMESTAMP_EPOCH_UNIX_SECS,
+    AckFrame, DecodeError, FragAckFrame, Frame, Frames, MsgFrame, PairTag, Record, SyncFrame,
+    AEAD_TAG_LEN, TIMESTAMP_EPOCH_UNIX_SECS,
 };
+use crate::wire::{put_sync_frame, sync_frame_len};
 use crate::{
     Config, ConversationId, Error, Event, LinkConfig, LinkId, MessageId, Packet, PublicKey,
     ReceivedMessage, Storage, Timestamp,
@@ -169,6 +170,10 @@ pub struct Stats {
     pub frag_acks_sent: u64,
     /// RTT samples taken.
     pub rtt_samples: u64,
+    /// SYNC frames sent.
+    pub syncs_sent: u64,
+    /// SYNC frames received.
+    pub syncs_received: u64,
     /// Storage operations that failed (the triggering input was dropped).
     pub storage_errors: u64,
     /// Packets added to an FEC window as sources.
@@ -372,10 +377,15 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             );
             e.outbox_len = e.outbox_len.saturating_add(1);
         }
-        for (conv, (inbox, replay_high)) in inboxes {
+        for (conv, (inbox, replay_high, digests)) in inboxes {
             let contact = e.contacts.get_mut(&conv).ok_or(Error::CorruptStorage)?;
             contact.inbox = inbox;
             contact.replay = Replay::with_floor(replay_high);
+            contact.recv_digests = digests;
+        }
+        // Announce the restored floor and next to every contact.
+        for c in e.contacts.values_mut() {
+            c.ack_due = Some(e.now);
         }
         for (n, ev) in events {
             e.next_event_key = e.next_event_key.max(n.saturating_add(1));
@@ -528,6 +538,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         let mut rec = contact.record();
         rec.next_seq = next_seq;
         rec.lamport = lamport;
+        Contact::fold_sent(&mut rec.sent_digests, seq, &id);
         commit(
             &mut self.storage,
             alloc::vec![
@@ -540,6 +551,11 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         )?;
         contact.next_seq = next_seq;
         contact.lamport = lamport;
+        contact.sent_digests = rec.sent_digests;
+        if next_seq % wire::SYNC_BLOCK == 0 {
+            // A block completed: its digest rides on the next ACK we send.
+            contact.sync_due = true;
+        }
         contact.outbox.insert(
             seq,
             OutMsg {
@@ -656,6 +672,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
                 Frame::Msg(msg) => self.on_msg(conv, msg),
                 Frame::Ack(ack) => self.on_ack(conv, ack),
                 Frame::FragAck(fa) => self.on_frag_ack(conv, fa),
+                Frame::Sync(sf) => self.on_sync(conv, sf),
                 Frame::Loss(p) => {
                     if let Some(c) = self.contacts.get_mut(&conv) {
                         c.peer_loss = Some(p.min(1000));
@@ -760,12 +777,21 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         });
         let mut inbox = contact.inbox.clone();
         inbox.insert(msg.seq);
+        let mut digests = contact.recv_digests.clone();
+        if let Event::MessageReceived(m) = &event {
+            Contact::fold_recv(&mut digests, msg.seq, &m.id);
+        }
         let lamport = contact.lamport.max(rec.lamport);
         let n = self.next_event_key;
         let mut ops = alloc::vec![
             (
                 inbox_key(&conv),
-                Some(encode_inbox(&inbox, window_bytes, contact.replay.high()))
+                Some(encode_inbox(
+                    &inbox,
+                    window_bytes,
+                    contact.replay.high(),
+                    &digests
+                ))
             ),
             (event_key(n), encode_event(&event)),
         ];
@@ -780,6 +806,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             return;
         }
         contact.inbox = inbox;
+        contact.recv_digests = digests;
         contact.lamport = lamport;
         contact.frag_ack_pending.remove(&msg.seq);
         schedule_ack(contact);
@@ -847,6 +874,129 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         self.events.extend(events);
     }
 
+    /// The peer's reconciliation summary (`docs/reliability.md` §7).
+    fn on_sync(&mut self, conv: ConversationId, sf: SyncFrame<'_>) {
+        let now = self.now;
+        let window_bytes = usize_of(self.config.max_reorder_window / 8).saturating_add(1);
+        let room = usize_of(self.config.max_pending_events).saturating_sub(self.events.len());
+        if sf.floor > sf.next {
+            bump(&mut self.stats.frames_dropped_invalid);
+            return;
+        }
+        let Some(contact) = self.contacts.get_mut(&conv) else {
+            return;
+        };
+        bump(&mut self.stats.syncs_received);
+        let ack_now = |c: &mut Contact| c.ack_due = Some(c.ack_due.map_or(now, |t| t.min(now)));
+        if sf.reply_wanted() {
+            contact.sync_due = true;
+            ack_now(contact);
+        }
+        // Tail loss: seqs we have never seen exist; our ACK tells the peer.
+        let known = contact
+            .inbox
+            .above
+            .last()
+            .map_or(contact.inbox.cum, |s| s.saturating_add(1))
+            .max(contact.inbox.cum);
+        if sf.next > known {
+            ack_now(contact);
+        }
+        if room < 2 {
+            // Events are backed up; the peer's next SYNC will retry the rest.
+            return;
+        }
+        let mut events = Vec::new();
+        for (block, hash) in sf.digests() {
+            let full = u8::try_from(wire::SYNC_BLOCK).unwrap_or(u8::MAX);
+            let ours = contact
+                .recv_digests
+                .iter()
+                .find(|d| d.0 == block && d.2 == full);
+            if ours.is_some_and(|d| d.1 != hash) && !contact.diverged.contains(&block) {
+                let first_seq = block.saturating_mul(wire::SYNC_BLOCK);
+                events.push(Event::SyncDiverged {
+                    conversation: conv,
+                    first_seq,
+                    last_seq: first_seq.saturating_add(wire::SYNC_BLOCK - 1),
+                });
+            }
+        }
+        let mut inbox = None;
+        if sf.floor > contact.inbox.cum {
+            let mut new = contact.inbox.clone();
+            let held = u64_of(new.above.range(new.cum..sf.floor).count());
+            let missing = sf.floor.saturating_sub(new.cum).saturating_sub(held);
+            if missing > 0 {
+                events.push(Event::MessagesSkipped {
+                    conversation: conv,
+                    first_seq: new.cum,
+                    count: missing,
+                });
+            }
+            new.above = new.above.split_off(&sf.floor);
+            new.cum = sf.floor;
+            new.insert(sf.floor.saturating_sub(1)); // no-op; normalises cum
+            while new.above.remove(&new.cum) {
+                new.cum = new.cum.saturating_add(1);
+            }
+            inbox = Some(new);
+        }
+        if events.is_empty() && inbox.is_none() {
+            return;
+        }
+        let mut ops = Vec::new();
+        let mut keyed = Vec::new();
+        let mut n = self.next_event_key;
+        for ev in events {
+            ops.push((event_key(n), encode_event(&ev)));
+            keyed.push((Some(n), ev));
+            n = n.saturating_add(1);
+        }
+        if let Some(new) = &inbox {
+            ops.push((
+                inbox_key(&conv),
+                Some(encode_inbox(
+                    new,
+                    window_bytes,
+                    contact.replay.high(),
+                    &contact.recv_digests,
+                )),
+            ));
+        }
+        if commit(&mut self.storage, ops).is_err() {
+            bump(&mut self.stats.storage_errors);
+            return;
+        }
+        for (_, ev) in &keyed {
+            if let Event::SyncDiverged { first_seq, .. } = ev {
+                contact.diverged.push(first_seq / wire::SYNC_BLOCK);
+                if contact.diverged.len() > 16 {
+                    contact.diverged.remove(0);
+                }
+            }
+        }
+        if let Some(new) = inbox {
+            contact.inbox = new;
+            self.reassembly.discard_below(conv, sf.floor);
+        }
+        self.next_event_key = n;
+        self.events.extend(keyed);
+    }
+
+    /// Tells the engine connectivity may have changed (e.g. the OS reports a
+    /// new network): every contact in backoff probes at once instead of
+    /// waiting out its probe interval.
+    pub fn nudge(&mut self, now: Timestamp) {
+        self.observe(now);
+        let now = self.now;
+        for c in self.contacts.values_mut() {
+            if c.backoff > 0 {
+                c.probe_due = now;
+            }
+        }
+    }
+
     fn on_frag_ack(&mut self, conv: ConversationId, fa: FragAckFrame<'_>) {
         let now = self.now;
         let Ok(unit) = usize::try_from(fa.unit) else {
@@ -911,6 +1061,13 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             max_rto: self.config.max_rto_ms,
             grace: u32::from(self.config.backoff_grace),
             probe_floor,
+            probe_cap: self.config.max_probe_interval_ms,
+            silence: contact
+                .backoff_since
+                .map_or(0, |t| self.now.saturating_millis_since(t)),
+            deep: contact.backoff_since.is_some_and(|t| {
+                self.now.saturating_millis_since(t) >= self.config.deep_backoff_after_ms
+            }),
         }
     }
 
@@ -1465,6 +1622,28 @@ fn build_packet<R: CryptoRng>(
             contact.ack_due = None;
             bump(&mut stats.acks_sent);
             wrote = true;
+            if contact.sync_due {
+                let (floor, next) = (contact.floor(), contact.next_seq);
+                let mut digests = contact.sync_digests();
+                // Drop the oldest digests until the frame fits.
+                while !digests.is_empty()
+                    && out
+                        .len()
+                        .saturating_add(sync_frame_len(0, floor, next, &digests))
+                        > limit
+                {
+                    digests.remove(0);
+                }
+                if out
+                    .len()
+                    .saturating_add(sync_frame_len(0, floor, next, &digests))
+                    <= limit
+                {
+                    put_sync_frame(&mut out, 0, floor, next, &digests);
+                    contact.sync_due = false;
+                    bump(&mut stats.syncs_sent);
+                }
+            }
             if let Some(loss) = contact.loss_report_due() {
                 if out.len().saturating_add(loss_frame_len(loss)) <= limit {
                     put_loss_frame(&mut out, loss);
@@ -1588,7 +1767,7 @@ fn write_data<R: CryptoRng>(
             })
         });
         if probe {
-            contact.deepen_backoff();
+            contact.deepen_backoff(now);
         }
     }
 
@@ -1597,8 +1776,29 @@ fn write_data<R: CryptoRng>(
     // timers of one message still share packets. Probe: every fragment,
     // longest-waiting first, with ones the peer already holds last.
     let horizon = now.saturating_add_millis(t.rto / 4);
+    let mut wrote = false;
+    // Probes carry the oldest data, as in Phase 2-4, so the first packet
+    // through after an outage delivers something. Only in deep backoff
+    // (`deep_backoff_after_ms` of silence) do they shrink to a bare SYNC
+    // asking for a reply, so long silences stay cheap (D-040).
+    let data_probe = !t.deep;
+    if probe && !data_probe {
+        // No digests: a bare SYNC (≤ 14 bytes) fits any MTU, so a probe can
+        // always be built.
+        let (floor, next) = (contact.floor(), contact.next_seq);
+        let flags = wire::SYNC_REPLY_WANTED;
+        if out
+            .len()
+            .saturating_add(sync_frame_len(flags, floor, next, &[]))
+            <= limit
+        {
+            put_sync_frame(out, flags, floor, next, &[]);
+            bump(&mut stats.syncs_sent);
+            wrote = true;
+        }
+    }
     let mut cands: Vec<((bool, Timestamp), u64, u64)> = Vec::new();
-    for (&seq, msg) in &contact.outbox {
+    for (&seq, msg) in contact.outbox.iter().filter(|_| !probe || data_probe) {
         let Some(p) = &msg.plan else {
             continue;
         };
@@ -1616,7 +1816,6 @@ fn write_data<R: CryptoRng>(
     }
     cands.sort_unstable();
 
-    let mut wrote = false;
     for (_, seq, index) in cands {
         if limit.saturating_sub(out.len()) < 4 {
             break;
@@ -1664,10 +1863,27 @@ fn write_data<R: CryptoRng>(
             .checked_rem((t.rto / 8).saturating_add(1))
             .unwrap_or(0);
     }
-    if probe && wrote {
-        bump(&mut stats.probes_sent);
+    if probe && data_probe {
+        // If room is left, tell the peer our floor and next: it can then
+        // see at once which newer messages it lacks and ACK immediately.
+        let (floor, next) = (contact.floor(), contact.next_seq);
+        if out
+            .len()
+            .saturating_add(sync_frame_len(0, floor, next, &[]))
+            <= limit
+        {
+            put_sync_frame(out, 0, floor, next, &[]);
+            bump(&mut stats.syncs_sent);
+        }
+    }
+    if probe {
+        // Advance the probe timer even if nothing fit, so a probe can never
+        // leave the contact due-but-unsendable (a busy loop for the host).
+        if wrote {
+            bump(&mut stats.probes_sent);
+        }
         contact.probe_due = now.saturating_add_millis(contact.probe_interval(t));
-        contact.deepen_backoff();
+        contact.deepen_backoff(now);
     }
     wrote
 }

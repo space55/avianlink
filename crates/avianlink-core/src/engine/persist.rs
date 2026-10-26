@@ -11,7 +11,7 @@ use crate::wire::{put_varint, DecodeError, Reader};
 use crate::{ConversationId, Event, MessageId, PublicKey, ReceivedMessage, Timestamp};
 
 /// Bumped on incompatible layout changes.
-pub(super) const SCHEMA: u8 = 2;
+pub(super) const SCHEMA: u8 = 3;
 
 pub(super) const KEY_VERSION: &[u8] = b"v";
 pub(super) const PREFIX_CONTACT: &[u8] = b"c";
@@ -56,13 +56,26 @@ pub(super) fn decode_version(v: &[u8]) -> Result<(u8, PublicKey), DecodeError> {
     Ok((r.u8()?, PublicKey(r.array()?)))
 }
 
+/// A digest of one 64-seq block of message IDs (`reliability.md` §7).
+pub(super) type BlockDigest = (u64, [u8; 8]);
+
+fn put_digests(v: &mut Vec<u8>, ds: &[BlockDigest]) {
+    put_varint(v, u64::try_from(ds.len()).unwrap_or(0));
+    for (block, hash) in ds {
+        put_varint(v, *block);
+        v.extend_from_slice(hash);
+    }
+}
+
 /// Durable per-contact fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ContactRecord {
     pub(super) key: PublicKey,
     pub(super) next_seq: u64,
     pub(super) lamport: u64,
     pub(super) counter_reserved: u64,
+    /// Digests of our most recent sent blocks.
+    pub(super) sent_digests: Vec<BlockDigest>,
 }
 
 impl ContactRecord {
@@ -71,16 +84,27 @@ impl ContactRecord {
         put_varint(&mut v, self.next_seq);
         put_varint(&mut v, self.lamport);
         put_varint(&mut v, self.counter_reserved);
+        put_digests(&mut v, &self.sent_digests);
         v
     }
 
     pub(super) fn decode(v: &[u8]) -> Result<Self, DecodeError> {
         let mut r = Reader::new(v);
+        let key = PublicKey(r.array()?);
+        let next_seq = r.varint()?;
+        let lamport = r.varint()?;
+        let counter_reserved = r.varint()?;
+        let n = r.varint()?;
+        let mut sent_digests = Vec::new();
+        for _ in 0..n.min(8) {
+            sent_digests.push((r.varint()?, r.array()?));
+        }
         Ok(Self {
-            key: PublicKey(r.array()?),
-            next_seq: r.varint()?,
-            lamport: r.varint()?,
-            counter_reserved: r.varint()?,
+            key,
+            next_seq,
+            lamport,
+            counter_reserved,
+            sent_digests,
         })
     }
 }
@@ -118,23 +142,40 @@ pub(super) fn parse_event_key(k: &[u8]) -> Option<u64> {
     r.is_empty().then_some(n)
 }
 
-/// Receive window plus the replay floor (highest accepted packet counter,
-/// stored +1 so 0 means none).
+/// Received-block digest with the number of messages folded in.
+pub(super) type RecvDigest = (u64, [u8; 8], u8);
+
+/// Receive window, received-block digests and the replay floor (highest
+/// accepted packet counter, stored +1 so 0 means none).
 pub(super) fn encode_inbox(
     inbox: &Inbox,
     window_bytes: usize,
     replay_high: Option<u64>,
+    digests: &[RecvDigest],
 ) -> Vec<u8> {
     let mut v = Vec::new();
     put_varint(&mut v, replay_high.map_or(0, |h| h.saturating_add(1)));
+    put_varint(&mut v, u64::try_from(digests.len()).unwrap_or(0));
+    for (block, hash, count) in digests {
+        put_varint(&mut v, *block);
+        v.extend_from_slice(hash);
+        v.push(*count);
+    }
     put_varint(&mut v, inbox.cum);
     v.extend_from_slice(&inbox.bitmap(window_bytes));
     v
 }
 
-pub(super) fn decode_inbox(v: &[u8]) -> Result<(Inbox, Option<u64>), DecodeError> {
+pub(super) type DecodedInbox = (Inbox, Option<u64>, Vec<RecvDigest>);
+
+pub(super) fn decode_inbox(v: &[u8]) -> Result<DecodedInbox, DecodeError> {
     let mut r = Reader::new(v);
     let replay_high = r.varint()?.checked_sub(1);
+    let n = r.varint()?;
+    let mut digests = Vec::new();
+    for _ in 0..n.min(8) {
+        digests.push((r.varint()?, r.array()?, r.u8()?));
+    }
     let cum = r.varint()?;
     let mut inbox = Inbox {
         cum,
@@ -153,11 +194,13 @@ pub(super) fn decode_inbox(v: &[u8]) -> Result<(Inbox, Option<u64>), DecodeError
             }
         }
     }
-    Ok((inbox, replay_high))
+    Ok((inbox, replay_high, digests))
 }
 
 const EVENT_RECEIVED: u8 = 1;
 const EVENT_DELIVERED: u8 = 2;
+const EVENT_SKIPPED: u8 = 3;
+const EVENT_DIVERGED: u8 = 4;
 
 /// Encodes a durable event; `None` for transient ones (never persisted).
 pub(super) fn encode_event(ev: &Event) -> Option<Vec<u8>> {
@@ -184,6 +227,28 @@ pub(super) fn encode_event(ev: &Event) -> Option<Vec<u8>> {
             v.push(EVENT_DELIVERED);
             v.extend_from_slice(&conversation.0);
             v.extend_from_slice(&id.0);
+        }
+        Event::MessagesSkipped {
+            conversation,
+            first_seq,
+            count,
+        } => {
+            v.push(EVENT_SKIPPED);
+            v.extend_from_slice(&conversation.0);
+            v.extend_from_slice(&[0; 16]);
+            put_varint(&mut v, *first_seq);
+            put_varint(&mut v, *count);
+        }
+        Event::SyncDiverged {
+            conversation,
+            first_seq,
+            last_seq,
+        } => {
+            v.push(EVENT_DIVERGED);
+            v.extend_from_slice(&conversation.0);
+            v.extend_from_slice(&[0; 16]);
+            put_varint(&mut v, *first_seq);
+            put_varint(&mut v, *last_seq);
         }
         Event::MessageTransmitted { .. } => return None,
     }
@@ -220,6 +285,16 @@ pub(super) fn decode_event(v: &[u8]) -> Result<Event, DecodeError> {
             }))
         }
         EVENT_DELIVERED => Ok(Event::MessageDelivered { conversation, id }),
+        EVENT_SKIPPED => Ok(Event::MessagesSkipped {
+            conversation,
+            first_seq: r.varint()?,
+            count: r.varint()?,
+        }),
+        EVENT_DIVERGED => Ok(Event::SyncDiverged {
+            conversation,
+            first_seq: r.varint()?,
+            last_seq: r.varint()?,
+        }),
         _ => Err(DecodeError::TooLarge),
     }
 }
@@ -236,6 +311,7 @@ mod tests {
             next_seq: 300,
             lamport: 9,
             counter_reserved: 1 << 40,
+            sent_digests: alloc::vec![(3, [5; 8]), (4, [6; 8])],
         };
         assert_eq!(ContactRecord::decode(&c.encode()), Ok(c));
 
@@ -243,12 +319,14 @@ mod tests {
         for s in [0, 1, 2, 5, 9, 40] {
             inbox.insert(s);
         }
-        let (back, high) = decode_inbox(&encode_inbox(&inbox, 512, Some(77))).unwrap();
+        let ds = [(0u64, [9u8; 8], 64u8)];
+        let (back, high, d) = decode_inbox(&encode_inbox(&inbox, 512, Some(77), &ds)).unwrap();
         assert_eq!(
             (back.cum, &back.above, high),
             (inbox.cum, &inbox.above, Some(77))
         );
-        let (_, none) = decode_inbox(&encode_inbox(&inbox, 512, None)).unwrap();
+        assert_eq!(d, ds);
+        let (_, none, _) = decode_inbox(&encode_inbox(&inbox, 512, None, &[])).unwrap();
         assert_eq!(none, None);
 
         let conv = ConversationId([3; 16]);
@@ -271,6 +349,16 @@ mod tests {
             Event::MessageDelivered {
                 conversation: conv,
                 id: MessageId([5; 16]),
+            },
+            Event::MessagesSkipped {
+                conversation: conv,
+                first_seq: 3,
+                count: 40,
+            },
+            Event::SyncDiverged {
+                conversation: conv,
+                first_seq: 64,
+                last_seq: 127,
             },
         ] {
             assert_eq!(decode_event(&encode_event(&ev).unwrap()), Ok(ev));
