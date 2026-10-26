@@ -1,6 +1,6 @@
 # avianlink wire format
 
-> **Status: draft v1 (Phase 1).** The layout is fixed, except that the 4-byte
+> **Status: draft v1 (Phase 2).** The layout is fixed, except that the 4-byte
 > keyed check (§2.4) becomes a 16-byte AEAD tag in Phase 3. The version byte
 > stays `0x01` until the first release; before then, peers are assumed to
 > run the same build.
@@ -94,6 +94,7 @@ added this way; it needs a new version byte.
 | 0x02 | ACK     | 1     | Selective acknowledgement (§3.2). |
 | 0x03 | REPAIR  | 4     | Reserved: FEC repair symbol. |
 | 0x04 | SYNC    | 5     | Reserved: reconciliation summary. |
+| 0x05 | FRAG_ACK| 2     | Per-fragment acknowledgement (§3.3). |
 | other| —       |       | Skipped and counted (`frames_unknown`). |
 
 ### 3.1 MSG
@@ -131,10 +132,14 @@ redelivered.
 ### 3.2 ACK
 
 ```
-body = cum:varint  bitmap:rest
+body = cum:varint  largest:varint  ack_delay:varint  bitmap:rest
 ```
 
 - `cum`: all of the receiver's inbound seqs `< cum` have been received.
+- `largest`: the largest packet counter received from the peer so far.
+- `ack_delay`: milliseconds between that packet's arrival and this ACK being
+  sent. Together with `largest`, this gives the peer an RTT sample that isn't
+  confused by retransmission (`reliability.md` §3).
 - Bit `i` of `bitmap` (byte `i / 8`, LSB first) set means seq `cum + 1 + i`
   was received. Seq `cum` itself is by definition missing.
 - Trailing zero bytes are omitted. The sender may cap the bitmap
@@ -144,6 +149,19 @@ An ACK covers the conversation implied by the packet's tag. Seqs the sender
 never used are ignored. Senders piggyback an ACK on any packet to the peer
 while one is pending, and otherwise send an ACK-only packet after
 `ack_delay_ms`.
+
+### 3.3 FRAG_ACK
+
+```
+body = seq:varint  count:varint  bitmap:rest
+```
+
+Fragments of the partially reassembled message `seq` (fragmented into
+`count` pieces) that have arrived. Bit `i` set means fragment `i` is held.
+A FRAG_ACK is advisory. The receiver may still evict the partial, so the
+sender treats acknowledged fragments as "not needed for now", not "never
+needed" (`reliability.md` §2). A sender whose plan for `seq` has a different
+`count` ignores the frame.
 
 ## 4. Message record
 

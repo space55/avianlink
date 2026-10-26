@@ -237,3 +237,93 @@ Default scenarios send 1000 messages, one every 30 s on average.
 3 KB/hour, about 1/30 of the default offered load. Overload still has its
 own test (`overloaded_lora_drains`), which checks that the backlog drains
 rather than collapses.
+
+## D-022: Packet-level RTT samples via `largest` + `ack_delay` in ACK (Phase 2)
+
+ACKs name the largest packet counter received and how long ago it arrived,
+in QUIC style. Every ACK yields an unambiguous RTT sample, even for
+messages that were retransmitted. Karn's algorithm would discard those
+samples, and under 35–50% loss most messages are retransmitted at least
+once. Cost: about 2–4 bytes per ACK.
+
+## D-023: Per-contact backoff with probes instead of per-fragment backoff (Phase 2)
+
+Phase 1 resent every outstanding fragment each RTO, straight into outages.
+Phase 2 tells loss (progress continues) from unreachability (no progress
+since the send). When the peer looks unreachable, the contact sends one
+probe packet per doubling interval, capped at `max_rto_ms`, and leaves
+backoff on the first authenticated packet from the peer. **Rejected:**
+independent exponential backoff per fragment. It still sends N fragments per
+interval, and each fragment backs off on a different clock, so recovery
+after an outage is slow and ragged.
+
+## D-024: Soft per-fragment acknowledgement (FRAG_ACK) (Phase 2)
+
+This resolves D-018. Message-level ACKs alone resend every fragment of a
+long message each round. At a 64-byte MTU a 1200-byte message is about 26
+fragments, and at 50% loss that means roughly 6 rounds × 26 sends. FRAG_ACK
+reports which fragments the receiver holds. It is advisory, because the
+receiver's reassembly memory is bounded and may evict. The sender therefore
+re-arms acknowledged fragments after `max_rto_ms`, so eviction costs
+latency, never liveness.
+
+## D-025: Storage batches are required trait methods; the engine owns its durable state (Phase 2)
+
+`Storage` gains `begin`/`commit`/`rollback` and `scan_prefix`. All of them
+are required; none has a no-op default. A host without transactions has to
+decide, visibly, what atomicity it offers. The engine persists contacts,
+outbox, receive windows, Lamport clocks, counter reservations and pending
+events, and `Engine::restore` rebuilds from them. Hosts no longer need to
+replay `add_contact` after a restart, and `contacts()` lists what was
+restored. (This overlaps desktop-app requests AR-006 and AR-008.) Links
+stay host-owned and are re-registered after restore.
+
+## D-026: Events are persisted until polled (Phase 2)
+
+An event is committed in the same batch as the state change that causes
+it, and removed when the host polls it. Without this, either side of a
+crash loses something. Acknowledge, then crash before the host sees the
+message: the message is lost. Redeliver after the crash: duplicates. The
+remaining window, between `poll_event` returning and the host persisting
+the event, is documented as the host's responsibility.
+
+## D-027: `send_text` returns `Queued { id, seq, lamport }` (Phase 2)
+
+The application has to interleave its own messages with received ones by
+Lamport value, and only the engine knows the value it assigned. This is
+part of Phase 2's causal-ordering work, and also satisfies desktop request
+AR-001. `ReceivedMessage` gains `missing_before`, so out-of-order arrival is
+visible rather than hidden.
+
+## D-028: Retransmission timer defaults tuned in the simulator (Phase 2)
+
+The first Phase 2 build used RFC 6298 as written (`srtt + 4·rttvar`) with a
+120 s backoff cap. It cut `disaster_cellular` traffic 6.5× but more than
+doubled its latency. Pareto-tailed delay inflates `rttvar`. And at one
+message every 30 s, a single loss looks like silence, so the sender dropped
+into backoff during uptime too. Sweep over 10 seeds × 1000 messages
+(medians of per-seed values):
+
+| variant | p50 | p95 | p99 | wire/payload |
+|---|--:|--:|--:|--:|
+| Phase 1 (fixed 4 s RTO, no backoff) | 5.3s | 6.5m | 10.6m | 23.9 |
+| RFC: 4·var, cap 120 s, no grace | 39.1s | 13.2m | 19.1m | 3.65 |
+| cap 30 s | 17.1s | 7.5m | 11.6m | 4.45 |
+| 2·var | 33.1s | 13.1m | 24.7m | 3.87 |
+| 2 grace probes | 25.2s | 11.4m | 21.2m | 3.78 |
+| **2·var, cap 30 s, 2 grace probes (chosen)** | **8.4s** | **7.5m** | **11.3m** | **4.75** |
+| 1·var, cap 30 s, 3 grace | 7.2s | 7.2m | 12.0m | 5.04 |
+| 2·var, cap 15 s, 3 grace | 7.2s | 7.1m | 11.2m | 5.95 |
+| 1·var, cap 10 s, 3 grace | 5.5s | 6.5m | 11.3m | 7.04 |
+
+The chosen point keeps p95/p99 within about 15% of Phase 1 at a fifth of
+the bytes. It is also the knee: going further buys little latency for a
+lot of bandwidth. On the other profiles it is neutral or better (see the
+Phase 2 report). All three knobs are `Config` fields
+(`rttvar_multiplier`, `max_rto_ms`, `backoff_grace`) for hosts with
+different priorities.
+
+**Link-aware probe floor.** A 30 s probe interval would spend more than a
+1% duty cycle's entire budget on a LoRa link. So the probe interval is
+never below 10× the budget time one MTU-sized packet costs on the
+contact's link: probing uses at most about 10% of the budget.
