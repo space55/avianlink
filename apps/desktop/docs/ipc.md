@@ -408,7 +408,7 @@ rather than the most recent.
 
 `message_status_changed` is the only event a retransmission storm could
 produce at a high rate, and it is kept quiet structurally rather than by a
-timer: the backend emits it only when the status actually *moves*. Status is
+timer: the backend emits it only when the status actually _moves_. Status is
 monotonic over four values, so a message can produce at most three of these
 events in its entire life, however many times it is retransmitted.
 

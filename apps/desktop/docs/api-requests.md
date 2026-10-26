@@ -24,7 +24,7 @@ pub fn send_text(&mut self, conversation: ConversationId, text: &str, now: Times
 The app re-exports `avianlink_core::Queued` from `engine::Queued` rather than
 declaring its own, and the mirrored-Lamport workaround described here is gone.
 
-*Original request, for the record:* the app has to interleave its own
+_Original request, for the record:_ the app has to interleave its own
 outgoing messages with incoming ones in one thread, and ordering outgoing
 messages by local queue time while ordering incoming ones by Lamport does not
 compose — a reply written in response to our message can sort above it. The
@@ -48,8 +48,8 @@ which is genuinely useful: it lets the thread say "two earlier messages are
 still on their way" rather than leaving a silent gap, and the app will use it
 in Phase 1.
 
-It answers the *forward* question (what is still missing below this message).
-The app also needs the *backward* one: did this message land behind messages
+It answers the _forward_ question (what is still missing below this message).
+The app also needs the _backward_ one: did this message land behind messages
 the user was already looking at? That is what the "arrived later" marker
 means, and only the host can answer it, because it depends on what the host
 had already displayed. No library change is needed — this entry exists so the
