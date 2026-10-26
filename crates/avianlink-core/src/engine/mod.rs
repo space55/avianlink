@@ -570,57 +570,84 @@ fn build_packet<R: CryptoRngCore>(
         }
     }
 
+    // Plan any message not yet fragmented (or planned for a larger MTU).
+    // New fragments inherit the message's queue time, so they sort by age
+    // against retransmissions below.
     for (&seq, msg) in contact.outbox.iter_mut() {
-        if msg.plan.as_ref().is_none_or(|p| p.space > ctx.min_space) {
-            let Some(plan) = plan_fragments(ctx.min_space, seq, msg.record.len()) else {
-                continue;
-            };
-            let count = usize::try_from(plan.count).unwrap_or(0);
-            msg.plan = Some(Planned {
-                plan,
-                space: ctx.min_space,
-                frags: alloc::vec![
-                    FragState {
-                        next_send: ctx.now,
-                        sends: 0
-                    };
-                    count
-                ],
-            });
+        if msg.plan.as_ref().is_some_and(|p| p.space <= ctx.min_space) {
+            continue;
         }
+        let Some(plan) = plan_fragments(ctx.min_space, seq, msg.record.len()) else {
+            continue;
+        };
+        let count = usize::try_from(plan.count).unwrap_or(0);
+        msg.plan = Some(Planned {
+            plan,
+            space: ctx.min_space,
+            frags: alloc::vec![
+                FragState {
+                    next_send: msg.queued_at,
+                    sends: 0
+                };
+                count
+            ],
+        });
+    }
+
+    // Serve due fragments oldest-due first. Seq order would starve later
+    // messages whenever the RTO is shorter than the time to drain the
+    // backlog (e.g. on duty-cycled links).
+    let mut due: Vec<(Timestamp, u64, u64)> = Vec::new();
+    for (&seq, msg) in &contact.outbox {
+        if let Some(p) = &msg.plan {
+            due.extend(
+                (0u64..)
+                    .zip(&p.frags)
+                    .filter(|(_, f)| f.next_send <= ctx.now)
+                    .map(|(i, f)| (f.next_send, seq, i)),
+            );
+        }
+    }
+    due.sort_unstable();
+
+    for (_, seq, index) in due {
+        if limit.saturating_sub(out.len()) < 4 {
+            break;
+        }
+        let Some(msg) = contact.outbox.get_mut(&seq) else {
+            continue;
+        };
         let Some(planned) = msg.plan.as_mut() else {
             continue;
         };
         let plan = planned.plan;
-        for (index, frag) in (0u64..).zip(planned.frags.iter_mut()) {
-            if frag.next_send > ctx.now {
-                continue;
-            }
-            let Some(data) = msg.record.get(plan.range(index, msg.record.len())) else {
-                continue;
-            };
-            let len = msg_frame_len(seq, plan.count, index, data.len());
-            if out.len().saturating_add(len) > limit {
-                continue;
-            }
-            put_msg_frame(&mut out, seq, plan.count, index, data);
-            wrote = true;
-            bump(&mut stats.fragments_sent);
-            if frag.sends > 0 {
-                bump(&mut stats.retransmissions);
-            }
-            frag.sends = frag.sends.saturating_add(1);
-            let jitter = rng
-                .next_u64()
-                .checked_rem((ctx.rto / 4).saturating_add(1))
-                .unwrap_or(0);
-            frag.next_send = ctx
-                .now
-                .saturating_add_millis(ctx.rto.saturating_add(jitter));
+        let Some(data) = msg.record.get(plan.range(index, msg.record.len())) else {
+            continue;
+        };
+        let len = msg_frame_len(seq, plan.count, index, data.len());
+        if out.len().saturating_add(len) > limit {
+            continue;
         }
-        if limit.saturating_sub(out.len()) < 4 {
-            break;
+        let Some(frag) = usize::try_from(index)
+            .ok()
+            .and_then(|i| planned.frags.get_mut(i))
+        else {
+            continue;
+        };
+        put_msg_frame(&mut out, seq, plan.count, index, data);
+        wrote = true;
+        bump(&mut stats.fragments_sent);
+        if frag.sends > 0 {
+            bump(&mut stats.retransmissions);
         }
+        frag.sends = frag.sends.saturating_add(1);
+        let jitter = rng
+            .next_u64()
+            .checked_rem((ctx.rto / 4).saturating_add(1))
+            .unwrap_or(0);
+        frag.next_send = ctx
+            .now
+            .saturating_add_millis(ctx.rto.saturating_add(jitter));
     }
 
     if !wrote {

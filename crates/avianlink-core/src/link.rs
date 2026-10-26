@@ -19,6 +19,15 @@ pub struct AirtimeModel {
     pub per_byte_us: u32,
 }
 
+impl AirtimeModel {
+    /// Airtime of a `len`-byte packet, in microseconds.
+    pub fn airtime_us(&self, len: usize) -> u64 {
+        let len = u64::try_from(len).unwrap_or(u64::MAX);
+        u64::from(self.per_packet_us)
+            .saturating_add(u64::from(self.per_byte_us).saturating_mul(len))
+    }
+}
+
 /// Transmission budget for a link. Often legally mandated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkBudget {

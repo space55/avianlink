@@ -26,12 +26,14 @@ pub(crate) enum Pacer {
         log: VecDeque<(Timestamp, u64)>,
         used_us: u64,
         max_entries: usize,
+        /// When the radio finishes the last admitted packet. Packets are
+        /// logged at their on-air start, not their hand-off time.
+        busy_until: Timestamp,
     },
 }
 
 pub(crate) fn airtime_us(model: &AirtimeModel, len: usize) -> u64 {
-    let len = u64::try_from(len).unwrap_or(u64::MAX);
-    u64::from(model.per_packet_us).saturating_add(u64::from(model.per_byte_us).saturating_mul(len))
+    model.airtime_us(len)
 }
 
 impl Pacer {
@@ -60,6 +62,7 @@ impl Pacer {
                 log: VecDeque::new(),
                 used_us: 0,
                 max_entries,
+                busy_until: now,
             },
         }
     }
@@ -108,18 +111,21 @@ impl Pacer {
                 log,
                 used_us,
                 max_entries,
+                busy_until,
             } => {
                 let need = airtime_us(airtime, usize::from(mtu));
                 let mut used = *used_us;
                 let mut entries = log.len();
-                // Drop entries that have aged out by `now`, then keep
+                // The packet can start no earlier than when the radio is
+                // free. Drop entries that have aged out by then, then keep
                 // dropping until the packet fits; the last dropped entry's
                 // expiry is the answer.
-                let mut at = now;
+                let start = now.max(*busy_until);
+                let mut at = start;
                 for &(t, a) in log {
                     let expires = t.saturating_add_millis(*window_ms);
                     let fits = used.saturating_add(need) <= *budget_us && entries < *max_entries;
-                    if expires > now && fits {
+                    if expires > start && fits {
                         break;
                     }
                     used = used.saturating_sub(a);
@@ -157,18 +163,21 @@ impl Pacer {
                 airtime,
                 log,
                 used_us,
+                busy_until,
                 ..
             } => {
+                let start = now.max(*busy_until);
                 while let Some(&(t, a)) = log.front() {
-                    if t.saturating_add_millis(*window_ms) > now {
+                    if t.saturating_add_millis(*window_ms) > start {
                         break;
                     }
                     log.pop_front();
                     *used_us = used_us.saturating_sub(a);
                 }
                 let a = airtime_us(airtime, len);
-                log.push_back((now, a));
+                log.push_back((start, a));
                 *used_us = used_us.saturating_add(a);
+                *busy_until = start.saturating_add_millis(a.div_ceil(1000));
             }
         }
     }
@@ -212,7 +221,9 @@ mod tests {
         assert_eq!(p.ready_at(t(20), 50), t(1000));
         assert_eq!(p.ready_at(t(1000), 50), t(1000));
         p.consume(t(1000), 50);
-        assert_eq!(p.ready_at(t(1000), 50), t(1010));
+        // The second packet went on air at 40 (radio busy until then), so
+        // its entry expires at 1040.
+        assert_eq!(p.ready_at(t(1000), 50), t(1040));
     }
 
     #[test]

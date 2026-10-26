@@ -7,6 +7,7 @@ members = [
     "crates/avianlink-udp",
     "crates/avianlink-cli",
     "crates/avianlink-ffi",
+    "apps/desktop/src-tauri",
 ]
 
 [workspace.package]

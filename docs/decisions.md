@@ -184,6 +184,11 @@ in a window T, which would break regulations such as EU868's 1%/hour. The
 log is bounded by `max_duty_log_entries`. When it is full, the link is
 treated as out of budget until the oldest entry ages out.
 
+The duty pacer also models the radio being busy. Each packet is logged at
+its on-air *start*, `max(now, busy_until)`, and is not admitted before then.
+Without this, a burst admitted at one instant is serialized over many
+seconds, and the on-air times can creep past the window the engine checked.
+
 ## D-016: Dependency: `proptest` (dev-only) (Phase 1)
 
 `proptest = "1"` is a dev-dependency for property tests (encode/decode
@@ -213,3 +218,22 @@ problem to Phase 4 FEC. This will be decided from simulator data.
 outside the workspace, and runs via `scripts/fuzz.sh`, so the stable CI gate
 stays stable-only. `ci.sh` builds the fuzz targets' shared harness code as
 an ordinary test (`fuzz_harness` in avianlink-core's tests), so it can't rot.
+
+## D-020: Due fragments are served oldest-due first, not in seq order (Phase 1)
+
+The first simulator run found congestion collapse on `lora_like`. With
+fragments chosen in seq order and an RTO (4 s) shorter than one duty-cycle
+slot (~37 s), the lowest seqs were due again at every slot. They starved
+everything behind them: 143 packets per message, about 3% delivered in 30
+days. Ordering by `next_send` makes the backlog a round-robin, and new
+fragments inherit their message's queue time. The same overloaded run now
+delivers everything. Phase 2's adaptive RTO attacks the root cause
+(spurious retransmission). This ordering stays as the fairness rule.
+
+## D-021: Simulator workloads respect link capacity by default (Phase 1)
+
+Default scenarios send 1000 messages, one every 30 s on average.
+`lora_like` uses one every 10 minutes: its 1% duty cycle carries roughly
+3 KB/hour, about 1/30 of the default offered load. Overload still has its
+own test (`overloaded_lora_drains`), which checks that the backlog drains
+rather than collapses.
