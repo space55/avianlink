@@ -18,6 +18,7 @@ done
 
 step "cargo fmt --check"
 cargo fmt --all -- --check
+cargo fmt --manifest-path fuzz/Cargo.toml -- --check
 
 step "cargo clippy (host, all targets)"
 cargo clippy --workspace --all-targets --locked -- -D warnings
