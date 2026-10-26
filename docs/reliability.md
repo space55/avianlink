@@ -66,8 +66,8 @@ also carries fragments due within the next `rto/4`, so jittered timers of
 one message still share packets.
 
 **Backoff mode** (the peer looks unreachable). The contact enters backoff
-when a retransmission timer fires and *no* acknowledgement progress has
-happened since that fragment was last sent. A loss among other successful
+when a retransmission timer fires and no fresh packet (new highest counter)
+has arrived from the peer since that fragment was last sent. A loss among other successful
 deliveries is just a loss. Silence after a send means the path is down.
 
 In backoff:
@@ -81,8 +81,10 @@ In backoff:
   duty-cycled link's airtime. There is no limit on the number of probes and
   no connection timeout;
 - the contact **leaves backoff immediately** on any authenticated packet
-  from the peer. Everything outstanding is then due again and drains at the
-  link's pace.
+  from the peer that carries a new highest counter. Everything outstanding
+  is then due again and drains at the link's pace. An older packet, such as
+  a late reorder or an attacker's replay of a lost original, doesn't count
+  (`security.md` §9).
 
 This bounds the cost of a long outage to one packet per `max_rto_ms` per
 contact. Without it, Phase 1 spent 17–32 wire bytes per payload byte on

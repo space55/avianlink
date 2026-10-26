@@ -1,9 +1,7 @@
 # avianlink wire format
 
-> **Status: draft v1 (Phase 2).** The layout is fixed, except that the 4-byte
-> keyed check (§2.4) becomes a 16-byte AEAD tag in Phase 3. The version byte
-> stays `0x01` until the first release; before then, peers are assumed to
-> run the same build.
+> **Status: v1 (Phase 3).** The version byte stays `0x01` until the first
+> release. Before then, peers are assumed to run the same build.
 
 ## 1. Conventions
 
@@ -22,60 +20,64 @@
 ## 2. Packet
 
 ```
-packet  = version:u8  tag:[3]  counter:varint  frame*  check:[4]
+packet  = header  ciphertext  aead_tag:[16]
+header  = version:u8  tag:[3]  counter:varint
+ciphertext = ChaCha20-Poly1305(frame*)   (same length as the frames)
 ```
 
 | Field   | Size  | Meaning |
 |---------|-------|---------|
 | version | 1     | `0x01`. `0x00` is never valid. Other values: drop (`packets_dropped_version`). |
-| tag     | 3     | Pair routing tag (§2.2). |
-| counter | 1–10  | Per (sender → recipient) packet counter, strictly increasing from 0. Phase 3 derives the AEAD nonce from it. Senders must not exceed 2³⁵−1 (fragment sizing assumes ≤ 5 bytes). |
-| frame*  | rest  | Zero or more frames (§3). Zero frames is a valid keep-alive. |
-| check   | 4     | Keyed integrity check (§2.4). |
+| tag     | 3     | Routing tag of the (sender → recipient) direction (§2.2). |
+| counter | 1–5   | Per-direction packet counter, strictly increasing, never reused. It gives the AEAD nonce (§2.3). Fragment sizing assumes ≤ 5 bytes (counter < 2³⁵). |
+| frame*  | rest  | Zero or more frames (§3), encrypted. Zero frames is a valid keep-alive. |
+| aead_tag| 16    | Poly1305 tag over header (associated data) and ciphertext. |
 
 A packet is never larger than the MTU of the link it is sent on. The smallest
-valid packet is 9 bytes.
+valid packet is 21 bytes.
 
 ### 2.1 Processing order
 
-1. Length ≥ 9, else drop.
+1. Length ≥ 21, else drop (`packets_dropped_malformed`).
 2. Version byte, else drop.
-3. Look up the tag among known contacts. For every candidate whose check
-   verifies, process the packet as coming from that contact. The first match
-   wins. No match: drop (`packets_dropped_unauthenticated`).
-4. Parse the counter and **all** frames. A structural error anywhere (a bad
-   varint, or a frame length past the end) drops the whole packet, so frames
-   are applied all-or-nothing.
-5. Apply the frames in order.
+3. Look up the tag among known contacts. No match: drop
+   (`packets_dropped_unauthenticated`).
+4. Parse the counter. For each candidate contact: skip it if the counter is
+   a replay for that contact (`security.md` §6). Otherwise try to decrypt
+   with its key, and the first success identifies the sender. No success:
+   drop (`packets_dropped_unauthenticated`, or `packets_dropped_replay` if
+   every candidate rejected the counter).
+5. Mark the counter as seen.
+6. Parse **all** frames. A structural error anywhere (a bad varint, or a
+   frame length past the end) drops the whole packet, so frames are applied
+   all-or-nothing.
+7. Apply the frames in order.
 
-### 2.2 Pair tag
-
-```
-tag = H_3("avianlink/v1/tag" || PK_s || PK_r)
-```
-
-The tag identifies the ordered (sender, recipient) pair, not just the
-recipient. The recipient precomputes one tag per contact. Collisions (about 3%
-among 1000 contacts) are resolved by trying each candidate's check
-(§2.1 step 3), and in Phase 3 by trial decryption. See D-010 for why this
-differs from a recipient-only tag.
-
-### 2.3 Counter
-
-The counter is a plain varint. A typical value takes 2 bytes. In Phase 1 the
-receiver uses it for nothing beyond parsing. Phase 3 adds a replay window and
-nonce derivation, and Phase 4 uses it to index FEC windows.
-
-### 2.4 Check (Phase 1 placeholder for the AEAD tag)
+### 2.2 Routing tag
 
 ```
-check = H_4("avianlink/v1/chk" || PK_s || PK_r || packet_without_check)
+tag(S→R) = HKDF-Expand(prk(S,R), "tag" ‖ PK_S ‖ PK_R, 3)
 ```
 
-This catches link corruption (about 2⁻³² false-accept rate) and resolves
-tag collisions. It provides **no security**: public keys are public. Phase 3
-replaces it with a 16-byte AEAD tag over the same layout. The header becomes
-associated data, and the frames are encrypted.
+`prk` is the pairwise key-derivation secret (`security.md` §3). The tag
+identifies the ordered pair to the recipient, who precomputes one tag per
+contact. Outsiders can't compute it even when they know both public keys.
+Collisions (about 3% among 1000 contacts) are resolved by trial decryption.
+
+### 2.3 Nonce
+
+```
+nonce = counter (u64, little-endian, 8 bytes) ‖ 00 00 00 00
+key   = key(S→R) = HKDF-Expand(prk(S,R), "key" ‖ PK_S ‖ PK_R, 32)
+```
+
+Each direction has its own key, so the counter alone makes nonces unique.
+
+### 2.4 AEAD
+
+ChaCha20-Poly1305 (RFC 8439), with the encoded header as associated data
+and the concatenated frames as plaintext. See `security.md` §4 for why
+there is no separate checksum and the tag is not truncated.
 
 ## 3. Frames
 
@@ -181,9 +183,9 @@ record = flags:varint  lamport:varint  [timestamp:varint]  [ext_len:varint ext:[
 - `text`: UTF-8 that must validate, else the record is malformed. It may be
   empty. Its length is `Config::max_text_len` (default 4096 bytes); a longer
   `text` makes the record malformed.
-- A malformed record is dropped **and not acknowledged**. The peer's
-  retransmission (about 2⁻³² of corruptions get past the check) then gets a
-  second chance.
+- A malformed record is dropped **and not acknowledged**. Since the AEAD
+  authenticates every fragment, only a buggy or hostile peer can produce
+  one. Not acknowledging it keeps the receiver's state unchanged.
 
 The custom epoch keeps timestamps at 4 bytes until 2033 (2²⁸ s).
 
@@ -204,29 +206,30 @@ MessageId      = H_16("avianlink/v1/msg" || PK_s || PK_r || varint(seq) || recor
 
 ## 6. Header-overhead budget
 
-Fixed per-packet cost in v1-draft: version 1 + tag 3 + counter (typical 2,
-worst case for sizing 5) + check 4 = **10 bytes typical**. Phase 3 changes
-the check to a 16-byte tag (+12).
+Fixed per-packet cost: version 1 + routing tag 3 + counter (typically 2,
+5 in the worst case assumed for sizing) + AEAD tag 16 = **22 bytes
+typical**. Phase 1–2's placeholder check was 4 bytes, 12 fewer.
 
 The engine sizes fragments for the worst case (5-byte counter). Columns:
 `text₁` is the most text that fits in one unfragmented packet (seq < 128,
 Lamport < 16384, with a timestamp). `frag` is the fragment payload per packet
 for a fragmented message (seq < 128, < 128 fragments). `eff` is
-`frag / MTU`. Generated by the `overhead_table` test in
+`frag / MTU`. The Phase 2 columns used the 4-byte placeholder check, for
+comparison. Generated by the `overhead_table` test in
 `avianlink-core/tests/wire.rs`.
 
 <!-- overhead-table:start -->
-| MTU | text₁ (P1) | frag (P1) | eff (P1) | text₁ (P3, +12) | frag (P3) | eff (P3) |
+| MTU | text₁ | frag | eff | text₁ (P2) | frag (P2) | eff (P2) |
 |---|--:|--:|--:|--:|--:|--:|
-| 48 | 24 | 30 | 62% | 12 | 18 | 37% |
-| 51 | 27 | 33 | 64% | 15 | 21 | 41% |
-| 64 | 40 | 46 | 71% | 28 | 34 | 53% |
-| 128 | 104 | 110 | 85% | 92 | 98 | 76% |
-| 222 | 197 | 203 | 91% | 185 | 191 | 86% |
-| 255 | 230 | 236 | 92% | 218 | 224 | 87% |
-| 512 | 487 | 493 | 96% | 475 | 481 | 93% |
-| 1200 | 1175 | 1181 | 98% | 1163 | 1169 | 97% |
+| 48 | 12 | 18 | 37% | 24 | 30 | 62% |
+| 51 | 15 | 21 | 41% | 27 | 33 | 64% |
+| 64 | 28 | 34 | 53% | 40 | 46 | 71% |
+| 128 | 92 | 98 | 76% | 104 | 110 | 85% |
+| 222 | 185 | 191 | 86% | 197 | 203 | 91% |
+| 255 | 218 | 224 | 87% | 230 | 236 | 92% |
+| 512 | 475 | 481 | 93% | 487 | 493 | 96% |
+| 1200 | 1163 | 1169 | 97% | 1175 | 1181 | 98% |
 <!-- overhead-table:end -->
 
-At 48 bytes the Phase 3 AEAD tag costs a third of the packet. See
-`docs/security.md` for the truncated-tag discussion.
+At 48 bytes the AEAD tag costs a third of the packet. See
+`security.md` §4 for why it isn't truncated.

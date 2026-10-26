@@ -327,3 +327,73 @@ different priorities.
 1% duty cycle's entire budget on a LoRa link. So the probe interval is
 never below 10× the budget time one MTU-sized packet costs on the
 contact's link: probing uses at most about 10% of the budget.
+
+## D-029: Cryptography dependencies (Phase 3)
+
+| Crate | Version | Why |
+|---|---|---|
+| `ed25519-dalek` | 2.x | Identity keys; `VerifyingKey::to_montgomery` and `SigningKey::to_scalar_bytes` give the X25519 form without custom math. |
+| `curve25519-dalek` | 4.x | `MontgomeryPoint::mul_clamped` for X25519 on converted keys. Already a dependency of `ed25519-dalek`. |
+| `chacha20poly1305` | 0.10 | RFC 8439 AEAD, constant-time, `no_std`, audited (NCC 2020). |
+| `hkdf` | 0.12 | RFC 5869 over the `sha2` 0.10 already in the tree. |
+| `zeroize` | 1.x | Wipes derived keys and identity secrets on drop. |
+
+All are `default-features = false`. **Rejected:** `x25519-dalek`, which
+can't consume Ed25519 secrets without re-implementing the conversion that
+`ed25519-dalek` already exposes. XChaCha20-Poly1305 is unnecessary because
+nonces come from counters and are never random. `ring` is not `no_std`.
+
+## D-030: One Ed25519 identity, used for X25519 too (Phase 3)
+
+See `security.md` §2. Identities are shared once, out of band, and are
+expensive to change. Choosing Ed25519 now keeps signatures available later
+without a new identity format.
+
+## D-031: Routing tags derived from the shared secret (Phase 3)
+
+This is the D-010 follow-up. Outsiders who know both public keys can't
+compute the tag. Tags stay static per direction (linkable). Rotating tags
+per counter epoch is possible later, because the receiver could precompute
+a small window. It is deferred until there is a metadata requirement worth
+the complexity.
+
+## D-032: The full 16-byte Poly1305 tag; no pre-decryption checksum (Phase 3)
+
+See `security.md` §4. At a 48-byte MTU this costs 12 bytes more per packet
+than Phase 2's placeholder. The overhead table in `wire-format.md` §6 shows
+the result.
+
+## D-033: Sequence numbers capped at 2³⁵, `max_fragments` raised to 512 (Phase 3)
+
+With a 16-byte tag, the frame space at a 48-byte MTU drops to 23 bytes.
+Config validation sized fragments for a worst-case 10-byte seq varint. That
+made a 4096-byte message need over 600 fragments, so defaults that fit the
+spec failed validation. Seqs are now capped at 2³⁵−1 per conversation
+(`send_text` returns `Exhausted` beyond it; at one message per second that
+is over a thousand years), which bounds the seq varint at 5 bytes. The
+fragment limit becomes 512, and reassembly bounds memory regardless.
+
+## D-034: Desktop API requests taken up in Phase 3
+
+- **AR-002, accepted with changes.** `Event::MessageTransmitted { conversation, id }`
+  fires once per message per engine incarnation, on its first
+  transmission. It is **not persisted**, because one storage write per
+  transmission is too costly. If the event queue is full it is skipped.
+  Retry counts come from a query instead: `Engine::outgoing(conv)` returns
+  per-message transmission counts and the fragments the peer holds. That
+  avoids an event per retransmission.
+- **AR-003, declined as specified.** There is no age-based give-up, because
+  silence for days is normal and a "failed" state would usually be a lie.
+  `remove_contact` abandons a contact's undelivered messages explicitly and
+  returns their IDs, so the host can mark them. An opt-in age limit can be
+  added if a host shows it needs one.
+- **AR-004, accepted unchanged:** `PublicKey::fingerprint` and
+  `format_fingerprint`, as defined by desktop DA-009.
+- **AR-005, accepted.** `remove_contact(conv) -> Result<Vec<MessageId>, Error>`
+  deletes the contact and its outbox, receive window and reassembly
+  partials in one batch. `contacts()` already existed (Phase 2), and
+  `contact_key(conv)` is added.
+- **AR-007, accepted as queries:** `link_stats(link)` (packets and bytes
+  in/out, drops, `budget_blocked_until`) and `contact_status(conv)`
+  (`last_heard`, smoothed RTT, `unreachable`, outbox size). `last_heard`
+  counts every authenticated packet, ACK-only packets included.
