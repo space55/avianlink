@@ -7,7 +7,6 @@ members = [
     "crates/avianlink-udp",
     "crates/avianlink-cli",
     "crates/avianlink-ffi",
-    "apps/desktop/src-tauri",
 ]
 
 [workspace.package]
@@ -21,11 +20,6 @@ license = "MIT"
 avianlink-core = { path = "crates/avianlink-core" }
 avianlink-sim = { path = "crates/avianlink-sim" }
 avianlink-udp = { path = "crates/avianlink-udp" }
-# Shared with apps/desktop, which still uses the pre-0.10 rand stack. The
-# library crates pin their own (newer) versions of these three; see D-035.
-rand_core = { version = "0.6.4", default-features = false }
-rand_chacha = { version = "0.3.1", default-features = false }
-sha2 = { version = "0.10.9", default-features = false }
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize"] }
 curve25519-dalek = { version = "5.0.0", default-features = false, features = ["zeroize"] }
 chacha20poly1305 = { version = "0.11.0", default-features = false }
