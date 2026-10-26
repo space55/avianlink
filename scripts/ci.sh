@@ -4,6 +4,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 EMBEDDED_TARGETS=(thumbv7em-none-eabihf aarch64-apple-ios)
+# The library's crates. Named explicitly because the workspace also holds
+# the desktop app (apps/desktop), which has its own gate.
+LIB_PKGS=(-p avianlink-core -p avianlink-sim -p avianlink-udp -p avianlink-cli -p avianlink-ffi)
 
 step() { printf '\n==> %s\n' "$*"; }
 
@@ -17,14 +20,14 @@ for t in "${EMBEDDED_TARGETS[@]}"; do
 done
 
 step "cargo fmt --check"
-cargo fmt --all -- --check
+cargo fmt "${LIB_PKGS[@]}" -- --check
 cargo fmt --manifest-path fuzz/Cargo.toml -- --check
 
-step "cargo clippy (host, all targets)"
-cargo clippy --workspace --all-targets --locked -- -D warnings
+step "cargo clippy (library crates, host, all targets)"
+cargo clippy "${LIB_PKGS[@]}" --all-targets --locked -- -D warnings
 
-step "cargo test"
-cargo test --workspace --locked
+step "cargo test (library crates)"
+cargo test "${LIB_PKGS[@]}" --locked
 
 for t in "${EMBEDDED_TARGETS[@]}"; do
     step "avianlink-core: build + clippy for $t (no default features)"
