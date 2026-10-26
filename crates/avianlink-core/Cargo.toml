@@ -13,8 +13,8 @@ default = []
 std = []
 
 [dependencies]
-rand_core = { workspace = true }
-sha2 = { workspace = true }
+rand_core = { version = "0.10.1", default-features = false }
+sha2 = { version = "0.11.1", default-features = false }
 ed25519-dalek = { workspace = true }
 curve25519-dalek = { workspace = true }
 chacha20poly1305 = { workspace = true }
@@ -23,7 +23,7 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-rand_chacha = { workspace = true }
+rand_chacha = { version = "0.10.0", default-features = false }
 
 [lints]
 workspace = true

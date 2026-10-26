@@ -189,7 +189,7 @@ pub fn restore(data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand_core::RngCore;
+    use rand_core::Rng;
 
     /// Smoke-runs both harnesses on random scripts (the real fuzzing runs
     /// under `scripts/fuzz.sh`).
@@ -237,11 +237,11 @@ mod tests {
             let mut script = vec![0xff];
             for (k, v) in &entries {
                 let mut v = v.clone();
-                if !v.is_empty() && rng.next_u32() % 2 == 0 {
+                if !v.is_empty() && rng.next_u32().is_multiple_of(2) {
                     let i = (rng.next_u32() as usize) % v.len();
                     v[i] ^= 1 << (rng.next_u32() % 8);
                 }
-                if rng.next_u32() % 8 == 0 {
+                if rng.next_u32().is_multiple_of(8) {
                     v.truncate((rng.next_u32() as usize) % (v.len() + 1));
                 }
                 script.push(k.len() as u8);

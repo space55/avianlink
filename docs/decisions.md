@@ -46,10 +46,11 @@ is what "reproducible from its seed" needs. It also implements `CryptoRng` for
 rand_core 0.6 (D-002). The `rand` crate isn't needed. It's a sim-only
 dependency and never enters core.
 
-## D-004: Edition 2021, MSRV 1.82 (Phase 0; MSRV raised in Phase 1)
+## D-004: Edition 2021, MSRV 1.88 (Phase 0; raised in Phases 1 and 4)
 
-**Decision.** Edition 2021, `rust-version = "1.82"` (raised from 1.81 in
-Phase 1 for `Option::is_none_or`).
+**Decision.** Edition 2021, `rust-version = "1.88"`. It was raised from 1.81
+to 1.82 in Phase 1 for `Option::is_none_or`, then to 1.88 in Phase 4 because
+`sha2` 0.11 requires it (D-035).
 
 **Why.** 1.81 stabilised `core::error::Error`, so the core can implement the
 error trait without `std`. Edition 2021 keeps us buildable on older embedded
@@ -397,3 +398,25 @@ fragment limit becomes 512, and reassembly bounds memory regardless.
   in/out, drops, `budget_blocked_until`) and `contact_status(conv)`
   (`last_heard`, smoothed RTT, `unreachable`, outbox size). `last_heard`
   counts every authenticated packet, ACK-only packets included.
+
+## D-035: Upgrade to the rand_core 0.10 / RustCrypto 0.11 generation (Phase 4)
+
+This supersedes the "revisit" note in D-002. Library crates now use
+`rand_core` 0.10, `rand_chacha` 0.10, `sha2` 0.11, `ed25519-dalek` 3,
+`curve25519-dalek` 5, `chacha20poly1305` 0.11 (`AeadInOut`), `hkdf` 0.13,
+`zeroize` 1.9 and `proptest` 1.12. The engine's RNG bound changes from
+`CryptoRngCore` to `rand_core::CryptoRng`.
+
+**Verification.** The 20-seed sweep over all scenarios is unchanged.
+Profiles that took no Phase 3 follow-up fixes reproduce bit-for-bit, so
+the RNG streams and key derivations are identical. The `no_std` tree has
+one copy of each crate.
+
+**Workspace coupling.** `apps/desktop` inherits `rand_core`, `rand_chacha`
+and `sha2` from `[workspace.dependencies]`, with `rand_core`'s `getrandom`
+feature, which 0.10 removed. Changing those shared entries would break
+dependency resolution for the whole workspace. So they stay at the old
+versions, and the library crates pin their own. When the desktop app
+migrates, the shared entries should move to the new versions and the
+per-crate pins can go. Until then the lockfile carries both generations of
+those three crates, but never inside the library's graph.

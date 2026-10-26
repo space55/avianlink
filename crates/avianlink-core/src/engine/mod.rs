@@ -4,7 +4,7 @@ mod state;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::ToString;
 use alloc::vec::Vec;
-use rand_core::CryptoRngCore;
+use rand_core::CryptoRng;
 
 use crate::config::MAX_SEQ;
 use crate::crypto::{Identity, PairKeys};
@@ -232,7 +232,7 @@ pub struct Engine<S, R> {
     last_served: Option<ConversationId>,
 }
 
-impl<S: Storage, R: CryptoRngCore> Engine<S, R> {
+impl<S: Storage, R: CryptoRng> Engine<S, R> {
     /// Creates an engine for `identity` on empty storage.
     ///
     /// Fails with [`Error::StorageNotEmpty`] if `storage` already holds an
@@ -1130,7 +1130,7 @@ struct BuildCtx {
 /// Fills one packet for `contact`: pending ACK and FRAG_ACKs first (small,
 /// and they unblock the peer), then due fragments oldest-due first, or a
 /// single probe's worth in backoff. Returns `None` if nothing was written.
-fn build_packet<R: CryptoRngCore>(
+fn build_packet<R: CryptoRng>(
     contact: &mut Contact,
     ctx: &BuildCtx,
     reassembly: &Reassembly,
@@ -1208,7 +1208,7 @@ fn build_packet<R: CryptoRngCore>(
 }
 
 /// Writes due fragments into `out`. Returns whether any were written.
-fn write_data<R: CryptoRngCore>(
+fn write_data<R: CryptoRng>(
     contact: &mut Contact,
     ctx: &BuildCtx,
     out: &mut Vec<u8>,

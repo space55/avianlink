@@ -69,7 +69,7 @@ pub fn seeded_rng(seed: u64) -> ChaCha20Rng {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand_core::RngCore;
+    use rand_core::Rng;
 
     #[test]
     fn same_seed_same_stream() {

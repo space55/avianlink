@@ -7,11 +7,11 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use chacha20poly1305::aead::AeadInPlace;
+use chacha20poly1305::aead::AeadInOut;
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, Tag};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hkdf::Hkdf;
-use rand_core::CryptoRngCore;
+use rand_core::CryptoRng;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -32,7 +32,7 @@ pub struct Identity {
 
 impl Identity {
     /// Generates a new identity.
-    pub fn generate<R: CryptoRngCore>(rng: &mut R) -> Self {
+    pub fn generate<R: CryptoRng>(rng: &mut R) -> Self {
         let mut seed = Zeroizing::new([0u8; 32]);
         rng.fill_bytes(seed.as_mut());
         Self::from_secret_bytes(&seed)
@@ -179,7 +179,7 @@ impl PairKeys {
         let cipher = ChaCha20Poly1305::new(&Key::from(*self.tx_key));
         let (header, body) = packet.split_at_mut_checked(header_len)?;
         let tag = cipher
-            .encrypt_in_place_detached(&nonce(counter), header, body)
+            .encrypt_inout_detached(&nonce(counter), header, body.into())
             .ok()?;
         packet.extend_from_slice(&tag);
         Some(())
@@ -194,7 +194,12 @@ impl PairKeys {
         let tag: [u8; AEAD_TAG_LEN] = tag.try_into().ok()?;
         let mut plain = ciphertext.to_vec();
         ChaCha20Poly1305::new(&Key::from(*self.rx_key))
-            .decrypt_in_place_detached(&nonce(counter), header, &mut plain, &Tag::from(tag))
+            .decrypt_inout_detached(
+                &nonce(counter),
+                header,
+                plain.as_mut_slice().into(),
+                &Tag::from(tag),
+            )
             .ok()?;
         Some(plain)
     }

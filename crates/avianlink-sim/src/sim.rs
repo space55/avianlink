@@ -9,7 +9,7 @@ use avianlink_core::{
     MemoryStorage, MessageId, Stats, Timestamp,
 };
 use rand_chacha::ChaCha20Rng;
-use rand_core::RngCore;
+use rand_core::Rng;
 
 use crate::impair::{
     below, unit, Channel, ChannelStats, GilbertElliott, LinkProfile, OutageModel, Outages,

@@ -2,7 +2,7 @@
 
 use avianlink_core::AirtimeModel;
 use rand_chacha::ChaCha20Rng;
-use rand_core::RngCore;
+use rand_core::Rng;
 
 /// Uniform sample in `[0, 1)`.
 pub(crate) fn unit(rng: &mut ChaCha20Rng) -> f64 {
