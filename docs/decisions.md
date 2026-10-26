@@ -638,3 +638,27 @@ messages span several packets, and within a few percent elsewhere.
 Wire bytes per payload byte drop on every profile compared with the
 100-byte workload: fixed per-packet and per-ACK costs are spread over
 more payload. Packets per message rise with fragmentation.
+
+## D-042: Host-side choices for the UDP adapter and CLI (Phase 6)
+
+- **Dependency: `getrandom` 0.4,** used only to seed ChaCha20 (rand_chacha,
+  already in the tree) from the OS. **Rejected:** `rand::rngs::OsRng`. That
+  is the whole `rand` crate for one function.
+- **`FileStorage` is a write-ahead log in one file** (`hosting.md` §2):
+  one checksummed record per batch, `fsync` on commit, truncate the tail on
+  recovery, and compact by rename. That is atomic batches with no
+  dependency. **Rejected:** `sled`, which is large and its future is
+  uncertain; SQLite, a C dependency and too much for a demo. Hosts with a
+  database should implement `Storage` over it.
+- **`Engine::handle_packet` now returns the authenticated sender's
+  `ConversationId`,** or `None` for a dropped packet. Hosts on
+  point-to-point transports need it to keep the address book current under
+  NAT rebinding, and only authenticated packets may move an address.
+  Returning a value is non-breaking for callers that ignore it.
+- **The CLI depends on `avianlink-sim`** for named profiles
+  (`Profile::link().engine_link()`), so a chat over netem uses the same MTU
+  and budget the simulator was tuned with.
+- **Desktop request AR-009 accepted.** `impair::Channel` and `Outages` are
+  public, with `Jitter::sample`, because `udp-impair` needs exactly what the
+  desktop app asked for: the simulator's impairment model, driven in real
+  time.
