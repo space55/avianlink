@@ -13,6 +13,7 @@ version = "0.0.0"
 edition = "2021"
 rust-version = "1.81"
 publish = false
+license = "MIT"
 
 [workspace.dependencies]
 avianlink-core = { path = "crates/avianlink-core" }
