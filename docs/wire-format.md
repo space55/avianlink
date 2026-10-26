@@ -1,6 +1,6 @@
 # avianlink wire format
 
-> **Status: v1 (Phase 3).** The version byte stays `0x01` until the first
+> **Status: v1 (Phase 4).** The version byte stays `0x01` until the first
 > release. Before then, peers are assumed to run the same build.
 
 ## 1. Conventions
@@ -86,7 +86,9 @@ frame = type:varint  len:varint  body:[len]
 ```
 
 Every frame is length-prefixed, so a receiver can skip frame types it doesn't
-know. A frame type whose meaning would be unsafe to ignore can never be
+know. **Zero bytes after the last frame are padding.** When every byte left at
+a frame boundary is zero, parsing ends successfully. FEC (§3.4) relies on
+this: a recovered packet keeps the zero padding of its coded symbol. A frame type whose meaning would be unsafe to ignore can never be
 added this way; it needs a new version byte.
 
 | Type | Name    | Phase | Body |
@@ -94,37 +96,49 @@ added this way; it needs a new version byte.
 | 0x00 | PADDING | 1     | Ignored. |
 | 0x01 | MSG     | 1     | Message fragment (§3.1). |
 | 0x02 | ACK     | 1     | Selective acknowledgement (§3.2). |
-| 0x03 | REPAIR  | 4     | Reserved: FEC repair symbol. |
+| 0x03 | REPAIR  | 4     | FEC repair symbol (§3.4). |
 | 0x04 | SYNC    | 5     | Reserved: reconciliation summary. |
 | 0x05 | FRAG_ACK| 2     | Per-fragment acknowledgement (§3.3). |
+| 0x06 | LOSS    | 4     | Receiver's measured packet loss (§3.5). |
 | other| —       |       | Skipped and counted (`frames_unknown`). |
 
 ### 3.1 MSG
 
 ```
-body = seq:varint  count:varint  [index:varint if count > 1]  data:rest
+body = seq:varint  frag:varint  data:rest
 ```
 
 - `seq`: the sender's per-conversation message sequence number, dense and
   starting at 0.
-- `count`: the number of fragments, ≥ 1. `count = 1` means unfragmented, and
-  `index` is omitted.
-- `index`: < `count`.
-- `data`: the fragment's slice of the encoded message record (§4).
-  Fragments are contiguous and in index order; only the last may be shorter.
+- `frag = 0`: unfragmented. `data` is the whole message record (§4).
+- `frag = 1 + (offset << 1 | last)`: `data` is bytes
+  `[offset, offset + len)` of the record. `last = 1` marks the final
+  fragment, whose end is the record's length.
 
-Semantic errors (`count = 0`, `index ≥ count`, `count > max_fragments`,
-inconsistent sizes) drop **that frame** only.
+Fragments are addressed **by byte offset**, so a receiver can combine
+fragments from different fragmentations of the same message. That happens
+when the sender re-plans: a smaller-MTU link appears, FEC changes the space
+available, or the sender restarts. The record's bytes are the same in
+every plan. (Phases 1–3 used `count, index`, and fragments from two plans
+with equal counts but different sizes spliced into a corrupt record.
+D-037.)
 
-**Reassembly.** The receiver keys partial messages by (contact, seq). If a
-fragment arrives with a different `count` than the stored partial, the
-sender has re-fragmented (for example because a link with a smaller MTU
-appeared). The stored partial is discarded and reassembly restarts. Memory
-is bounded by `Config::max_reassembly_bytes`. When that limit is hit, the
-least recently updated partials belonging to *other* messages are evicted
-first. If the fragment still doesn't fit, it is dropped
-(`fragments_dropped_reassembly_full`), and the sender's retransmission
-recovers it.
+Semantic errors drop **that frame** only:
+- an empty fragment;
+- an end beyond the record limit;
+- a final fragment that disagrees with a known length, or with data already
+  held beyond it;
+- a non-final fragment that reaches the known length.
+
+**Reassembly.** The receiver keys partial messages by (contact, seq). It
+copies each fragment to its offset, growing the buffer as needed;
+overlaps are harmless. The message completes once the final fragment has
+fixed the length and `[0, length)` is covered. Memory is bounded by
+`Config::max_reassembly_bytes`, charged at the buffer size. When that
+limit is hit, the least recently updated partials belonging to *other*
+messages are evicted first. If the fragment still doesn't fit, it is
+dropped (`fragments_dropped_reassembly_full`), and the sender's
+retransmission recovers it.
 
 **Receive window.** A `seq` ≥ `cum + max_reorder_window` (§3.2) is dropped
 unacknowledged. This bounds receiver state, and the sender keeps
@@ -155,15 +169,62 @@ while one is pending, and otherwise send an ACK-only packet after
 ### 3.3 FRAG_ACK
 
 ```
-body = seq:varint  count:varint  bitmap:rest
+body = seq:varint  unit:varint  bitmap:rest
 ```
 
-Fragments of the partially reassembled message `seq` (fragmented into
-`count` pieces) that have arrived. Bit `i` set means fragment `i` is held.
-A FRAG_ACK is advisory. The receiver may still evict the partial, so the
-sender treats acknowledged fragments as "not needed for now", not "never
-needed" (`reliability.md` §2). A sender whose plan for `seq` has a different
-`count` ignores the frame.
+Which bytes of the partially reassembled message `seq` the receiver holds,
+in blocks of `unit` bytes. Bit `i` set means bytes
+`[i·unit, (i+1)·unit)` are all held, truncated at the record's length
+when it is known. `unit` is the length of
+the most recent non-final fragment received, normally the sender's current
+fragment size, so the blocks line up with its fragments.
+
+The sender treats fragment `[a, b)` as held when every block that
+intersects it is set. That rule is correct for any `unit`. FRAG_ACK is
+advisory. The receiver may still evict the partial, so the sender treats
+held fragments as "not needed for now", not "never needed"
+(`reliability.md` §2).
+
+### 3.4 REPAIR
+
+```
+body = base:varint  mask:varint  shape:u8  data:rest
+```
+
+A repair symbol for a window of the sender's earlier packets in this
+direction (`reliability.md` §6).
+
+- **Sources:** packet counters `base + i` for every bit `i` set in `mask`
+  (LSB first). Bit 0 must be set. There are at most 16 sources, and
+  `mask < 2³²`.
+- **`shape`:** `(m − 1) << 4 | j`. The window has `m` repairs (1–16) and
+  this is repair `j < m`.
+- **`data`:** `Σᵢ c(m, j, i) · sᵢ` over GF(2⁸), using the polynomial
+  `x⁸+x⁴+x³+x²+1` (0x11d).
+  - `sᵢ` is the *plaintext* (decrypted frames) of the i-th source, in
+    counter order, zero-padded to the length of `data`.
+  - `c(1, 0, i) = 1`, so a single repair is plain XOR.
+  - For `m > 1`, `c(m, j, i) = (j ⊕ (16 + i))⁻¹`. This is a Cauchy matrix,
+    and every square submatrix of a Cauchy matrix is invertible. So any `e`
+    missing sources can be recovered from any `e` repairs of the window.
+- **Packets:** a packet carrying REPAIR carries nothing else and is never
+  itself a source.
+- **Recovery:** a recovered source is processed exactly like a received
+  packet with that counter. It goes through the replay check, frame
+  validation and frame application. Trailing zero bytes are padding (§3).
+- **Invalid fields** (bit 0 clear, too many sources, `j ≥ m`) drop the
+  frame.
+
+### 3.5 LOSS
+
+```
+body = loss_permille:varint
+```
+
+Loss the receiver measured on packets from the sender, in parts per
+thousand. It counts gaps in the packet counter, before any FEC recovery,
+over the most recent ~256 counters. The sender uses it to size FEC
+(`reliability.md` §6). It is advisory, and values above 1000 are clamped.
 
 ## 4. Message record
 

@@ -1,6 +1,6 @@
 # avianlink reliability
 
-> **Status: Phase 2.** How the engine decides what to (re)send and when, and
+> **Status: Phase 4.** How the engine decides what to (re)send and when, and
 > what survives a crash. The wire encodings referenced here are in
 > `wire-format.md`.
 
@@ -140,3 +140,64 @@ seqs from the same sender that have not arrived yet. So the application can
 tell "this arrived out of order, and two earlier messages are still on
 their way" from "this is the latest", and sort its thread by (Lamport,
 sender key).
+
+## 6. Forward error correction
+
+Most messages fit in one packet, so FEC codes **across packets**, not
+within a message. One repair packet can stand in for any one lost packet
+of its window. That saves a retransmission timeout, which on these links
+means seconds to minutes.
+
+**Sender, per contact:**
+- **When FEC is on.** All three must hold:
+  - the peer's latest LOSS report is at least `fec_min_loss_permille`
+    (default 20 ‰);
+  - the contact is not in backoff, so repairs are never sent into an
+    outage;
+  - the link is budget-rich: one MTU-sized packet costs at most
+    `fec_max_packet_cost_ms` (default 2 s) of its rate or duty-cycle
+    budget. On a 1%-duty LoRa link a packet costs about 37 s of budget, and
+    redundancy would crowd out data.
+- **Sources.** Every packet built while FEC is on is a source, ACK-only
+  packets included. Its plaintext frames are kept until the window closes.
+  Packets are built `fec_reserve` bytes short of the MTU so a repair
+  (frame header plus the longest source) always fits in one packet. New
+  messages are fragmented with that reserve. Packets built before FEC
+  turned on are simply not coded.
+- **Windows** close at `fec_max_sources` sources (default 8), or
+  `fec_flush_ms` (default 200 ms) after the first source, whichever comes
+  first. On close, the engine computes `m` repairs and queues them. Repairs
+  are sent after due data and before ACK-only packets.
+- **Repair count.** For window size `k` and reported loss `p` (as a
+  fraction), each closing window adds `k · 1.5 · p/(1−p)` (at most `k`) to
+  a per-contact *repair credit*. The window then gets `m` whole repairs out
+  of that credit: at most 1 with `fec = Xor`, at most `k` with
+  `fec = ReedSolomon` (the default, D-038). The rest of the credit carries
+  over.
+- **Spare budget only.** A repair is sent only if the link could still
+  send an MTU-sized packet straight afterwards. Otherwise the window's
+  pending repairs are dropped (`fec_repairs_dropped`). On a busy link,
+  redundancy would delay the data it is meant to protect, and the
+  retransmission timer covers the loss.
+  This targets about 1.5× the expected losses on average, without
+  rounding every lone packet up to a full duplicate at low loss.
+
+**Receiver:**
+- **Plaintexts kept** of recently received sources, bounded by
+  `max_fec_rx_bytes` (default 32 KiB across all contacts, oldest evicted
+  first).
+- **Pending repairs** until their window decodes or they are evicted, at
+  most `max_fec_pending_repairs` (default 64).
+- **Decoding** happens when a window's missing sources number no more than
+  its repairs received. It is Gaussian elimination over GF(2⁸) on an
+  `e × e` system, where `e ≤ 16`.
+- **Loss measurement.** Counter gaps over a separate arrivals bitmap, so
+  FEC recoveries don't hide loss from the sender, which would make FEC
+  turn itself off. Reported in a LOSS frame with an ACK whenever the
+  estimate moves by ≥ 20 ‰, or every 64 packets.
+
+**Cost model.** With FEC on, every packet gives up the `fec_reserve` bytes
+(about 7–9 at small MTUs), plus `m/k` extra packets. Sparse traffic means
+small windows: a lone packet's single repair is a duplicate, which is the
+right code for a lone packet. The simulator reports the bandwidth this
+costs against the latency it saves (Phase 4 report, D-037).

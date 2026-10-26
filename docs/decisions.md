@@ -420,3 +420,105 @@ versions, and the library crates pin their own. When the desktop app
 migrates, the shared entries should move to the new versions and the
 per-crate pins can go. Until then the lockfile carries both generations of
 those three crates, but never inside the library's graph.
+
+## D-036: FEC codes decrypted packet plaintexts, with Cauchy Reed-Solomon over GF(2⁸) (Phase 4)
+
+**What is coded.** Packet plaintexts (frames) are coded, not ciphertexts or
+message bytes. A recovered plaintext then enters the normal frame path,
+and the repair itself is authenticated like any packet, so FEC adds no
+trust assumptions. **Rejected:** coding ciphertexts. A repair would then
+have to be a raw, unauthenticated packet type, and a recovered packet
+would need a second AEAD pass. Coding message bytes would not help the
+common single-packet message.
+
+**The code.** A single repair uses the all-ones row, which is plain XOR, as
+the spec's "start with parity" asks. Multiple repairs use a Cauchy matrix:
+every square submatrix is nonsingular, so *any* `e` repairs recover *any*
+`e` losses. A Vandermonde code has to be made systematic to give that
+guarantee. GF(2⁸) arithmetic is a 300-line integer module with log/exp
+tables built at compile time, so no dependency is needed.
+
+**Trailing zeros are padding** (wire §3), so symbols need no length prefix.
+That saves 2 bytes per repair.
+
+**Loss is measured by the receiver** from counter gaps and reported in a
+LOSS frame. The sender can't see packet loss directly: ACKs are per
+message. Losses are counted *before* FEC recovery. Otherwise FEC would hide
+the loss that justifies it and switch itself off.
+
+**Rejected:** a fountain code (the spec defers it); interleaving windows
+across time, which adds latency at sparse traffic and should only be
+reconsidered if burst losses dominate in measurements.
+
+## D-037: Fragments addressed by byte offset (Phase 4; fixes a latent Phase 1 bug)
+
+**Bug.** MSG fragments carried `(count, index)`. The receiver detected
+re-fragmentation only when `count` changed (D-017). Two plans with
+different fragment sizes can share a count: a 30-byte record splits as
+19+11 or as 29+1. The receiver then spliced fragments from both into a
+corrupt record. It was usually still valid UTF-8, so it was delivered
+under a wrong ID and *acknowledged*, and the real message was lost.
+
+**Exposure.** In Phases 1–3 it needed a new, smaller-MTU link while a long
+message was in flight, and no test did that. Phase 4 made it reachable,
+because FEC changes the planning space and a restarted sender re-plans
+without it. The simulator caught it as integrity violations in
+`harsh_64_crashy` with FEC on (7 lost messages in 20,000).
+
+**Fix.** Fragments carry their byte offset, plus a flag on the final one
+(wire §3.1). The receiver copies bytes to their offsets, so any mix of
+plans reassembles correctly. The final fragment fixes the length, so
+`total` needn't be repeated: the encoding is no larger than the old
+`count, index`. Unfragmented messages keep a single `0` byte. FRAG_ACK
+reports coverage in byte blocks. **Rejected:**
+always planning with the FEC reserve, which would only hide this instance
+and cost about 8 bytes per fragment on every link; adding a plan ID, which
+would still discard partial progress on every re-plan.
+
+## D-038: FEC policy: budget gates, repair credit, Reed-Solomon by default (Phase 4)
+
+These are the measurements behind the policy in `reliability.md` §6. All
+use `bursty_loss` (`disaster_cellular`'s ~35% Gilbert-Elliott loss,
+heavy-tailed delay, no outages) unless noted. Values are medians over 10–20
+seeds.
+
+**1. Gate on link budget.** The first version used FEC wherever loss was
+reported. On `lora_like` (1% duty) p95 went from 9 minutes to 2.5 hours,
+because repairs spent airtime that data needed. On `geo_satellite` it cost
++38% for no gain. FEC now requires one MTU-sized packet to cost at most
+`fec_max_packet_cost_ms` (2 s) of the link's budget, which rules out
+duty-cycled LoRa.
+
+**2. Repair credit.** Rounding every window up to at least one repair
+meant a full duplicate per lone packet at any loss rate. Windows now
+accrue `k·1.5·p/(1−p)` of credit and send whole repairs out of it. That
+brought `geo_satellite`'s cost from +38% to +5%. A factor of 1.0 or 0.7
+instead of 1.5 saved under 10% of bytes but lost 10–15% of the p95 gain.
+
+**3. Spare budget only.** On a near-saturated link (one long message per
+second, about 75% load), both codes made p95 *worse* than no FEC (XOR 1.8m
+vs 1.4m off), because repairs queued ahead of data. Repairs are now
+dropped unless a further MTU packet would fit straight after. With that
+gate, Reed-Solomon improves the saturated case (p95 1.2m vs 1.4m).
+
+**4. Reed-Solomon vs XOR depends on fragments per message.**
+
+| workload | p95 off | p95 XOR | p95 RS | bytes, RS vs XOR |
+|---|--:|--:|--:|--:|
+| chat mix (mean ~100 B), MTU 256 | 51.0s | 33.0s | 36.8s | +3% |
+| ~190 B messages, MTU 51 | 1.2m | 32.4s | **24.4s** | +16% |
+| ~190 B messages, MTU 64 | 1.2m | 43.1s | **26.2s** | +20% |
+| ~190 B messages, MTU 128 | 1.2m | 52.8s | **42.8s** | +18% |
+| ~190 B messages, MTU 256 | 1.1m | 39.2s | 38.5s | +9% |
+| 300–1200 B bulk, MTU 256 | 21.9s | 17.2s | **15.5s** | +2% |
+
+When one message spans several packets, a window often loses two or more,
+and only Reed-Solomon recovers that. The expected workload is messages
+averaging 200 bytes or more over small-MTU links, so **Reed-Solomon is
+the default**. XOR stays available for short-message chat over larger
+MTUs.
+
+**Not done:** interleaving windows over time. In this simulator,
+Gilbert-Elliott bursts take out a window's sources and its repairs
+together. Real fading is time-correlated, and spacing repairs out could
+help there. It needs a time-based burst model to evaluate.
