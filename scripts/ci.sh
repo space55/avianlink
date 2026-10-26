@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 EMBEDDED_TARGETS=(thumbv7em-none-eabihf aarch64-apple-ios)
-# The library's crates. Named explicitly because the workspace also holds
-# the desktop app (apps/desktop), which has its own gate.
+# The library's crates, named explicitly so that local experiments added to
+# the workspace don't join the gate.
 LIB_PKGS=(-p avianlink-core -p avianlink-sim -p avianlink-udp -p avianlink-cli -p avianlink-ffi)
 
 step() { printf '\n==> %s\n' "$*"; }
@@ -34,5 +34,26 @@ for t in "${EMBEDDED_TARGETS[@]}"; do
     cargo build -p avianlink-core --no-default-features --target "$t" --locked
     cargo clippy -p avianlink-core --no-default-features --target "$t" --locked -- -D warnings
 done
+
+step "avianlink.h is up to date (cbindgen)"
+if ! command -v cbindgen >/dev/null; then
+    echo "cbindgen not found; run: cargo install cbindgen" >&2
+    exit 1
+fi
+fresh=$(mktemp)
+trap 'rm -f "$fresh"' EXIT
+(cd crates/avianlink-ffi && cbindgen --quiet --config cbindgen.toml --crate avianlink-ffi --output "$fresh")
+if ! diff -u crates/avianlink-ffi/include/avianlink.h "$fresh"; then
+    echo "header is stale; regenerate with: (cd crates/avianlink-ffi && cbindgen --config cbindgen.toml --crate avianlink-ffi --output include/avianlink.h)" >&2
+    exit 1
+fi
+
+step "C example against the static library"
+scripts/c-example.sh
+
+if [ "$(uname)" = Darwin ]; then
+    step "avianlink-ffi: build for aarch64-apple-ios"
+    cargo build -p avianlink-ffi --target aarch64-apple-ios --locked
+fi
 
 step "ok"
