@@ -1,6 +1,6 @@
 # avianlink wire format
 
-> **Status: v1 (Phase 4).** The version byte stays `0x01` until the first
+> **Status: v1 (Phase 5).** The version byte stays `0x01` until the first
 > release. Before then, peers are assumed to run the same build.
 
 ## 1. Conventions
@@ -97,7 +97,7 @@ added this way; it needs a new version byte.
 | 0x01 | MSG     | 1     | Message fragment (§3.1). |
 | 0x02 | ACK     | 1     | Selective acknowledgement (§3.2). |
 | 0x03 | REPAIR  | 4     | FEC repair symbol (§3.4). |
-| 0x04 | SYNC    | 5     | Reserved: reconciliation summary. |
+| 0x04 | SYNC    | 5     | Reconciliation summary (§3.6). |
 | 0x05 | FRAG_ACK| 2     | Per-fragment acknowledgement (§3.3). |
 | 0x06 | LOSS    | 4     | Receiver's measured packet loss (§3.5). |
 | other| —       |       | Skipped and counted (`frames_unknown`). |
@@ -225,6 +225,40 @@ Loss the receiver measured on packets from the sender, in parts per
 thousand. It counts gaps in the packet counter, before any FEC recovery,
 over the most recent ~256 counters. The sender uses it to size FEC
 (`reliability.md` §6). It is advisory, and values above 1000 are clamped.
+
+### 3.6 SYNC
+
+```
+body   = flags:varint  floor:varint  next:varint  n:varint  digest{n}
+digest = block:varint  hash:[8]
+```
+
+The sender's view of what it has sent to the recipient in this
+conversation (`reliability.md` §7):
+
+- `flags` bit 0: **reply wanted**. The recipient should answer promptly
+  with its ACK and a SYNC of its own (without this bit). Other bits are
+  reserved and ignored.
+- `floor`: the lowest seq the sender can still deliver. Everything below
+  has been acknowledged or abandoned and will never be sent again.
+- `next`: the sender's next unused seq. Seqs in `[floor, next)` exist.
+  `floor ≤ next`, else the frame is dropped.
+- `digest`: for up to 4 completed blocks of 64 seqs
+  (`[64·block, 64·block + 64)`, all below `next`), the XOR of the first 8
+  bytes of the message IDs in the block.
+
+**On receipt:**
+- **Floor.** If `floor` is above the receiver's `cum`, the seqs in
+  `[cum, floor)` that it doesn't hold are reported once as skipped
+  (`Event::MessagesSkipped`), and `cum` jumps to `floor`.
+- **Next.** If `next` reveals seqs the receiver hasn't seen, it
+  acknowledges at once, so the sender learns exactly what is missing.
+- **Digests.** For each digest of a block the receiver holds completely,
+  it compares its own. A mismatch is reported once
+  (`Event::SyncDiverged`). It means both sides hold different messages
+  under the same seqs, for example after a storage rollback.
+
+Each SYNC is self-contained, so any one that arrives makes progress.
 
 ## 4. Message record
 

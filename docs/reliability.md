@@ -1,6 +1,6 @@
 # avianlink reliability
 
-> **Status: Phase 4.** How the engine decides what to (re)send and when, and
+> **Status: Phase 5.** How the engine decides what to (re)send and when, and
 > what survives a crash. The wire encodings referenced here are in
 > `wire-format.md`.
 
@@ -86,8 +86,18 @@ In backoff:
   a late reorder or an attacker's replay of a lost original, doesn't count
   (`security.md` §9).
 
-This bounds the cost of a long outage to one packet per `max_rto_ms` per
-contact. Without it, Phase 1 spent 17–32 wire bytes per payload byte on
+**Long silences.** Once a silence outlasts the short-term doubling, the
+probe interval follows it: 1/64 of the time since backoff began, at least
+`max_rto_ms` and at most `max_probe_interval_ms` (default 1 h). A flaky
+link with brief up-windows keeps being probed every 30–60 s for the first
+hour. A dead one is probed less and less often, so a week costs a few
+hundred packets. After `deep_backoff_after_ms` (default 1 h) of silence,
+probes shrink from data to a bare SYNC frame (§7) asking for a reply.
+
+**Hints.** `Engine::nudge(now)` tells the engine that connectivity may have
+changed, for example the OS reports a new network or the app comes to the
+foreground. Every contact in backoff then probes at once. Without a hint,
+a returning peer is noticed at the next probe in either direction. Without it, Phase 1 spent 17–32 wire bytes per payload byte on
 `disaster_cellular`, almost all of it lost to outages.
 
 ## 4. Persistence
@@ -201,3 +211,54 @@ means seconds to minutes.
 small windows: a lone packet's single repair is a duplicate, which is the
 right code for a lone packet. The simulator reports the bandwidth this
 costs against the latency it saves (Phase 4 report, D-037).
+
+## 7. Sync
+
+Reconciliation answers "which messages does each side have?" with a
+summary rather than by resending. In a pairwise conversation with dense
+per-sender seqs, a direction's state is fully described by four values:
+- the sender's `floor`, the lowest seq it can still deliver;
+- the sender's `next`, its next unused seq;
+- the receiver's `cum`;
+- the receiver's bitmap of seqs above `cum`.
+
+The ACK carries the receiver's half and SYNC (wire §3.6) the sender's.
+Each frame stands alone, so reconciliation makes progress with whatever
+fraction of packets arrives. There is no handshake to complete.
+
+**When SYNC is sent:**
+- in every SYNC-only backoff probe, with *reply wanted*;
+- in answer to a SYNC that asked for one, together with an ACK;
+- after `Engine::restore`, to announce the restored floor and next;
+- when a block of 64 sent seqs completes, so its digest reaches the peer.
+
+SYNC rides along with any packet that is going out anyway.
+
+**What it fixes:**
+- **Tail loss.** If every packet of the newest messages is lost, the
+  receiver learns from `next` that they exist, and asks via its ACK.
+- **Lost or reset receiver state.** A fresh install with the same identity,
+  or a restore from old storage, has a `cum` far below anything the sender
+  can still deliver. Without `floor`, its receive window would stall, and
+  after `max_reorder_window` seqs it would drop everything. With `floor` it
+  skips the unrecoverable gap and reports it (`Event::MessagesSkipped`),
+  so the application can say "N earlier messages were delivered to a
+  previous install".
+- **Divergence.** If a sender's storage was rolled back (forbidden, see
+  `security.md` §4, but it happens), it reuses seqs for new messages. The
+  receiver would dedupe those away. Block digests detect this and raise
+  `Event::SyncDiverged`, so the host can warn instead of silently losing
+  messages. Repairing divergence would need message histories that v1
+  doesn't keep.
+
+**Persisted:**
+- the last 4 sent-block digests, in the contact record;
+- the last 4 received-block digests, with their message counts, in the
+  receive-window record (so only completely received blocks are compared).
+
+**Not done:** range-based set reconciliation (Minsky–Trachtenberg, IBLTs,
+RBSR). It solves sets without a dense order, such as group conversations
+with many senders or multi-device histories. In a pairwise conversation
+the dense seq order makes (floor, next, cum, bitmap) a complete summary at
+O(1) size plus the reorder window. Range reconciliation is the extension
+point for groups (D-039).

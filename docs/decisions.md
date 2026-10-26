@@ -525,3 +525,69 @@ MTUs.
 Gilbert-Elliott bursts take out a window's sources and its repairs
 together. Real fading is time-correlated, and spacing repairs out could
 help there. It needs a time-based burst model to evaluate.
+
+## D-039: Sync as floor/next/cum/bitmap plus block digests, not general set reconciliation (Phase 5)
+
+**Spec said:** reconcile via compact summaries, starting with
+per-conversation hash ranges, with range-based set reconciliation later.
+
+**Decision.** In a pairwise conversation each sender's seqs are dense, so
+one direction's state *is* the four values (floor, next, cum, bitmap).
+That is an exact summary, smaller than any hash structure. The ACK
+already carried the receiver's half. SYNC now carries the sender's half,
+plus XOR digests over 64-seq blocks. Those are the "per-conversation hash
+ranges": cheap, and they detect what the dense summary can't, namely two
+sides holding *different* messages under the same seqs.
+
+**Why not set reconciliation now.** It earns its complexity when there is
+no shared order: groups with many senders, multi-device histories. Those
+aren't v1 features. The SYNC frame and `Event::SyncDiverged` leave room for
+it: a future frame type can carry range summaries for group conversations
+without changing pairwise sync.
+
+**Divergence is detected, not repaired.** Repair needs both sides to keep
+message histories (v1 deletes delivered messages from the outbox) and a
+way to re-sequence. Both are outside v1.
+
+## D-040: Bounding the cost of long silence: probe interval follows the silence; deep probes are bare SYNCs (Phase 5)
+
+Phase 2–4 probes resent the oldest data fragment every `max_rto_ms` (30 s)
+forever. A week offline cost one contact 20,165 packets (3.43 MB, measured
+through the public API on commit 8be22d8), and the done criterion asks for
+bounded bytes.
+
+**Now.**
+- Once a silence outlasts the short-term doubling, the probe interval is
+  1/64 of the silence so far, between `max_rto_ms` and
+  `max_probe_interval_ms` (1 h).
+- After `deep_backoff_after_ms` (1 h) of silence, probes carry only a bare
+  SYNC (reply wanted) instead of data.
+- Data probes append a SYNC when there is room left after the data.
+
+**How this was chosen.** The tests were the simulator, 60 paired seeds
+against the Phase 4 build, plus `week_offline`.
+
+| variant | harsh_64 p95 (P4: 46.4m) | week offline, bytes while down (both peers; P4 ≈ 6.8 MB) |
+|---|--:|--:|
+| fixed: 30 s for 1 h, then doubling to 1 h | 102m, days on some seeds | ~26 KB |
+| interval = silence/16 | 102m | 20–26 KB |
+| **interval = silence/64** | **47.0m** | **47–80 KB** |
+| interval = silence/128 | 46.4m | 67–105 KB |
+
+The fixed schedule failed badly on `harsh_64`, whose link is up 13% of the
+time in 90-second windows. After one rare outage over an hour, both peers
+probed hourly. Each probe had about a 6% chance of landing in an up window
+and surviving 50% loss, so reconnecting took hours and on some seeds days.
+Probing in proportion to the silence keeps flaky links found quickly and
+dead links cheap.
+
+**Probe content, measured:**
+- *SYNC-only probes from early backoff:* +25% `bursty_loss` p95. Recovery
+  from two consecutive losses waited a round trip for the peer's reply.
+- *SYNC in every data probe:* hurt `lora_like`, because at a 51-byte MTU it
+  halved the data per probe. Appending it only when there is room keeps
+  both.
+
+**Rejected:** unbounded doubling. Bytes would be logarithmic in the outage
+length, but return latency could reach days. `nudge()` lets hosts that
+know connectivity changed skip the wait entirely.
