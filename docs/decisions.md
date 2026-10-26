@@ -421,6 +421,9 @@ migrates, the shared entries should move to the new versions and the
 per-crate pins can go. Until then the lockfile carries both generations of
 those three crates, but never inside the library's graph.
 
+*Resolved (Phase 5):* the desktop app moved to its own repository, and the
+shared entries are back in `[workspace.dependencies]` at the new versions.
+
 ## D-036: FEC codes decrypted packet plaintexts, with Cauchy Reed-Solomon over GF(2⁸) (Phase 4)
 
 **What is coded.** Packet plaintexts (frames) are coded, not ciphertexts or

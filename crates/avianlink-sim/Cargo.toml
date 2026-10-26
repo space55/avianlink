@@ -9,8 +9,8 @@ license.workspace = true
 
 [dependencies]
 avianlink-core = { workspace = true, features = ["std"] }
-rand_core = { version = "0.10.1", default-features = false }
-rand_chacha = { version = "0.10.0", default-features = false }
+rand_core = { workspace = true }
+rand_chacha = { workspace = true }
 
 [lints]
 workspace = true
