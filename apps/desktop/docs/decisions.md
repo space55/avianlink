@@ -316,3 +316,43 @@ approximately on-brand is indistinguishable from being off-brand.
 **Rejected:** adding `resvg`/`librsvg`/ImageMagick. A build-time dependency on
 a native image toolchain, for one file that changes about once a year, when a
 real browser engine is already installed.
+
+## DA-021: A Makefile is the app's build entry point, and `dist` gates before it packages (Phase 4)
+
+**Decision.** `apps/desktop/Makefile`. `make` lists the targets; `make dist`
+produces the final application bundle and is the only packaging target that
+runs the full gate first.
+
+**Why `dist` refuses to package a red tree.** An installer is the worst place
+to discover that the tests were failing: the artefact looks finished, it is
+the thing that gets attached to a release, and nothing about it says which
+commit or which test state it came from. `make bundle` exists for iterating
+on packaging itself and skips the gate; `dist` is what a release uses.
+
+**Why a Makefile rather than more npm scripts.** The build has two
+toolchains. `npm run` can drive `cargo`, but then the Rust-only targets live
+inside a Node package manifest, the dependency between "node_modules is
+current" and everything else is implicit, and platform guards become shell
+one-liners inside JSON strings. Make expresses "this target needs a macOS
+host" and "re-run `npm ci` only when the lockfile moved" directly.
+
+**Why it lives in `apps/desktop/`, not at the repo root.** The root is shared
+with the library crates, which have their own gate (`scripts/ci.sh`). A root
+Makefile would have to speak for both halves and would belong to neither
+agent. See DA-003.
+
+**Signing is reported, never assumed.** `make bundle` prints whether the
+build will be signed _before_ it starts, and `make verify` says in plain
+words whether the result would open on another machine. An ad-hoc signed
+macOS bundle is indistinguishable from a real one at a glance — it has a
+signature, `codesign` is happy with parts of it, and it runs perfectly on the
+machine that built it. The one place it differs is the machine you shipped it
+to. Both targets exist so that difference is visible before the artefact
+leaves.
+
+**No `[profile.release]` tuning.** Cargo only honours profile settings in the
+_workspace root_ manifest, which is shared with the library crates, so adding
+LTO or `strip` here would change their builds too. The default release
+profile already gives a 9.6 MiB `.app` and a 3.5 MiB `.dmg`, which is not
+worth imposing slower builds on the other half of the repo for. Worth raising
+with the library agent if the size ever matters.
