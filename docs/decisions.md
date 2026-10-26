@@ -662,3 +662,37 @@ more payload. Packets per message rise with fragmentation.
   public, with `Jitter::sample`, because `udp-impair` needs exactly what the
   desktop app asked for: the simulator's impairment model, driven in real
   time.
+
+## D-043: The C ABI wraps the sans-IO engine; `unsafe` is confined to `avianlink-ffi` (Phase 7)
+
+- **Why the engine, not `UdpHost`.** The C ABI is the basis for iOS and
+  other mobile bindings. Those hosts own their transports and their
+  database, and the engine's sans-IO shape is what lets them. `UdpHost` is
+  a convenience for desktop demos.
+- **Storage across the boundary.** File (the Phase 6 write-ahead log),
+  memory, or a callback vtable, so an app can use its own encrypted store.
+  Callbacks must give the same atomicity and durability guarantees as Rust
+  `Storage` implementations.
+- **`unsafe`.** The workspace denies `unsafe_code`. `avianlink-ffi` allows
+  it, because dereferencing C pointers needs it. Every unsafe block states
+  its precondition. `avianlink-core` keeps `forbid(unsafe_code)`.
+- **Errors and panics.** Status codes plus a thread-local detail, and
+  `catch_unwind` on every entry point, so unwinding never crosses into C.
+- **Tooling.** `cbindgen` (a CLI, not a build dependency) generates
+  `include/avianlink.h`, and CI fails if the checked-in header is stale. The
+  C example and the Swift smoke test link against the real static library.
+- **Scope (per the user).** The microcontroller example is deferred. The
+  core's `thumbv7em-none-eabihf` build stays in CI meanwhile.
+- **Enums from C are integers.** `AvlConfig.fec` and `AvlLinkConfig.budget`
+  are `uint8_t`, validated on the Rust side. A `repr(C)` enum field written
+  by C with an unknown value would be undefined behaviour in Rust before any
+  check could run. Enums Rust only returns stay C enums.
+- **`size_t`, not `uintptr_t`.** cbindgen's default maps `usize` to
+  `uintptr_t`, which Swift imports as `UInt` and every `count` would need a
+  cast. `usize_is_size_t` gives `Int`.
+- **XCFramework without `xcodebuild`.** The build script falls back to
+  writing the bundle (slice directories plus `Info.plist`) when
+  `xcodebuild -create-xcframework` fails. The development machine's Xcode
+  could not load its simulator plug-in, and Command Line Tools installs
+  have no `xcodebuild` at all. The Swift smoke test consumes the result
+  through SwiftPM's `binaryTarget`, which validates the bundle either way.
