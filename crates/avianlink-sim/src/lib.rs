@@ -1,18 +1,33 @@
 //! Deterministic network simulator and test harness for avianlink.
 //!
-//! Virtual time and a single seeded RNG make every run reproducible from its
-//! seed. Phase 1 adds the impairment models and the scenario runner.
+//! Virtual time and seeded RNG streams make every run reproducible from its
+//! seed: a failing [`Scenario`] is replayed exactly by re-running it with the
+//! same seed.
+//!
+//! ```no_run
+//! use avianlink_sim::{Profile, Scenario};
+//! let report = Scenario::new(Profile::DisasterCellular, 1).run();
+//! println!("{report}");
+//! ```
+
+pub mod fuzz_harness;
+pub mod impair;
+mod metrics;
+mod profiles;
+mod sim;
 
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 
-/// Named impairment profiles. Their parameters are defined in Phase 1 and
-/// mirrored by `scripts/netem/` in Phase 6.
+pub use metrics::{fmt_ms, percentile, Report};
+pub use sim::{total_channel_stats, LengthMix, Scenario, SIM_EPOCH_MS};
+
+/// Named impairment profiles; parameters in [`Profile::link`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Profile {
     /// No impairments.
     Clean,
-    /// Geostationary satellite: ~600 ms RTT, light loss.
+    /// Geostationary satellite: ~550 ms RTT, light loss, rain fade.
     GeoSatellite,
     /// 2G EDGE: low rate, high and variable delay.
     Edge2g,
@@ -44,7 +59,7 @@ impl Profile {
     }
 }
 
-/// Creates the simulator's deterministic RNG from a seed.
+/// Creates a deterministic RNG from a seed.
 pub fn seeded_rng(seed: u64) -> ChaCha20Rng {
     ChaCha20Rng::seed_from_u64(seed)
 }
@@ -52,7 +67,6 @@ pub fn seeded_rng(seed: u64) -> ChaCha20Rng {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use avianlink_core::{Config, Engine, MemoryStorage, Timestamp};
     use rand_core::RngCore;
 
     #[test]
@@ -62,16 +76,10 @@ mod tests {
     }
 
     #[test]
-    fn engine_accepts_sim_rng() {
-        let mut e = Engine::new(Config::default(), MemoryStorage::new(), seeded_rng(7));
-        assert_eq!(e.poll_transmit(Timestamp::ZERO), None);
-    }
-
-    #[test]
-    fn profile_names_are_unique() {
-        let mut names: Vec<_> = Profile::ALL.iter().map(|p| p.name()).collect();
-        names.sort_unstable();
-        names.dedup();
-        assert_eq!(names.len(), Profile::ALL.len());
+    fn profile_names_round_trip() {
+        for p in Profile::ALL {
+            assert_eq!(Profile::from_name(p.name()), Some(p));
+        }
+        assert_eq!(Profile::from_name("nope"), None);
     }
 }
