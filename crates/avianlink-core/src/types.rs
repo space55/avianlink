@@ -1,9 +1,13 @@
 use alloc::vec::Vec;
 
-/// Identifies a conversation.
+/// A peer's 32-byte public identity key.
 ///
-/// Placeholder representation; Phase 1/3 will derive it from participants'
-/// keys (see `docs/wire-format.md`).
+/// Phase 1 treats it as opaque bytes; Phase 3 makes it an X25519/Ed25519 key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PublicKey(pub [u8; 32]);
+
+/// Identifies a (pairwise) conversation: a hash of both participants' keys,
+/// identical on both sides (`docs/wire-format.md` §5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConversationId(pub [u8; 16]);
 

@@ -10,6 +10,12 @@
 //! host ──handle_packet / send_text / handle_timeout──▶ Engine
 //! host ◀──poll_transmit / poll_event / next_timeout─── Engine
 //! ```
+//!
+//! A host loop, after any input: call `poll_transmit` until `None`, drain
+//! `poll_event`, then sleep until `next_timeout` or the next packet.
+//!
+//! **Phase 1 status:** messages are plaintext, protected only against
+//! corruption. See `docs/security.md`.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -36,10 +42,14 @@ mod config;
 mod engine;
 mod error;
 mod event;
+mod hash;
 mod link;
+mod pacer;
+mod reassembly;
 mod storage;
 mod time;
 mod types;
+pub mod wire;
 
 pub use config::Config;
 pub use engine::{Engine, Stats, Transmit};
@@ -48,4 +58,10 @@ pub use event::{Event, ReceivedMessage};
 pub use link::{AirtimeModel, LinkBudget, LinkConfig, LinkId, MIN_MTU};
 pub use storage::{MemoryStorage, Storage};
 pub use time::Timestamp;
-pub use types::{ConversationId, MessageId, Packet};
+pub use types::{ConversationId, MessageId, Packet, PublicKey};
+
+/// Hash helpers, exposed for tests and tooling (fuzz harnesses need to build
+/// valid packets). Not a stable API.
+pub mod hashes {
+    pub use crate::hash::{conversation_id, message_id, packet_check, pair_tag};
+}
