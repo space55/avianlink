@@ -7,22 +7,9 @@
 //! another machine, and a silently-accepted near-miss would produce a
 //! contact that can never receive anything, with no visible cause.
 
-use avianlink_core::{ConversationId, MessageId, PublicKey};
-use sha2::{Digest, Sha256};
+use avianlink_core::{format_fingerprint, ConversationId, MessageId, PublicKey};
 
 use crate::error::{IpcError, IpcResult};
-
-/// Domain-separation label for the fingerprint hash.
-///
-/// Fixed by desktop DA-009 so that `avianlink-core` can adopt the derivation
-/// unchanged (api-requests AR-004).
-const FINGERPRINT_LABEL: &[u8] = b"avianlink-fingerprint-v1";
-
-/// Bytes of the fingerprint hash shown to the user: 80 bits.
-const FINGERPRINT_BYTES: usize = 10;
-
-/// Characters per group in the rendered fingerprint.
-const FINGERPRINT_GROUP: usize = 4;
 
 /// Encodes a fixed-size byte array as lowercase hex.
 fn encode<const N: usize>(bytes: &[u8; N]) -> String {
@@ -79,31 +66,20 @@ pub fn decode_message_id(text: &str) -> IpcResult<MessageId> {
     Ok(MessageId(decode("message id", text.trim())?))
 }
 
-/// Derives the 80-bit fingerprint of a public key.
-pub fn fingerprint_bytes(key: &PublicKey) -> [u8; FINGERPRINT_BYTES] {
-    let mut hasher = Sha256::new();
-    hasher.update(FINGERPRINT_LABEL);
-    hasher.update(key.0);
-    let digest = hasher.finalize();
-    let mut out = [0u8; FINGERPRINT_BYTES];
-    out.copy_from_slice(&digest[..FINGERPRINT_BYTES]);
-    out
-}
-
-/// Renders the fingerprint as five dash-separated groups of four lowercase
-/// hex characters, e.g. `a1b2-c3d4-e5f6-7890-abcd`.
+/// Renders a key's fingerprint as five dash-separated groups of four
+/// lowercase hex characters, e.g. `a1b2-c3d4-e5f6-7890-abcd`.
 ///
 /// The grouping is the point: an ungrouped 20-character string does not get
-/// compared character by character, and this is the app's only
-/// authentication step.
+/// compared character by character, and this is the app's only authentication
+/// step.
+///
+/// The derivation now lives in `avianlink-core`, which was api-request AR-004
+/// and is what keeps this app, the CLI and a future mobile client showing the
+/// *same* fingerprint for the same key. The app's own implementation is gone;
+/// this is a one-line delegation so that the call sites and their tests stay
+/// where they are.
 pub fn fingerprint(key: &PublicKey) -> String {
-    let hex = hex::encode(fingerprint_bytes(key));
-    let groups: Vec<String> = hex
-        .as_bytes()
-        .chunks(FINGERPRINT_GROUP)
-        .map(|c| String::from_utf8_lossy(c).into_owned())
-        .collect();
-    groups.join("-")
+    format_fingerprint(&key.fingerprint())
 }
 
 /// The first group of the fingerprint, used as a fallback display name when
@@ -183,8 +159,11 @@ mod tests {
     #[test]
     fn fingerprint_is_domain_separated() {
         // Must not be a bare hash of the key: that would collide with any
-        // other protocol that fingerprints the same key material.
-        let bare = hex::encode(&Sha256::digest(key(0).0)[..FINGERPRINT_BYTES]);
+        // other protocol that fingerprints the same key material. The
+        // derivation is the library's now, so this guards the library's
+        // choice as much as the app's use of it.
+        use sha2::{Digest, Sha256};
+        let bare = hex::encode(&Sha256::digest(key(0).0)[..10]);
         assert_ne!(fingerprint(&key(0)).replace('-', ""), bare);
     }
 }

@@ -52,6 +52,49 @@ struct Thread {
     undelivered: u32,
 }
 
+/// A message we have just queued for sending.
+#[derive(Clone, Copy, Debug)]
+pub struct OutgoingMessage<'a> {
+    /// Conversation it belongs to.
+    pub conversation: ConversationId,
+    /// Content-addressed identifier.
+    pub id: MessageId,
+    /// Our sequence number in this conversation.
+    pub seq: u64,
+    /// Causal order key.
+    pub lamport: u64,
+    /// Body.
+    pub text: &'a str,
+    /// When we queued it, unix milliseconds.
+    pub queued_at: u64,
+}
+
+/// A message that arrived from a peer.
+///
+/// A struct rather than eight positional parameters: half of these are
+/// `u64`s, and a transposed pair would produce history that is subtly wrong
+/// in a way no type checker would catch.
+#[derive(Clone, Copy, Debug)]
+pub struct IncomingMessage<'a> {
+    /// Conversation it belongs to.
+    pub conversation: ConversationId,
+    /// Content-addressed identifier.
+    pub id: MessageId,
+    /// The sender's sequence number.
+    pub seq: u64,
+    /// Causal order key.
+    pub lamport: u64,
+    /// Body.
+    pub text: &'a str,
+    /// Sender-asserted wall clock, unix milliseconds; `None` if the sender
+    /// has no clock.
+    pub sent_at: Option<u64>,
+    /// When our engine received it, unix milliseconds.
+    pub received_at: u64,
+    /// Earlier messages from this sender not yet received.
+    pub missing_before: u64,
+}
+
 /// Outcome of inserting a received message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Inserted {
@@ -129,6 +172,16 @@ impl AppStore {
         self.to_contact(conversation, &record)
     }
 
+    /// Every known conversation, so the driver can poll the engine about each.
+    pub fn conversation_ids(&self) -> Vec<ConversationId> {
+        self.contacts.keys().copied().collect()
+    }
+
+    /// When a packet was last attributed to this contact.
+    pub fn contact_last_packet_at(&self, conversation: &ConversationId) -> Option<u64> {
+        self.contacts.get(conversation)?.last_packet_at
+    }
+
     /// Whether `conversation` is a known contact.
     pub fn has_contact(&self, conversation: &ConversationId) -> bool {
         self.contacts.contains_key(conversation)
@@ -203,18 +256,18 @@ impl AppStore {
     // -- messages ----------------------------------------------------------
 
     /// Stores an outgoing message we have just queued.
-    pub fn insert_outgoing(
-        &mut self,
-        conversation: ConversationId,
-        id: MessageId,
-        seq: u64,
-        lamport: u64,
-        text: &str,
-        now: u64,
-    ) -> Message {
+    pub fn insert_outgoing(&mut self, message: OutgoingMessage<'_>) -> Message {
+        let OutgoingMessage {
+            conversation,
+            id,
+            seq,
+            lamport,
+            text,
+            queued_at: now,
+        } = message;
         let id_hex = identity::encode_message_id(&id);
         let key = order_key(lamport, &id_hex);
-        let message = Message {
+        let stored = Message {
             id: id_hex,
             conversation_id: identity::encode_conversation(&conversation),
             outgoing: true,
@@ -231,11 +284,12 @@ impl AppStore {
             // it can never be late. If it ever were, the engine's Lamport
             // clock would be broken.
             arrived_late: false,
+            missing_before: 0,
         };
         let thread = self.threads.entry(conversation).or_default();
         thread.undelivered = thread.undelivered.saturating_add(1);
-        Self::store(thread, message.clone());
-        message
+        Self::store(thread, stored.clone());
+        stored
     }
 
     /// Stores a received message, or reports it as a duplicate.
@@ -244,17 +298,17 @@ impl AppStore {
     /// present: that is exactly "this appeared behind something you were
     /// already looking at". It is computed once and never recomputed, because
     /// it records a fact about history rather than about the current sort.
-    #[expect(clippy::too_many_arguments, reason = "every field is independent")]
-    pub fn insert_incoming(
-        &mut self,
-        conversation: ConversationId,
-        id: MessageId,
-        seq: u64,
-        lamport: u64,
-        text: &str,
-        sent_at: Option<u64>,
-        received_at: u64,
-    ) -> Inserted {
+    pub fn insert_incoming(&mut self, message: IncomingMessage<'_>) -> Inserted {
+        let IncomingMessage {
+            conversation,
+            id,
+            seq,
+            lamport,
+            text,
+            sent_at,
+            received_at,
+            missing_before,
+        } = message;
         let id_hex = identity::encode_message_id(&id);
         let key = order_key(lamport, &id_hex);
         let thread = self.threads.entry(conversation).or_default();
@@ -266,7 +320,7 @@ impl AppStore {
             .range((Bound::Excluded(key.clone()), Bound::Unbounded))
             .next()
             .is_some();
-        let message = Message {
+        let stored = Message {
             id: id_hex,
             conversation_id: identity::encode_conversation(&conversation),
             outgoing: false,
@@ -280,16 +334,17 @@ impl AppStore {
             delivered_at: None,
             attempts: None,
             arrived_late,
+            missing_before,
         };
         if thread.read_through.as_ref().is_none_or(|read| key > *read) {
             thread.unread = thread.unread.saturating_add(1);
         }
-        Self::store(thread, message.clone());
+        Self::store(thread, stored.clone());
         if let Some(record) = self.contacts.get_mut(&conversation) {
             record.last_message_at = Some(received_at);
             record.last_packet_at = Some(received_at);
         }
-        Inserted::New(message)
+        Inserted::New(stored)
     }
 
     fn store(thread: &mut Thread, message: Message) {
@@ -339,37 +394,6 @@ impl AppStore {
             delivered_at: message.delivered_at,
             attempts: message.attempts.unwrap_or(0),
         })
-    }
-
-    /// Promotes every still-`queued` outgoing message in a conversation to
-    /// `sent`, returning the changes to emit.
-    ///
-    /// This exists only for the api-requests AR-002 workaround: an engine
-    /// that cannot say which messages a packet carried forces the driver to
-    /// assume all of them. It over-reports by design, and is not used for
-    /// engines that report transmissions themselves.
-    pub fn promote_queued_to_sent(
-        &mut self,
-        conversation: &ConversationId,
-        now: u64,
-    ) -> Vec<MessageStatusChanged> {
-        let Some(thread) = self.threads.get(conversation) else {
-            return Vec::new();
-        };
-        let queued: Vec<MessageId> = thread
-            .by_order
-            .values()
-            .filter(|m| m.status == Some(MessageStatus::Queued))
-            .filter_map(|m| {
-                let mut bytes = [0u8; 16];
-                hex::decode_to_slice(&m.id, &mut bytes).ok()?;
-                Some(MessageId(bytes))
-            })
-            .collect();
-        queued
-            .into_iter()
-            .filter_map(|id| self.update_status(conversation, &id, MessageStatus::Sent, now))
-            .collect()
     }
 
     /// A page of history, oldest first.
@@ -536,6 +560,46 @@ mod tests {
         MessageId([b; 16])
     }
 
+    /// Terse constructors, so a test reads as what it is checking.
+    fn out(
+        conversation: ConversationId,
+        id: MessageId,
+        seq: u64,
+        lamport: u64,
+        text: &str,
+        queued_at: u64,
+    ) -> OutgoingMessage<'_> {
+        OutgoingMessage {
+            conversation,
+            id,
+            seq,
+            lamport,
+            text,
+            queued_at,
+        }
+    }
+
+    fn inc(
+        conversation: ConversationId,
+        id: MessageId,
+        seq: u64,
+        lamport: u64,
+        text: &str,
+        sent_at: Option<u64>,
+        received_at: u64,
+    ) -> IncomingMessage<'_> {
+        IncomingMessage {
+            conversation,
+            id,
+            seq,
+            lamport,
+            text,
+            sent_at,
+            received_at,
+            missing_before: 0,
+        }
+    }
+
     fn store_with_contact() -> (AppStore, ConversationId) {
         let mut s = AppStore::new();
         s.set_identity(key(0));
@@ -565,7 +629,7 @@ mod tests {
     #[test]
     fn upsert_renames_without_losing_history_or_added_at() {
         let (mut s, c) = store_with_contact();
-        s.insert_outgoing(c, msg(1), 0, 1, "hi", T0);
+        s.insert_outgoing(out(c, msg(1), 0, 1, "hi", T0));
         let renamed = s.upsert_contact(c, key(2), "Rook (work)", true, T0 + 5_000);
         assert_eq!(renamed.display_name, "Rook (work)");
         assert!(renamed.verified);
@@ -585,7 +649,7 @@ mod tests {
     #[test]
     fn outgoing_messages_start_queued() {
         let (mut s, c) = store_with_contact();
-        let m = s.insert_outgoing(c, msg(1), 0, 1, "hello", T0);
+        let m = s.insert_outgoing(out(c, msg(1), 0, 1, "hello", T0));
         assert_eq!(m.status, Some(MessageStatus::Queued));
         assert_eq!(m.sent_at, Some(T0));
         assert_eq!(m.received_at, None, "we did not receive our own message");
@@ -597,7 +661,7 @@ mod tests {
     #[test]
     fn status_advances_queued_sent_delivered_and_emits_once_each() {
         let (mut s, c) = store_with_contact();
-        s.insert_outgoing(c, msg(1), 0, 1, "hello", T0);
+        s.insert_outgoing(out(c, msg(1), 0, 1, "hello", T0));
 
         let sent = s
             .update_status(&c, &msg(1), MessageStatus::Sent, T0 + 1_000)
@@ -624,7 +688,7 @@ mod tests {
     fn status_never_goes_backwards() {
         // A `sent` for attempt 7 can arrive after the ack for attempt 3.
         let (mut s, c) = store_with_contact();
-        s.insert_outgoing(c, msg(1), 0, 1, "hello", T0);
+        s.insert_outgoing(out(c, msg(1), 0, 1, "hello", T0));
         s.update_status(&c, &msg(1), MessageStatus::Delivered, T0 + 10);
         assert!(s
             .update_status(&c, &msg(1), MessageStatus::Sent, T0 + 20)
@@ -648,9 +712,9 @@ mod tests {
     #[test]
     fn retransmitted_incoming_messages_are_duplicates_not_errors() {
         let (mut s, c) = store_with_contact();
-        let first = s.insert_incoming(c, msg(1), 0, 1, "hi", Some(T0), T0 + 100);
+        let first = s.insert_incoming(inc(c, msg(1), 0, 1, "hi", Some(T0), T0 + 100));
         assert!(matches!(first, Inserted::New(_)));
-        let again = s.insert_incoming(c, msg(1), 0, 1, "hi", Some(T0), T0 + 90_000);
+        let again = s.insert_incoming(inc(c, msg(1), 0, 1, "hi", Some(T0), T0 + 90_000));
         assert_eq!(again, Inserted::Duplicate);
         assert_eq!(s.messages(&c, None, 10).unwrap().total, 1);
         assert_eq!(s.contact(&c).unwrap().unread_count, 1);
@@ -660,9 +724,9 @@ mod tests {
     fn a_late_message_sorts_into_place_and_is_marked() {
         let (mut s, c) = store_with_contact();
         // lamport 1 and 3 arrive; 2 turns up an hour later.
-        s.insert_incoming(c, msg(1), 0, 1, "first", Some(T0), T0);
-        s.insert_incoming(c, msg(3), 2, 3, "third", Some(T0 + 2), T0 + 10);
-        let late = s.insert_incoming(c, msg(2), 1, 2, "second", Some(T0 + 1), T0 + 3_600_000);
+        s.insert_incoming(inc(c, msg(1), 0, 1, "first", Some(T0), T0));
+        s.insert_incoming(inc(c, msg(3), 2, 3, "third", Some(T0 + 2), T0 + 10));
+        let late = s.insert_incoming(inc(c, msg(2), 1, 2, "second", Some(T0 + 1), T0 + 3_600_000));
         let Inserted::New(late) = late else {
             panic!("expected a new message")
         };
@@ -676,10 +740,10 @@ mod tests {
     #[test]
     fn a_message_arriving_at_the_head_is_not_marked_late() {
         let (mut s, c) = store_with_contact();
-        s.insert_incoming(c, msg(1), 0, 1, "first", Some(T0), T0);
-        let Inserted::New(m) = s.insert_incoming(c, msg(2), 1, 2, "second", Some(T0), T0 + 5)
+        s.insert_incoming(inc(c, msg(1), 0, 1, "first", Some(T0), T0));
+        let Inserted::New(m) = s.insert_incoming(inc(c, msg(2), 1, 2, "second", Some(T0), T0 + 5))
         else {
-            panic!()
+            panic!("expected a new message")
         };
         assert!(!m.arrived_late);
     }
@@ -689,9 +753,9 @@ mod tests {
         // It records "this appeared out of order while you were watching",
         // which stops being true of the *sort* as soon as more arrive.
         let (mut s, c) = store_with_contact();
-        s.insert_incoming(c, msg(3), 2, 3, "third", None, T0);
-        s.insert_incoming(c, msg(1), 0, 1, "first", None, T0 + 10);
-        s.insert_incoming(c, msg(5), 4, 5, "fifth", None, T0 + 20);
+        s.insert_incoming(inc(c, msg(3), 2, 3, "third", None, T0));
+        s.insert_incoming(inc(c, msg(1), 0, 1, "first", None, T0 + 10));
+        s.insert_incoming(inc(c, msg(5), 4, 5, "fifth", None, T0 + 20));
         let page = s.messages(&c, None, 10).unwrap();
         let late: Vec<bool> = page.messages.iter().map(|m| m.arrived_late).collect();
         assert_eq!(late, vec![true, false, false]);
@@ -704,7 +768,15 @@ mod tests {
         // lamport land inside the already-read range.
         let (mut s, c) = store_with_contact();
         for i in 1..=10u8 {
-            s.insert_incoming(c, msg(i * 2), u64::from(i), u64::from(i) * 2, "m", None, T0);
+            s.insert_incoming(inc(
+                c,
+                msg(i * 2),
+                u64::from(i),
+                u64::from(i) * 2,
+                "m",
+                None,
+                T0,
+            ));
         }
         let newest = s.messages(&c, None, 4).unwrap();
         assert_eq!(newest.messages.len(), 4);
@@ -712,7 +784,7 @@ mod tests {
         let cursor = newest.oldest_order_key.clone().unwrap();
 
         // A late message lands at lamport 19, inside the page just read.
-        s.insert_incoming(c, msg(19), 99, 19, "late", None, T0 + 3_600_000);
+        s.insert_incoming(inc(c, msg(19), 99, 19, "late", None, T0 + 3_600_000));
 
         let older = s.messages(&c, Some(&cursor), 4).unwrap();
         // Nothing from the first page reappears, and nothing was skipped.
@@ -728,7 +800,15 @@ mod tests {
     fn paging_walks_the_whole_history_exactly_once() {
         let (mut s, c) = store_with_contact();
         for i in 0..25u8 {
-            s.insert_incoming(c, msg(i), u64::from(i), u64::from(i) + 1, "m", None, T0);
+            s.insert_incoming(inc(
+                c,
+                msg(i),
+                u64::from(i),
+                u64::from(i) + 1,
+                "m",
+                None,
+                T0,
+            ));
         }
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
@@ -764,7 +844,15 @@ mod tests {
     fn page_limit_is_clamped() {
         let (mut s, c) = store_with_contact();
         for i in 0..5u8 {
-            s.insert_incoming(c, msg(i), u64::from(i), u64::from(i) + 1, "m", None, T0);
+            s.insert_incoming(inc(
+                c,
+                msg(i),
+                u64::from(i),
+                u64::from(i) + 1,
+                "m",
+                None,
+                T0,
+            ));
         }
         assert_eq!(s.messages(&c, None, 0).unwrap().messages.len(), 1);
         assert_eq!(
@@ -777,8 +865,8 @@ mod tests {
     #[test]
     fn reading_clears_unread_and_a_late_message_above_the_mark_stays_unread() {
         let (mut s, c) = store_with_contact();
-        s.insert_incoming(c, msg(1), 0, 1, "a", None, T0);
-        s.insert_incoming(c, msg(2), 1, 2, "b", None, T0 + 1);
+        s.insert_incoming(inc(c, msg(1), 0, 1, "a", None, T0));
+        s.insert_incoming(inc(c, msg(2), 1, 2, "b", None, T0 + 1));
         assert_eq!(s.contact(&c).unwrap().unread_count, 2);
 
         let through = order_key(2, &identity::encode_message_id(&msg(2)));
@@ -786,19 +874,19 @@ mod tests {
         assert_eq!(s.contact(&c).unwrap().unread_count, 0);
 
         // Arrives below the read mark: already seen, stays read.
-        s.insert_incoming(c, msg(9), 9, 1, "late-below", None, T0 + 10);
+        s.insert_incoming(inc(c, msg(9), 9, 1, "late-below", None, T0 + 10));
         assert_eq!(s.contact(&c).unwrap().unread_count, 0);
 
         // Arrives above it: genuinely unseen.
-        s.insert_incoming(c, msg(4), 3, 4, "new", None, T0 + 20);
+        s.insert_incoming(inc(c, msg(4), 3, 4, "new", None, T0 + 20));
         assert_eq!(s.contact(&c).unwrap().unread_count, 1);
     }
 
     #[test]
     fn marking_read_is_idempotent_and_never_moves_backwards() {
         let (mut s, c) = store_with_contact();
-        s.insert_incoming(c, msg(1), 0, 1, "a", None, T0);
-        s.insert_incoming(c, msg(2), 1, 2, "b", None, T0);
+        s.insert_incoming(inc(c, msg(1), 0, 1, "a", None, T0));
+        s.insert_incoming(inc(c, msg(2), 1, 2, "b", None, T0));
         let early = order_key(1, &identity::encode_message_id(&msg(1)));
         let late = order_key(2, &identity::encode_message_id(&msg(2)));
         s.mark_read(&c, &late);
@@ -811,7 +899,7 @@ mod tests {
     #[test]
     fn our_own_messages_are_never_unread() {
         let (mut s, c) = store_with_contact();
-        s.insert_outgoing(c, msg(1), 0, 1, "mine", T0);
+        s.insert_outgoing(out(c, msg(1), 0, 1, "mine", T0));
         assert_eq!(s.contact(&c).unwrap().unread_count, 0);
     }
 
@@ -832,8 +920,16 @@ mod tests {
         s.upsert_contact(conv(2), key(2), "Recent", false, T0);
         s.upsert_contact(conv(3), key(3), "zz-never", false, T0);
         s.upsert_contact(conv(4), key(4), "aa-never", false, T0);
-        s.insert_incoming(conv(1), msg(1), 0, 1, "old", Some(T0), T0);
-        s.insert_incoming(conv(2), msg(2), 0, 1, "new", Some(T0 + 1_000), T0 + 1_000);
+        s.insert_incoming(inc(conv(1), msg(1), 0, 1, "old", Some(T0), T0));
+        s.insert_incoming(inc(
+            conv(2),
+            msg(2),
+            0,
+            1,
+            "new",
+            Some(T0 + 1_000),
+            T0 + 1_000,
+        ));
         let names: Vec<String> = s
             .conversations()
             .into_iter()
@@ -848,7 +944,7 @@ mod tests {
         // Multi-byte characters: truncating by byte index would panic or
         // split a character.
         let long: String = std::iter::repeat_n('é', PREVIEW_CHARS + 50).collect();
-        s.insert_incoming(c, msg(1), 0, 1, &long, None, T0);
+        s.insert_incoming(inc(c, msg(1), 0, 1, &long, None, T0));
         let preview = s.conversations()[0].last_message.clone().unwrap();
         assert_eq!(preview.text.chars().count(), PREVIEW_CHARS);
     }
@@ -856,12 +952,12 @@ mod tests {
     #[test]
     fn preview_uses_send_time_when_known_and_receive_time_otherwise() {
         let (mut s, c) = store_with_contact();
-        s.insert_incoming(c, msg(1), 0, 1, "no clock", None, T0 + 500);
+        s.insert_incoming(inc(c, msg(1), 0, 1, "no clock", None, T0 + 500));
         assert_eq!(
             s.conversations()[0].last_message.as_ref().unwrap().at,
             T0 + 500
         );
-        s.insert_incoming(c, msg(2), 1, 2, "clock", Some(T0 + 1), T0 + 600);
+        s.insert_incoming(inc(c, msg(2), 1, 2, "clock", Some(T0 + 1), T0 + 600));
         assert_eq!(
             s.conversations()[0].last_message.as_ref().unwrap().at,
             T0 + 1
@@ -890,7 +986,7 @@ mod tests {
     #[test]
     fn reset_clears_everything() {
         let (mut s, c) = store_with_contact();
-        s.insert_outgoing(c, msg(1), 0, 1, "hi", T0);
+        s.insert_outgoing(out(c, msg(1), 0, 1, "hi", T0));
         s.set_settings(Settings {
             display_name: Some("me".into()),
             ..Settings::default()

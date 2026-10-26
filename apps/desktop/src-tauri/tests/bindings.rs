@@ -121,6 +121,54 @@ fn json(relative: &str) -> serde_json::Value {
 }
 
 #[test]
+fn a_ts_type_annotation_never_drops_an_options_nullability() {
+    // `#[ts(type = "...")]` replaces the *whole* generated type, so
+    // annotating an `Option<u64>` with `"number"` silently drops the
+    // nullability and tells the frontend the field can never be absent.
+    // TypeScript cannot catch that, because the generated type is what it
+    // believes. Every annotated field is checked against its Rust type here.
+    let source = read("src/ipc.rs");
+    let lines: Vec<&str> = source.lines().collect();
+    let mut checked = 0;
+
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("#[ts(type = \"") else {
+            continue;
+        };
+        let Some(declared) = rest.strip_suffix("\")]") else {
+            continue;
+        };
+        let field = lines
+            .get(index + 1)
+            .map(|l| l.trim())
+            .expect("an annotation must be followed by the field it annotates");
+        let Some((name, ty)) = field.strip_prefix("pub ").and_then(|f| f.split_once(": ")) else {
+            panic!("`{field}` does not look like a field after a #[ts(type)] annotation");
+        };
+        checked += 1;
+        if ty.starts_with("Option<") {
+            assert!(
+                declared.contains("null"),
+                "`{name}` is `{ty}` in Rust but is declared as `{declared}`; \
+                 the annotation has dropped its nullability"
+            );
+        } else {
+            assert!(
+                !declared.contains("null"),
+                "`{name}` is `{ty}` in Rust but is declared as `{declared}`; \
+                 the annotation claims it can be absent when it cannot"
+            );
+        }
+    }
+
+    assert!(
+        checked >= 20,
+        "found only {checked} annotated fields; the parse is probably broken"
+    );
+}
+
+#[test]
 fn the_capability_file_grants_nothing_beyond_events() {
     // The app's own commands need no ACL grant. Anything else appearing here
     // widens what the webview can reach, and should be deliberate.

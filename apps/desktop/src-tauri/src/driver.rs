@@ -23,7 +23,7 @@ use tokio::time::{sleep_until, Instant};
 use crate::engine::{EngineEvent, EngineHandle, LinkCounters, LinkHealth};
 use crate::events::EventSink;
 use crate::ipc::{Link, LinkKind, LinkSettings, LinkStatus, MessageStatus};
-use crate::storage::{AppStore, Inserted};
+use crate::storage::{AppStore, IncomingMessage, Inserted};
 
 /// How long the loop will sleep when the engine has no deadline.
 ///
@@ -42,6 +42,16 @@ pub trait Clock: Send + Sync {
 /// The real clock.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemClock;
+
+impl SystemClock {
+    /// The current time, before the driver exists.
+    ///
+    /// `Clock::now_ms` needs a `&dyn Clock`, which the app does not yet have
+    /// while it is constructing the engine that the clock will drive.
+    pub fn now_ms_for_bootstrap(&self) -> u64 {
+        self.now_ms()
+    }
+}
 
 impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
@@ -203,6 +213,11 @@ impl LinkTable {
         self.links.iter().map(|(id, l)| l.to_ipc(*id)).collect()
     }
 
+    /// Every registered link id, ascending.
+    pub fn ids(&self) -> Vec<u16> {
+        self.links.keys().copied().collect()
+    }
+
     /// Whether a link with this id exists.
     pub fn contains(&self, id: u16) -> bool {
         self.links.contains_key(&id)
@@ -292,21 +307,76 @@ impl Shared {
         while let Some(event) = engine.poll_event() {
             self.apply(event, now);
         }
+        self.merge_link_counters(&**engine);
+        self.refresh_last_heard(&**engine);
         engine.next_timeout().map(Timestamp::as_millis)
     }
 
     /// Drains `poll_transmit` to the transport, counting as it goes.
     async fn flush(&self, engine: &mut dyn EngineHandle, now: Timestamp) {
-        let infer_sent = !engine.reports_transmissions();
         let mut transport = self.transport.lock().await;
         while let Some(transmit) = engine.poll_transmit(now) {
             let bytes = transmit.packet.as_bytes();
-            let accepted = transport.send(transmit.link, transmit.to, bytes, now);
-            if accepted {
+            if transport.send(transmit.link, transmit.to, bytes, now) {
                 self.count_sent(transmit.link, bytes.len() as u64, now);
             }
-            if infer_sent && accepted {
-                self.infer_sent(transmit.to, now);
+            // The `queued` -> `sent` transition comes from the engine's own
+            // `MessageTransmitted` event, not from this loop: a packet names
+            // a conversation, not the messages inside it.
+        }
+    }
+
+    /// Takes counters from an engine that moves its own packets.
+    ///
+    /// `FakeEngine` is its own transport, so the driver's flush and deliver
+    /// paths never see its traffic and its counts would otherwise stay at
+    /// zero. The real stack returns `None` here and the driver's own counts
+    /// stand.
+    fn merge_link_counters(&self, engine: &dyn EngineHandle) {
+        let ids: Vec<u16> = self.with_links(|links| links.ids());
+        for id in ids {
+            let Some(counters) = engine.link_counters(LinkId(id)) else {
+                continue;
+            };
+            let changed = self.with_links(|links| {
+                let record = links.record_mut(id)?;
+                if record.counters == counters {
+                    return None;
+                }
+                record.counters = counters;
+                links.get(id)
+            });
+            if let Some(link) = changed {
+                self.sink.link_status_changed(&link);
+            }
+        }
+    }
+
+    /// Updates each contact's "last heard from" time from the engine.
+    ///
+    /// An acknowledgement-only packet proves the peer is there but produces
+    /// no event, so without this the thread header would claim silence while
+    /// the link was in fact working — the one number on this screen a user
+    /// most needs to be able to trust.
+    fn refresh_last_heard(&self, engine: &dyn EngineHandle) {
+        let conversations: Vec<(ConversationId, Option<u64>)> = self.with_store(|store| {
+            store
+                .conversation_ids()
+                .into_iter()
+                .map(|id| (id, store.contact_last_packet_at(&id)))
+                .collect()
+        });
+        for (conversation, known) in conversations {
+            let Some(heard) = engine.contact_last_heard(conversation) else {
+                continue;
+            };
+            let heard = heard.as_millis();
+            if known.is_some_and(|known| known >= heard) {
+                continue;
+            }
+            let contact = self.with_store(|store| store.note_packet(&conversation, heard));
+            if let Some(contact) = contact {
+                self.sink.contact_changed(&contact);
             }
         }
     }
@@ -325,37 +395,21 @@ impl Shared {
         }
     }
 
-    /// The AR-002 workaround: promote every still-queued message in the
-    /// conversation to `sent`, because a packet for that conversation went
-    /// out and the engine will not say which messages were in it.
-    ///
-    /// This over-reports. An acknowledgement-only packet, or a packet
-    /// carrying the first of three queued messages, promotes all of them.
-    /// It is used only for engines whose `reports_transmissions()` is false;
-    /// `FakeEngine` reports transmissions exactly, so the UI is still
-    /// designed against correct semantics.
-    fn infer_sent(&self, conversation: ConversationId, now: Timestamp) {
-        let changes =
-            self.with_store(|store| store.promote_queued_to_sent(&conversation, now.as_millis()));
-        for change in &changes {
-            self.sink.message_status_changed(change);
-        }
-    }
-
     /// Applies one engine event to the store and the frontend.
     fn apply(&self, event: EngineEvent, now: Timestamp) {
         match event {
             EngineEvent::MessageReceived(received) => {
                 let stored = self.with_store(|store| {
-                    let inserted = store.insert_incoming(
-                        received.conversation,
-                        received.id,
-                        received.seq,
-                        received.lamport,
-                        &received.text,
-                        received.sender_time.map(Timestamp::as_millis),
-                        received.received_at.as_millis(),
-                    );
+                    let inserted = store.insert_incoming(IncomingMessage {
+                        conversation: received.conversation,
+                        id: received.id,
+                        seq: received.seq,
+                        lamport: received.lamport,
+                        text: &received.text,
+                        sent_at: received.sender_time.map(Timestamp::as_millis),
+                        received_at: received.received_at.as_millis(),
+                        missing_before: received.missing_before,
+                    });
                     let contact = store.contact(&received.conversation);
                     (inserted, contact)
                 });

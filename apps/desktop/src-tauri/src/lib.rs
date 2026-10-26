@@ -21,8 +21,7 @@ pub mod storage;
 
 use std::sync::Arc;
 
-use avianlink_core::{LinkBudget, LinkConfig, LinkId, PublicKey};
-use rand_core::RngCore;
+use avianlink_core::{Identity, LinkId};
 use tauri::Manager;
 use tokio::sync::mpsc;
 
@@ -41,6 +40,13 @@ const INBOUND_CAPACITY: usize = 256;
 /// Id of the link the app starts with.
 const DEFAULT_LINK: LinkId = LinkId(1);
 
+/// Impairment profile the app starts on.
+///
+/// Not `clean`: the interface's whole purpose is to be right about a bad
+/// link, and starting on a good one would mean every launch looks like an
+/// ordinary chat app until something goes wrong.
+const DEFAULT_PROFILE: &str = "disaster_cellular";
+
 /// Handle the receive side of the app uses to inject packets.
 ///
 /// Managed separately from [`Shared`] because only the transport layer should
@@ -48,78 +54,74 @@ const DEFAULT_LINK: LinkId = LinkId(1);
 /// command cannot reach it.
 pub struct InboundSender(pub mpsc::Sender<Inbound>);
 
-/// Generates this machine's identity key.
+/// Generates this machine's identity.
 ///
-/// **Phase 0: ephemeral.** A fresh key is generated on every launch, so
+/// **Phase 0/1: ephemeral.** A fresh keypair is generated on every launch, so
 /// restarting the app changes who you are and existing contacts stop
-/// matching. Phase 2 stores it in the OS keychain and this becomes a load.
-/// It is random rather than a fixed test key so that two instances running
-/// side by side are distinguishable.
-fn generate_identity() -> PublicKey {
-    let mut bytes = [0u8; 32];
-    rand_core::OsRng.fill_bytes(&mut bytes);
-    PublicKey(bytes)
+/// matching. Phase 2 stores `Identity::secret_bytes` in the OS keychain and
+/// this becomes a load.
+fn generate_identity() -> Identity {
+    Identity::generate(&mut rand_core::OsRng)
 }
 
-/// The link the app starts with: one simulated link, so the interface has
-/// something to show before any transport is configured.
-fn default_link_config() -> LinkConfig {
-    LinkConfig {
-        mtu: 1200,
-        budget: LinkBudget::Unlimited,
-        cost: 1,
-    }
-}
-
-/// Registers the starting state: identity and the default link.
-async fn bootstrap(shared: &Arc<Shared>) -> Result<(), avianlink_core::Error> {
-    let config = default_link_config();
+/// Registers the starting state: identity and the simulated link.
+///
+/// The link's MTU and budget come from the engine's impairment profile, so
+/// selecting a LoRa profile really does hand the engine a 51-byte MTU and a
+/// 1% duty cycle to pace against, rather than a comfortable default that
+/// would hide the behaviour the interface exists to show.
+async fn bootstrap(shared: &Arc<Shared>, link: LinkRecord) -> Result<(), avianlink_core::Error> {
     {
         let mut engine = shared.engine.lock().await;
         let local = engine.local_key();
         shared.with_store(|store| store.set_identity(local));
-        engine.add_link(DEFAULT_LINK, config)?;
+        engine.add_link(DEFAULT_LINK, link.config)?;
     }
-    shared.with_links(|links| {
-        links.insert(
-            DEFAULT_LINK.0,
-            LinkRecord {
-                label: "Simulated link".to_string(),
-                kind: LinkKind::Fake,
-                enabled: true,
-                config,
-                settings: LinkSettings::Fake {
-                    profile: "clean".to_string(),
-                },
-                health: LinkHealth {
-                    up: true,
-                    loss_permille: Some(0),
-                    budget_blocked_until: None,
-                },
-                counters: LinkCounters::default(),
-            },
-        );
-    });
+    shared.with_links(|links| links.insert(DEFAULT_LINK.0, link));
     // Drain the registration events the engine produced, so the link table is
     // consistent before the window opens.
     shared.pump().await;
     Ok(())
 }
 
+/// Builds the app's starting link record from the simulated engine.
+fn simulated_link(engine: &FakeEngine) -> LinkRecord {
+    LinkRecord {
+        label: "Simulated link".to_string(),
+        kind: LinkKind::Fake,
+        enabled: true,
+        config: engine.link_config(),
+        settings: LinkSettings::Fake {
+            profile: engine.settings().profile,
+        },
+        health: LinkHealth {
+            up: true,
+            loss_permille: None,
+            budget_blocked_until: None,
+        },
+        counters: LinkCounters::default(),
+    }
+}
+
 /// Builds and runs the app.
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            let engine = Box::new(FakeEngine::new(generate_identity()));
+            let engine = FakeEngine::with_profile(
+                generate_identity(),
+                DEFAULT_PROFILE,
+                SystemClock.now_ms_for_bootstrap(),
+            );
+            let link = simulated_link(&engine);
             let sink = Arc::new(TauriSink::new(app.handle().clone()));
             let shared = Arc::new(Shared::new(
-                engine,
+                Box::new(engine),
                 Box::new(NullTransport),
                 Arc::new(SystemClock),
                 sink,
             ));
             let (tx, rx) = mpsc::channel(INBOUND_CAPACITY);
-            tauri::async_runtime::block_on(bootstrap(&shared))?;
+            tauri::async_runtime::block_on(bootstrap(&shared, link))?;
             app.manage(Arc::clone(&shared));
             app.manage(InboundSender(tx));
             tauri::async_runtime::spawn(driver::run(shared, rx));

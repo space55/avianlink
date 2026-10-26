@@ -20,6 +20,7 @@ use avianlink_desktop_lib::engine::{
 };
 use avianlink_desktop_lib::events::{Recorded, RecordingSink};
 use avianlink_desktop_lib::ipc::{LinkKind, LinkSettings, LinkStatus, MessageStatus};
+use avianlink_desktop_lib::storage::OutgoingMessage;
 
 const T0: u64 = 1_700_000_000_000;
 
@@ -51,7 +52,6 @@ struct ScriptedEngine {
     local: PublicKey,
     contacts: BTreeMap<ConversationId, PublicKey>,
     links: BTreeMap<LinkId, LinkHealth>,
-    reports_transmissions: bool,
     script: Arc<Mutex<Script>>,
     seq: u64,
     lamport: u64,
@@ -59,12 +59,11 @@ struct ScriptedEngine {
 }
 
 impl ScriptedEngine {
-    fn new(reports_transmissions: bool, script: Arc<Mutex<Script>>) -> Self {
+    fn new(script: Arc<Mutex<Script>>) -> Self {
         Self {
             local: PublicKey([1; 32]),
             contacts: BTreeMap::new(),
             links: BTreeMap::new(),
-            reports_transmissions,
             script,
             seq: 0,
             lamport: 0,
@@ -147,10 +146,6 @@ impl EngineHandle for ScriptedEngine {
     fn outbox_len(&self) -> usize {
         self.outbox
     }
-
-    fn reports_transmissions(&self) -> bool {
-        self.reports_transmissions
-    }
 }
 
 /// What the transport was handed: one entry per accepted packet.
@@ -207,14 +202,14 @@ impl Harness {
                 .unwrap()
         };
         self.shared.with_store(|store| {
-            store.insert_outgoing(
-                self.conversation,
-                queued.id,
-                queued.seq,
-                queued.lamport,
+            store.insert_outgoing(OutgoingMessage {
+                conversation: self.conversation,
+                id: queued.id,
+                seq: queued.seq,
+                lamport: queued.lamport,
                 text,
-                T0,
-            )
+                queued_at: T0,
+            })
         });
         queued.id
     }
@@ -247,9 +242,9 @@ fn link_record() -> LinkRecord {
 }
 
 /// Builds a harness with one contact and one registered link.
-async fn harness_with(reports_transmissions: bool, transport: Box<dyn Transport>) -> Harness {
+async fn harness_with(transport: Box<dyn Transport>) -> Harness {
     let script = Arc::new(Mutex::new(Script::default()));
-    let engine = ScriptedEngine::new(reports_transmissions, Arc::clone(&script));
+    let engine = ScriptedEngine::new(Arc::clone(&script));
     let sink = Arc::new(RecordingSink::new());
     let clock = Arc::new(TestClock::new(T0));
     let peer = PublicKey([2; 32]);
@@ -276,8 +271,8 @@ async fn harness_with(reports_transmissions: bool, transport: Box<dyn Transport>
     }
 }
 
-async fn harness(reports_transmissions: bool) -> Harness {
-    harness_with(reports_transmissions, Box::new(NullTransport)).await
+async fn harness() -> Harness {
+    harness_with(Box::new(NullTransport)).await
 }
 
 fn received(conversation: ConversationId, seq: u64, lamport: u64, text: &str) -> EngineEvent {
@@ -299,7 +294,7 @@ fn received(conversation: ConversationId, seq: u64, lamport: u64, text: &str) ->
 
 #[tokio::test]
 async fn pump_uses_the_injected_clock_and_advances_the_engines_timers() {
-    let h = harness(true).await;
+    let h = harness().await;
     h.clock.set(T0 + 9_999);
     h.shared.pump().await;
     assert_eq!(h.shared.now().as_millis(), T0 + 9_999);
@@ -312,7 +307,7 @@ async fn pump_uses_the_injected_clock_and_advances_the_engines_timers() {
 
 #[tokio::test]
 async fn an_incoming_message_is_stored_and_announced() {
-    let h = harness(true).await;
+    let h = harness().await;
     h.script(vec![received(h.conversation, 0, 1, "hello")]);
     h.shared.pump().await;
 
@@ -337,7 +332,7 @@ async fn an_incoming_message_is_stored_and_announced() {
 async fn a_retransmitted_message_is_stored_once_and_announced_once() {
     // Retransmission is the normal case on these links, not an anomaly. The
     // UI must not flash a second copy of the message.
-    let h = harness(true).await;
+    let h = harness().await;
     h.script(vec![
         received(h.conversation, 0, 1, "hello"),
         received(h.conversation, 0, 1, "hello"),
@@ -354,7 +349,7 @@ async fn a_retransmitted_message_is_stored_once_and_announced_once() {
 
 #[tokio::test]
 async fn a_message_that_arrives_late_is_marked_and_sorted_into_place() {
-    let h = harness(true).await;
+    let h = harness().await;
     h.script(vec![
         received(h.conversation, 0, 1, "first"),
         received(h.conversation, 2, 3, "third"),
@@ -373,8 +368,8 @@ async fn a_message_that_arrives_late_is_marked_and_sorted_into_place() {
 }
 
 #[tokio::test]
-async fn an_engine_that_reports_transmissions_moves_exactly_one_message() {
-    let h = harness(true).await;
+async fn a_transmission_event_moves_exactly_the_message_it_names() {
+    let h = harness().await;
     let first = h.send("one").await;
     h.send("two").await;
     h.sink.take();
@@ -401,35 +396,8 @@ async fn an_engine_that_reports_transmissions_moves_exactly_one_message() {
 }
 
 #[tokio::test]
-async fn an_engine_that_cannot_report_transmissions_over_reports() {
-    // Pins the api-requests AR-002 workaround's real cost, so that when the
-    // library gains the event this test fails and the workaround is deleted
-    // rather than quietly left in.
-    let h = harness(false).await;
-    h.send("one").await;
-    h.send("two").await;
-    h.sink.take();
-
-    // One packet, which in reality carries only the first message.
-    h.queue_transmit(b"packet");
-    h.shared.pump().await;
-
-    let statuses: Vec<MessageStatus> = h
-        .sink
-        .status_changes()
-        .into_iter()
-        .map(|c| c.status)
-        .collect();
-    assert_eq!(
-        statuses,
-        vec![MessageStatus::Sent, MessageStatus::Sent],
-        "both messages were promoted, though only one went out"
-    );
-}
-
-#[tokio::test]
 async fn delivery_advances_status_once_and_retries_are_silent() {
-    let h = harness(true).await;
+    let h = harness().await;
     let id = h.send("one").await;
     h.sink.take();
 
@@ -466,7 +434,7 @@ async fn delivery_advances_status_once_and_retries_are_silent() {
 
 #[tokio::test]
 async fn abandonment_marks_a_message_failed() {
-    let h = harness(true).await;
+    let h = harness().await;
     let id = h.send("one").await;
     h.sink.take();
     h.script(vec![EngineEvent::MessageAbandoned {
@@ -485,7 +453,7 @@ async fn flushing_counts_packets_against_the_link() {
         sent: Arc::clone(&sent),
         accept: true,
     };
-    let h = harness_with(true, Box::new(transport)).await;
+    let h = harness_with(Box::new(transport)).await;
     h.queue_transmit(b"0123456789");
     h.queue_transmit(b"abc");
     h.clock.set(T0 + 50);
@@ -506,7 +474,7 @@ async fn a_packet_the_transport_refuses_is_not_counted_as_sent() {
         sent: Arc::new(Mutex::new(Vec::new())),
         accept: false,
     };
-    let h = harness_with(false, Box::new(transport)).await;
+    let h = harness_with(Box::new(transport)).await;
     h.send("one").await;
     h.queue_transmit(b"packet");
     h.sink.take();
@@ -519,7 +487,7 @@ async fn a_packet_the_transport_refuses_is_not_counted_as_sent() {
 
 #[tokio::test]
 async fn an_inbound_packet_is_counted_and_fed_to_the_engine() {
-    let h = harness(true).await;
+    let h = harness().await;
     h.clock.set(T0 + 25);
     h.shared
         .deliver(Inbound {
@@ -540,7 +508,7 @@ async fn an_inbound_packet_is_counted_and_fed_to_the_engine() {
 
 #[tokio::test]
 async fn a_link_going_down_is_reported_but_a_disabled_link_reads_disabled() {
-    let h = harness(true).await;
+    let h = harness().await;
     h.script(vec![EngineEvent::LinkChanged {
         link: LINK,
         health: LinkHealth {
@@ -571,7 +539,7 @@ async fn being_out_of_airtime_is_reported_without_the_link_going_down() {
     // Duty-cycled radios spend most of their time out of budget. That is
     // pacing working correctly, not a fault, and the UI has to be able to
     // say so.
-    let h = harness(true).await;
+    let h = harness().await;
     h.script(vec![EngineEvent::LinkChanged {
         link: LINK,
         health: LinkHealth {
@@ -589,7 +557,7 @@ async fn being_out_of_airtime_is_reported_without_the_link_going_down() {
 
 #[tokio::test]
 async fn an_unchanged_link_health_is_not_re_announced() {
-    let h = harness(true).await;
+    let h = harness().await;
     let health = h
         .shared
         .with_links(|l| l.record_mut(LINK.0).unwrap().health);
@@ -608,7 +576,7 @@ async fn an_unchanged_link_health_is_not_re_announced() {
 async fn the_loop_wakes_on_a_poke_rather_than_waiting_out_its_sleep() {
     // Without this, a message queued while the engine had no deadline would
     // sit in the outbox until something unrelated woke the driver.
-    let h = harness(true).await;
+    let h = harness().await;
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     let task = tokio::spawn(avianlink_desktop_lib::driver::run(
         Arc::clone(&h.shared),
@@ -633,7 +601,7 @@ async fn the_loop_wakes_on_a_poke_rather_than_waiting_out_its_sleep() {
 
 #[tokio::test]
 async fn the_loop_stops_when_the_inbound_channel_closes() {
-    let h = harness(true).await;
+    let h = harness().await;
     let (tx, rx) = tokio::sync::mpsc::channel::<Inbound>(8);
     let task = tokio::spawn(avianlink_desktop_lib::driver::run(
         Arc::clone(&h.shared),

@@ -17,9 +17,11 @@
 //! `docs/api-requests.md` and the richer shape is the one the UI is built
 //! against, so that adopting the library's version later is a deletion.
 
+mod channel;
 mod fake;
 
 pub use avianlink_core::Queued;
+pub use channel::{Channel, ChannelCounters, Outages};
 pub use fake::FakeEngine;
 
 use avianlink_core::{
@@ -80,15 +82,12 @@ pub enum EngineEvent {
     /// A new message arrived. Not in causal order; sort by `lamport`.
     MessageReceived(ReceivedMessage),
     /// A message left this machine. The `queued` -> `sent` transition.
-    ///
-    /// Not available from `avianlink_core` today (AR-002); `FakeEngine`
-    /// reports it exactly, and `RealEngine` approximates it.
     MessageTransmitted {
         /// Conversation the message belongs to.
         conversation: ConversationId,
         /// The message that went out.
         id: MessageId,
-        /// 1 for the first transmission, incrementing per retransmission.
+        /// Transmissions so far, from `Engine::outgoing`. 1 on the first.
         attempt: u32,
     },
     /// The peer acknowledged a message.
@@ -114,6 +113,30 @@ pub enum EngineEvent {
         /// Its new health.
         health: LinkHealth,
     },
+}
+
+/// Controls that only a simulated engine has.
+///
+/// Reached through [`EngineHandle::simulation`], which returns `None` for the
+/// real engine. One named escape hatch is better than scattering
+/// `is_fake()`-style questions through the command layer, and it makes the
+/// set of things that exist only in the simulation explicit and finite.
+pub trait Simulation {
+    /// The impairment settings in force.
+    fn settings(&self) -> crate::ipc::FakeEngineSettings;
+
+    /// Replaces the impairment settings.
+    fn set_settings(&mut self, settings: crate::ipc::FakeEngineSettings);
+
+    /// Generates an identity for a new simulated contact.
+    fn invent_key(&mut self) -> PublicKey;
+
+    /// Gives a conversation some scripted history.
+    fn seed_history(&mut self, conversation: ConversationId, lines: usize);
+
+    /// Forces a message into the `failed` state, which the real engine cannot
+    /// produce (api-requests AR-003).
+    fn abandon(&mut self, conversation: ConversationId, id: MessageId, reason: AbandonReason);
 }
 
 /// Counters the app shows in the link-health display.
@@ -186,19 +209,35 @@ pub trait EngineHandle: Send {
     /// Current health of a registered link.
     fn link_health(&self, link: LinkId) -> Option<LinkHealth>;
 
+    /// Packet counters, when this implementation owns its links and is
+    /// therefore the only thing that can count them.
+    ///
+    /// `FakeEngine` returns `Some`: it is its own transport, so the driver's
+    /// transmit and receive paths never see its packets. The real stack
+    /// returns `None`, because there the driver *is* the thing moving the
+    /// bytes and its own counts are authoritative.
+    fn link_counters(&self, _link: LinkId) -> Option<LinkCounters> {
+        None
+    }
+
+    /// The simulated engine's controls, when this is a simulated engine.
+    fn simulation(&mut self) -> Option<&mut dyn Simulation> {
+        None
+    }
+
+    /// When an authenticated packet was last seen from this contact,
+    /// acknowledgement-only packets included.
+    ///
+    /// This is the single most useful number on a link where silence for a
+    /// day is normal, and only the engine can answer it: a packet that
+    /// carries nothing but an acknowledgement still proves the peer is there,
+    /// and never reaches the app as an event.
+    fn contact_last_heard(&self, _conversation: ConversationId) -> Option<Timestamp> {
+        None
+    }
+
     /// Number of queued, undelivered outgoing messages.
     fn outbox_len(&self) -> usize;
-
-    /// Whether this implementation emits [`EngineEvent::MessageTransmitted`]
-    /// itself.
-    ///
-    /// When `false`, the driver infers the `queued` -> `sent` transition from
-    /// `poll_transmit`, which over-reports (api-requests AR-002). The method
-    /// exists so that the inaccurate path is used only where it is
-    /// unavoidable: `FakeEngine` returns `true` and reports transmissions
-    /// exactly, so the UI is designed against correct semantics, and the flag
-    /// disappears entirely once AR-002 lands.
-    fn reports_transmissions(&self) -> bool;
 }
 
 #[cfg(test)]
@@ -210,9 +249,11 @@ mod tests {
         // The driver stores the engine as `Box<dyn EngineHandle>` so the
         // binary does not need to be generic over the implementation.
         fn assert_object_safe(_: &dyn EngineHandle) {}
-        let mut fake = FakeEngine::new(PublicKey([1; 32]));
+        let mut fake = FakeEngine::new(avianlink_core::Identity::from_secret_bytes(&[1; 32]));
         assert_object_safe(&fake);
-        let boxed: Box<dyn EngineHandle> = Box::new(FakeEngine::new(PublicKey([2; 32])));
+        let boxed: Box<dyn EngineHandle> = Box::new(FakeEngine::new(
+            avianlink_core::Identity::from_secret_bytes(&[2; 32]),
+        ));
         assert_eq!(boxed.outbox_len(), 0);
         assert_eq!(fake.poll_event(), None);
     }

@@ -16,6 +16,12 @@
 //! check would fail against real data. The annotation makes the generated
 //! type match what actually crosses the boundary. The precision limit this
 //! implies is discussed in `docs/ipc.md` § Conventions.
+//!
+//! An `Option<u64>` needs `#[ts(type = "number | null")]`, not
+//! `"number"`: the annotation replaces the *whole* generated type, so the
+//! shorter form silently drops the nullability and tells the frontend a field
+//! can never be absent. A test in `tests/bindings.rs` checks that every
+//! optional field in the generated output still admits `null`.
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -61,10 +67,10 @@ pub struct Contact {
     #[ts(type = "number")]
     pub added_at: u64,
     /// Last packet attributed to this peer, unix milliseconds. Best effort.
-    #[ts(type = "number")]
+    #[ts(type = "number | null")]
     pub last_packet_at: Option<u64>,
     /// Last message received from this peer, unix milliseconds.
-    #[ts(type = "number")]
+    #[ts(type = "number | null")]
     pub last_message_at: Option<u64>,
     /// Messages received but not yet marked read.
     pub unread_count: u32,
@@ -131,20 +137,28 @@ pub struct Message {
     /// Opaque sort and pagination key; sort ascending. See [`order_key`].
     pub order_key: String,
     /// Sender-asserted wall clock, unix milliseconds.
-    #[ts(type = "number")]
+    #[ts(type = "number | null")]
     pub sent_at: Option<u64>,
     /// When our engine received it, unix milliseconds. Incoming only.
-    #[ts(type = "number")]
+    #[ts(type = "number | null")]
     pub received_at: Option<u64>,
     /// Outgoing only; `None` for incoming messages.
     pub status: Option<MessageStatus>,
     /// Unix milliseconds. Outgoing only.
-    #[ts(type = "number")]
+    #[ts(type = "number | null")]
     pub delivered_at: Option<u64>,
     /// Transmissions so far. Outgoing only.
     pub attempts: Option<u32>,
     /// Set at insert time if a strictly greater `order_key` already existed.
     pub arrived_late: bool,
+    /// Earlier messages from this sender that have not arrived yet.
+    ///
+    /// Reported by the engine. Non-zero means this message overtook others in
+    /// the network, and the thread shows a gap marker above it: the
+    /// forward-looking counterpart to `arrived_late`. Always 0 for our own
+    /// messages.
+    #[ts(type = "number")]
+    pub missing_before: u64,
 }
 
 /// Builds the opaque sort key: `<lamport as 16 hex digits>:<message id hex>`.
@@ -291,37 +305,45 @@ pub struct Link {
     /// 0..=1000. `None` means not measured, which must not render as 0.
     pub recent_loss_permille: Option<u16>,
     /// Unix milliseconds.
-    #[ts(type = "number")]
+    #[ts(type = "number | null")]
     pub last_sent_at: Option<u64>,
     /// Unix milliseconds.
-    #[ts(type = "number")]
+    #[ts(type = "number | null")]
     pub last_received_at: Option<u64>,
     /// Pacing, not a fault: the link is up but out of airtime until then.
-    #[ts(type = "number")]
+    #[ts(type = "number | null")]
     pub budget_blocked_until: Option<u64>,
 }
 
-/// Impairments the fake engine applies, so the UI can be driven through every
-/// state on demand. Dev builds only.
+/// How the simulated engine behaves, so a reviewer can drive the interface
+/// through every state on demand. Present only when the app is running on
+/// `FakeEngine`.
+///
+/// The packet-level impairments — delay, jitter, bursty loss, corruption,
+/// duplication, reordering, MTU, airtime budget and outage schedule — all
+/// come from the named `profile`, whose parameters are `avianlink-sim`'s and
+/// are shared with `scripts/netem/`. Only the knobs that have no equivalent
+/// in the simulator are exposed separately.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../src/lib/ipc/bindings.ts")]
 pub struct FakeEngineSettings {
-    /// Impairment profile name.
+    /// Active impairment profile.
     pub profile: String,
-    /// Base one-way delay, milliseconds.
+    /// Every profile that can be selected, in a stable order.
+    pub available_profiles: Vec<String>,
+    /// How long a scripted contact takes to begin answering, before the
+    /// link's own delay is added.
     #[ts(type = "number")]
-    pub delay_ms: u64,
-    /// Uniform jitter added to the delay, milliseconds.
+    pub reply_delay_ms: u64,
+    /// Uniform jitter on top of `reply_delay_ms`. Large by default, so
+    /// replies land anywhere from seconds to hours after the message they
+    /// answer.
     #[ts(type = "number")]
-    pub jitter_ms: u64,
-    /// Per-packet loss, parts per thousand.
-    pub loss_permille: u16,
-    /// Probability a delivered packet is reordered, parts per thousand.
-    pub reorder_permille: u16,
-    /// Whether scripted link outages are running.
-    pub outages: bool,
-    /// Whether scripted peers reply.
+    pub reply_jitter_ms: u64,
+    /// Whether scripted contacts answer at all.
     pub scripted_replies: bool,
+    /// Whether the profile's scheduled link outages run.
+    pub outages: bool,
 }
 
 /// User-visible app settings.
@@ -428,6 +450,18 @@ pub struct SetContactVerifiedArgs {
     pub verified: bool,
 }
 
+/// Arguments to `add_simulated_contact`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../src/lib/ipc/bindings.ts")]
+pub struct AddSimulatedContactArgs {
+    /// Local label. May be empty.
+    pub display_name: String,
+    /// How many scripted messages the contact should already have sent. They
+    /// travel the real simulated link, so they arrive over the next seconds
+    /// rather than appearing at once.
+    pub history: u32,
+}
+
 /// Arguments to `set_settings`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../src/lib/ipc/bindings.ts")]
@@ -455,7 +489,7 @@ pub struct MessageStatusChanged {
     /// New status.
     pub status: MessageStatus,
     /// Unix milliseconds; set when `status` is `delivered`.
-    #[ts(type = "number")]
+    #[ts(type = "number | null")]
     pub delivered_at: Option<u64>,
     /// Transmissions so far.
     pub attempts: u32,

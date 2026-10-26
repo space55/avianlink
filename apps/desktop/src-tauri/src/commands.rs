@@ -21,10 +21,11 @@ use crate::driver::Shared;
 use crate::error::{IpcError, IpcResult};
 use crate::identity;
 use crate::ipc::{
-    AddContactArgs, ConfigureLinkArgs, Contact, ConversationSummary, GetMessagesArgs, Identity,
-    Link, LinkSettings, MarkReadArgs, Message, MessagePage, SendMessageArgs,
-    SetContactVerifiedArgs, SetLinkEnabledArgs, SetSettingsArgs, Settings,
+    AddContactArgs, AddSimulatedContactArgs, ConfigureLinkArgs, Contact, ConversationSummary,
+    GetMessagesArgs, Identity, Link, LinkSettings, MarkReadArgs, Message, MessagePage,
+    SendMessageArgs, SetContactVerifiedArgs, SetLinkEnabledArgs, SetSettingsArgs, Settings,
 };
+use crate::storage::OutgoingMessage;
 
 /// Shorthand for the managed state.
 type Ctx<'a> = State<'a, Arc<Shared>>;
@@ -117,14 +118,14 @@ pub async fn send_message(ctx: Ctx<'_>, args: SendMessageArgs) -> IpcResult<Mess
         engine.send_text(conversation, text, now)?
     };
     let message = ctx.with_store(|store| {
-        store.insert_outgoing(
+        store.insert_outgoing(OutgoingMessage {
             conversation,
-            queued.id,
-            queued.seq,
-            queued.lamport,
+            id: queued.id,
+            seq: queued.seq,
+            lamport: queued.lamport,
             text,
-            now.as_millis(),
-        )
+            queued_at: now.as_millis(),
+        })
     });
     ctx.poke();
     Ok(message)
@@ -227,10 +228,18 @@ pub async fn set_contact_verified(
     Ok(contact)
 }
 
-/// Current settings.
+/// Current settings, including the simulated engine's controls when one is
+/// running.
 #[tauri::command]
 pub async fn get_settings(ctx: Ctx<'_>) -> IpcResult<Settings> {
-    Ok(ctx.with_store(|store| store.settings()))
+    let mut settings = ctx.with_store(|store| store.settings());
+    settings.fake_engine = ctx
+        .engine
+        .lock()
+        .await
+        .simulation()
+        .map(|sim| sim.settings());
+    Ok(settings)
 }
 
 /// Replaces settings.
@@ -241,10 +250,62 @@ pub async fn set_settings(ctx: Ctx<'_>, args: SetSettingsArgs) -> IpcResult<Sett
         .display_name
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty());
-    let stored = ctx.with_store(|store| store.set_settings(settings));
+    // The simulation's controls live in the engine, not the store, so they
+    // are split off before the rest is persisted and put back afterwards.
+    let simulation = settings.fake_engine.take();
+    let mut stored = ctx.with_store(|store| store.set_settings(settings));
+    let mut engine = ctx.engine.lock().await;
+    if let Some(sim) = engine.simulation() {
+        if let Some(wanted) = simulation {
+            sim.set_settings(wanted);
+        }
+        stored.fake_engine = Some(sim.settings());
+    }
+    drop(engine);
+    ctx.poke();
     // The display name is part of the identity the UI shows, and `Identity`
     // reads it straight from settings, so there is nothing else to update.
     Ok(stored)
+}
+
+/// Adds a contact backed by a simulated device that answers.
+///
+/// Only meaningful on `FakeEngine`. It exists because the interface cannot be
+/// reviewed — or screenshotted, or driven through its states — without a peer,
+/// and inventing a key by hand to paste into the add-contact dialog is a
+/// pointless ritual. On the real engine it fails rather than silently
+/// creating a contact that nothing will ever answer.
+#[tauri::command]
+pub async fn add_simulated_contact(
+    ctx: Ctx<'_>,
+    args: AddSimulatedContactArgs,
+) -> IpcResult<Contact> {
+    let now = ctx.clock.now_ms();
+    let (key, conversation) = {
+        let mut engine = ctx.engine.lock().await;
+        if engine.simulation().is_none() {
+            return Err(IpcError::bad_request(
+                "this build is not running the simulated engine",
+            ));
+        }
+        let key = engine
+            .simulation()
+            .map(|sim| sim.invent_key())
+            .ok_or_else(|| IpcError::internal("the simulation vanished"))?;
+        let conversation = engine.add_contact(key)?;
+        if args.history > 0 {
+            if let Some(sim) = engine.simulation() {
+                sim.seed_history(conversation, args.history as usize);
+            }
+        }
+        (key, conversation)
+    };
+    let contact = ctx.with_store(|store| {
+        store.upsert_contact(conversation, key, &args.display_name, false, now)
+    });
+    ctx.sink.contact_changed(&contact);
+    ctx.poke();
+    Ok(contact)
 }
 
 /// Deletes all local data. Destructive; the UI confirms first.
@@ -325,6 +386,7 @@ macro_rules! command_handlers {
             $crate::commands::set_contact_verified,
             $crate::commands::get_settings,
             $crate::commands::set_settings,
+            $crate::commands::add_simulated_contact,
             $crate::commands::reset_local_data,
         ]
     };
