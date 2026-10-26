@@ -116,6 +116,20 @@ exchanges messages both ways, and fails unless every message is received
 and acknowledged. `cargo test -p avianlink-udp` runs the same path
 in-process with `UdpHost`.
 
+**In Docker, through real netem.** On any machine with Docker:
+
+```
+scripts/netem/docker-test.sh [PROFILE] [MESSAGES] [INTERVAL_S] [TIMEOUT_S]
+```
+
+This builds Linux binaries in a `rust` container. It then puts alice and bob
+on two separate bridge networks whose only route to each other goes through
+a router container running the generated `scripts/netem/PROFILE.sh` on both
+of its interfaces: real `tc netem`, both directions, with shared outages.
+It exchanges messages through `avianlink chat` and fails unless every
+message is received and acknowledged. (Docker's `--internal` networks drop
+routed traffic, so plain bridge networks are used.)
+
 **Two machines through a netem box (the Phase 6 acceptance setup).**
 
 ```
