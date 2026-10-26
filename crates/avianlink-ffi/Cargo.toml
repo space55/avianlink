@@ -1,14 +1,27 @@
 [package]
 name = "avianlink-ffi"
-description = "C ABI for avianlink (Phase 7); basis for iOS/Swift bindings"
+description = "C ABI for avianlink; basis for iOS/Swift bindings"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 
-[dependencies]
-avianlink-core = { workspace = true }
+[lib]
+crate-type = ["staticlib", "rlib"]
 
-[lints]
-workspace = true
+[dependencies]
+avianlink-core = { workspace = true, features = ["std"] }
+avianlink-udp = { workspace = true }
+rand_chacha = { workspace = true }
+
+[lints.rust]
+# Dereferencing C pointers needs unsafe; it is confined to this crate
+# (D-043), and every block states its precondition.
+unsafe_code = "allow"
+missing_docs = "warn"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"

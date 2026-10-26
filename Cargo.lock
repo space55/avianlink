@@ -47,6 +47,8 @@ name = "avianlink-ffi"
 version = "0.0.0"
 dependencies = [
  "avianlink-core",
+ "avianlink-udp",
+ "rand_chacha",
 ]
 
 [[package]]
