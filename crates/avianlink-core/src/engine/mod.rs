@@ -170,6 +170,9 @@ pub struct Stats {
     pub frag_acks_sent: u64,
     /// RTT samples taken.
     pub rtt_samples: u64,
+    /// Times due work could not be turned into a packet and was pushed
+    /// back instead (a bug if non-zero; never a busy loop).
+    pub transmit_stalls: u64,
     /// SYNC frames sent.
     pub syncs_sent: u64,
     /// SYNC frames received.
@@ -1242,8 +1245,8 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         let contact = self.contacts.get_mut(&conv)?;
         let counter = contact.tx_counter;
         let mut announced = Vec::new();
-        let bytes = if pass == Pass::Repair {
-            build_repair(contact, &ctx, &mut self.stats)?
+        let built = if pass == Pass::Repair {
+            build_repair(contact, &ctx, &mut self.stats)
         } else {
             build_packet(
                 contact,
@@ -1252,7 +1255,31 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
                 &mut self.rng,
                 &mut self.stats,
                 &mut announced,
-            )?
+            )
+        };
+        let Some(bytes) = built else {
+            if pass != Pass::Repair {
+                // Work was due and the link ready, yet nothing could be
+                // built. That is a bug, but a host must never spin on it:
+                // push the work back and count it (tests assert zero).
+                bump(&mut self.stats.transmit_stalls);
+                if pass == Pass::Ack {
+                    contact.ack_due = None;
+                }
+                for msg in contact.outbox.values_mut() {
+                    if let Some(p) = msg.plan.as_mut() {
+                        for f in p
+                            .frags
+                            .iter_mut()
+                            .filter(|f| f.last_sent.is_none_or(|s| s <= now))
+                        {
+                            f.last_sent = Some(now);
+                        }
+                    }
+                }
+                contact.probe_due = contact.probe_due.max(now.saturating_add_millis(1));
+            }
+            return None;
         };
         let room = usize_of(self.config.max_pending_events).saturating_sub(self.events.len());
         self.events
@@ -1554,18 +1581,24 @@ fn close_fec_window(c: &mut Contact, mode: FecMode) {
 /// Builds a REPAIR-only packet from the contact's oldest pending repair.
 /// Repairs that no longer fit (the counter grew too much) are dropped.
 fn build_repair(contact: &mut Contact, ctx: &BuildCtx, stats: &mut Stats) -> Option<Vec<u8>> {
-    let r = contact.fec_tx.pending.pop_front()?;
     let counter = contact.tx_counter;
     let mut out = Vec::with_capacity(ctx.mtu);
     begin_packet(&mut out, contact.keys.tx_tag, counter);
     let limit = ctx.mtu.saturating_sub(AEAD_TAG_LEN);
-    if out
-        .len()
-        .saturating_add(repair_frame_len(r.base, r.mask, r.data.len()))
-        > limit
-    {
-        return None;
-    }
+    // Repairs sized for a larger link than the current route cannot be
+    // sent; discard all of them now, not one per call (a busy loop found by
+    // fuzzing).
+    let r = loop {
+        let r = contact.fec_tx.pending.pop_front()?;
+        if out
+            .len()
+            .saturating_add(repair_frame_len(r.base, r.mask, r.data.len()))
+            <= limit
+        {
+            break r;
+        }
+        bump(&mut stats.fec_repairs_dropped);
+    };
     put_repair_frame(&mut out, r.base, r.mask, r.shape, &r.data);
     contact.keys.seal(&mut out, header_len(counter), counter)?;
     contact.tx_counter = counter.saturating_add(1);

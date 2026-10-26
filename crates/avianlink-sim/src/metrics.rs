@@ -114,7 +114,9 @@ impl Report {
     /// Whether any engine-correctness counter is non-zero.
     pub fn bugs(&self) -> u64 {
         let ch = total_channel_stats(&self.channels);
-        self.stalls
+        let tx_stalls: u64 = self.engines.iter().map(|s| s.transmit_stalls).sum();
+        tx_stalls
+            + self.stalls
             + self.duplicate_deliveries
             + self.integrity_violations
             + self.sync_anomalies

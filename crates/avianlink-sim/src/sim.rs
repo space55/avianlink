@@ -452,7 +452,8 @@ pub fn add_stats(a: &Stats, b: &Stats) -> Stats {
         fec_recovered,
         loss_reports_sent,
         syncs_sent,
-        syncs_received
+        syncs_received,
+        transmit_stalls
     )
 }
 
