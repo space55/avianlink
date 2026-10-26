@@ -44,6 +44,11 @@ impl<'a> Reader<'a> {
             .map_err(|_| DecodeError::Truncated)
     }
 
+    /// Everything left, without consuming it.
+    pub fn peek_rest(&self) -> &'a [u8] {
+        self.buf
+    }
+
     /// Consumes and returns everything left.
     pub fn rest(&mut self) -> &'a [u8] {
         core::mem::take(&mut self.buf)

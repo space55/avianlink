@@ -234,6 +234,16 @@ impl fmt::Display for Report {
         )?;
         writeln!(
             f,
+            "  fec             sources {} repairs-sent {} repairs-dropped {} repairs-received {} recovered {} loss-reports {}",
+            e(|s| s.fec_sources),
+            e(|s| s.fec_repairs_sent),
+            e(|s| s.fec_repairs_dropped),
+            e(|s| s.fec_repairs_received),
+            e(|s| s.fec_recovered),
+            e(|s| s.loss_reports_sent)
+        )?;
+        writeln!(
+            f,
             "  host            crashes {}, adversary packets {}, out-of-order arrivals {}, max storage {} B, outbox-full retries {}",
             self.crashes, self.injected, self.out_of_order, self.max_storage_bytes, self.outbox_full_retries
         )?;

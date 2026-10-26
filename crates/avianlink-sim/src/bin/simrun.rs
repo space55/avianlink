@@ -2,15 +2,17 @@
 //!
 //! ```text
 //! simrun [--profile NAME|all|everything] [--seed N] [--seeds K] [--messages N]
-//!        [--interval-ms N] [--verbose] [--csv]
+//!        [--interval-ms N] [--verbose] [--csv] [--fec off|xor|rs]
+//!        [--mix SHORT,MEDIUM] [--fec-sources K] [--fec-flush MS] [--mtu BYTES]
 //!        [--max-rto MS] [--min-rto MS] [--initial-rto MS] [--var-mult N] [--grace N]
 //!
 //! NAME is a profile (clean, geo_satellite, edge_2g, disaster_cellular,
 //! lora_like) or a stress scenario (harsh_64, harsh_64_crashy,
-//! disaster_hostile). `all` runs
+//! disaster_hostile, bursty_loss). `all` runs
 //! the profiles; `everything` adds the stress scenarios.
 //! ```
 
+use avianlink_core::FecMode;
 use avianlink_sim::{Report, Scenario};
 
 fn main() {
@@ -21,6 +23,8 @@ fn main() {
     let mut interval = None;
     let mut verbose = false;
     let mut csv = false;
+    let mut fec = None;
+    let mut mix: Option<(f64, f64)> = None;
     let mut tweak: Vec<(String, u64)> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -46,9 +50,24 @@ fn main() {
             "--interval-ms" => interval = Some(num(&val())),
             "--verbose" | "-v" => verbose = true,
             "--csv" => csv = true,
-            "--max-rto" | "--min-rto" | "--initial-rto" | "--var-mult" | "--grace" => {
-                tweak.push((a.clone(), num(&val())))
+            "--mix" => {
+                let v = val();
+                let parts: Vec<f64> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+                match parts[..] {
+                    [short, medium] => mix = Some((short, medium)),
+                    _ => usage("--mix wants SHORT,MEDIUM fractions, e.g. 0,0 for all long"),
+                }
             }
+            "--fec" => {
+                fec = Some(match val().as_str() {
+                    "off" => FecMode::Off,
+                    "xor" => FecMode::Xor,
+                    "rs" => FecMode::ReedSolomon,
+                    v => usage(&format!("unknown FEC mode {v}")),
+                })
+            }
+            "--max-rto" | "--min-rto" | "--initial-rto" | "--var-mult" | "--grace"
+            | "--fec-sources" | "--fec-flush" | "--mtu" => tweak.push((a.clone(), num(&val()))),
             _ => usage(&format!("unknown argument {a}")),
         }
     }
@@ -68,12 +87,21 @@ fn main() {
             if let Some(i) = interval {
                 sc.mean_interval_ms = i;
             }
+            if let Some(f) = fec {
+                sc.config.fec = f;
+            }
+            if let Some((short, medium)) = mix {
+                sc.lengths = avianlink_sim::LengthMix { short, medium };
+            }
             for (k, v) in &tweak {
                 match k.as_str() {
                     "--max-rto" => sc.config.max_rto_ms = *v,
                     "--min-rto" => sc.config.min_rto_ms = *v,
                     "--initial-rto" => sc.config.initial_rto_ms = *v,
                     "--var-mult" => sc.config.rttvar_multiplier = *v as u8,
+                    "--fec-sources" => sc.config.fec_max_sources = *v as u8,
+                    "--fec-flush" => sc.config.fec_flush_ms = *v,
+                    "--mtu" => sc.link.mtu = *v as u16,
                     _ => sc.config.backoff_grace = *v as u8,
                 }
             }

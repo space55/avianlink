@@ -1,6 +1,18 @@
 use crate::wire::{frame_space, plan_fragments};
 use crate::{Error, MIN_MTU};
 
+/// Forward error correction across packets (`docs/reliability.md` §6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FecMode {
+    /// No repair packets are sent. Received repairs are still used.
+    Off,
+    /// One XOR repair per window.
+    Xor,
+    /// Cauchy Reed-Solomon, with the repair count sized to measured loss
+    /// (the default; D-038).
+    ReedSolomon,
+}
+
 /// Engine-wide limits and timers. Every queue and table in the engine is
 /// bounded by one of these; each field documents what happens at the limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +71,24 @@ pub struct Config {
     pub counter_reservation: u32,
     /// How long an ACK may wait for a data packet to piggyback on.
     pub ack_delay_ms: u64,
+    /// FEC scheme for outgoing traffic.
+    pub fec: FecMode,
+    /// Most sources per FEC window (1–16).
+    pub fec_max_sources: u8,
+    /// A window closes this long after its first source, if not full.
+    pub fec_flush_ms: u64,
+    /// FEC is used only while the peer reports at least this much loss.
+    pub fec_min_loss_permille: u16,
+    /// FEC is used only on links where one MTU-sized packet costs at most
+    /// this much of the link's rate or duty-cycle budget. On scarcer links,
+    /// redundancy crowds out data; retransmitting what was lost is cheaper.
+    pub fec_max_packet_cost_ms: u64,
+    /// Memory for received source plaintexts kept for FEC recovery, across
+    /// all contacts; the oldest are evicted first.
+    pub max_fec_rx_bytes: u32,
+    /// Repairs held while waiting for the rest of their window; the oldest
+    /// are dropped first.
+    pub max_fec_pending_repairs: u16,
     /// Whether `now` is Unix-epoch wall-clock time. If false, messages carry
     /// no timestamp.
     pub wall_clock: bool,
@@ -86,6 +116,13 @@ impl Default for Config {
             max_frag_acks_per_packet: 2,
             counter_reservation: 1024,
             ack_delay_ms: 100,
+            fec: FecMode::ReedSolomon,
+            fec_max_sources: 8,
+            fec_flush_ms: 200,
+            fec_min_loss_permille: 20,
+            fec_max_packet_cost_ms: 2_000,
+            max_fec_rx_bytes: 32 * 1024,
+            max_fec_pending_repairs: 64,
             wall_clock: true,
         }
     }
@@ -114,6 +151,8 @@ impl Config {
             || self.initial_rto_ms == 0
             || self.max_sent_log == 0
             || self.counter_reservation == 0
+            || self.fec_max_sources == 0
+            || usize::from(self.fec_max_sources) > crate::fec::MAX_SOURCES
         {
             return Err(Error::InvalidConfig);
         }

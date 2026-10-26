@@ -266,7 +266,7 @@ mod tests {
                 text: "hi",
             },
         );
-        wire::put_msg_frame(&mut frames, 0, 1, 0, &rec);
+        wire::put_msg_frame(&mut frames, 0, None, &rec);
         let mut script = vec![1u8, frames.len() as u8];
         script.extend_from_slice(&frames);
         script.extend_from_slice(&[3 | (8 << 3), 0]);

@@ -44,6 +44,7 @@ pub mod crypto;
 mod engine;
 mod error;
 mod event;
+pub mod fec;
 mod hash;
 mod link;
 mod pacer;
@@ -53,7 +54,7 @@ mod time;
 mod types;
 pub mod wire;
 
-pub use config::Config;
+pub use config::{Config, FecMode};
 pub use engine::{ContactStatus, Engine, LinkStats, OutgoingStatus, Queued, Stats, Transmit};
 pub use error::Error;
 pub use event::{Event, ReceivedMessage};

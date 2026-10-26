@@ -215,6 +215,31 @@ impl Replay {
             .is_some_and(|word| word & (1u64 << b) == 0)
     }
 
+    /// Fraction of counters missing among those aged 32..288 below the
+    /// highest, in permille; `None` until 32 such counters exist.
+    pub(super) fn loss_permille(&self) -> Option<u64> {
+        let high = self.high?;
+        let last = high.min(287);
+        if last < 63 {
+            return None;
+        }
+        let (mut seen, mut total) = (0u64, 0u64);
+        for k in 32..=last {
+            total = total.saturating_add(1);
+            let hit = usize::try_from(k / 64)
+                .ok()
+                .and_then(|w| self.bits.get(w))
+                .is_some_and(|word| word & (1u64 << (k % 64)) != 0);
+            if hit {
+                seen = seen.saturating_add(1);
+            }
+        }
+        total
+            .saturating_sub(seen)
+            .saturating_mul(1000)
+            .checked_div(total)
+    }
+
     /// Records `counter` as accepted. Call only after authentication.
     pub(super) fn mark(&mut self, counter: u64) {
         match self.high {
@@ -264,6 +289,28 @@ impl Replay {
     }
 }
 
+/// A repair waiting to be sent.
+#[derive(Debug, Clone)]
+pub(super) struct RepairOut {
+    pub(super) base: u64,
+    pub(super) mask: u64,
+    pub(super) shape: u8,
+    pub(super) data: Vec<u8>,
+}
+
+/// Sender side of FEC for one contact.
+#[derive(Debug, Default)]
+pub(super) struct FecTx {
+    /// Current window: (counter, plaintext), in counter order.
+    pub(super) sources: Vec<(u64, Vec<u8>)>,
+    /// When the window's first source was sent.
+    pub(super) opened: Timestamp,
+    /// Repairs of closed windows, oldest first.
+    pub(super) pending: VecDeque<RepairOut>,
+    /// Fractional repairs owed, in thousandths, carried across windows.
+    pub(super) credit: u64,
+}
+
 #[derive(Debug)]
 pub(super) struct Contact {
     pub(super) key: PublicKey,
@@ -296,6 +343,14 @@ pub(super) struct Contact {
     /// 0: normal. k > 0: peer unreachable, probing every `rto * 2^k`.
     pub(super) backoff: u32,
     pub(super) probe_due: Timestamp,
+    pub(super) fec_tx: FecTx,
+    /// Loss the peer reports on our packets (LOSS frames), permille.
+    pub(super) peer_loss: Option<u64>,
+    /// Actual arrivals from the peer (before FEC recovery), for LOSS.
+    pub(super) arrivals: Replay,
+    /// Last loss we reported, and packets received since.
+    pub(super) loss_reported: Option<u64>,
+    pub(super) rx_since_report: u32,
 }
 
 impl Contact {
@@ -321,6 +376,11 @@ impl Contact {
             last_fresh: None,
             backoff: 0,
             probe_due: Timestamp::ZERO,
+            fec_tx: FecTx::default(),
+            peer_loss: None,
+            arrivals: Replay::default(),
+            loss_reported: None,
+            rx_since_report: 0,
         }
     }
 
@@ -386,6 +446,15 @@ impl Contact {
             self.rx_largest = Some((counter, now));
             self.last_fresh = Some(now);
             self.backoff = 0;
+        }
+    }
+
+    /// Our loss estimate, if it is worth (re)reporting to the peer.
+    pub(super) fn loss_report_due(&self) -> Option<u64> {
+        let est = self.arrivals.loss_permille()?;
+        match self.loss_reported {
+            Some(last) if est.abs_diff(last) < 20 && self.rx_since_report < 64 => None,
+            _ => Some(est),
         }
     }
 

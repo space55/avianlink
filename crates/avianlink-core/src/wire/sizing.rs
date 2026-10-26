@@ -1,4 +1,4 @@
-use super::{msg_frame_len, varint_len, AEAD_TAG_LEN, MAX_HEADER_LEN};
+use super::{msg_frame_len, Part, AEAD_TAG_LEN, MAX_HEADER_LEN};
 
 /// Bytes available for frames in a packet on a link with this MTU, assuming
 /// the worst-case header used for sizing.
@@ -28,43 +28,44 @@ impl FragmentPlan {
 /// Plans the fragmentation of a record so every MSG frame fits in `space`
 /// bytes on its own. Returns `None` if `space` is too small for any data.
 pub fn plan_fragments(space: usize, seq: u64, record_len: usize) -> Option<FragmentPlan> {
-    if msg_frame_len(seq, 1, 0, record_len) <= space {
+    if msg_frame_len(seq, None, record_len) <= space {
         return Some(FragmentPlan {
             count: 1,
             frag_size: record_len,
         });
     }
-    // `width` is the worst-case varint length of count and index.
-    for width in 1..=3usize {
-        let max_count: u64 = match width {
-            1 => 0x7f,
-            2 => 0x3fff,
-            _ => 0x1f_ffff,
-        };
-        let frag_size = max_data(space, seq, max_count)?;
-        let count = u64::try_from(record_len.div_ceil(frag_size)).ok()?;
-        if count <= max_count {
-            debug_assert!(varint_len(count) <= width);
-            return Some(FragmentPlan { count, frag_size });
+    // Worst case for the offset varint: the record length.
+    let worst = Some(Part {
+        offset: u64::try_from(record_len).ok()?,
+        last: true,
+    });
+    let mut d = space;
+    while d > 0 {
+        let len = msg_frame_len(seq, worst, d);
+        if len <= space {
+            let count = u64::try_from(record_len.div_ceil(d)).ok()?;
+            return Some(FragmentPlan {
+                count,
+                frag_size: d,
+            });
         }
+        d = d.saturating_sub(len.saturating_sub(space).max(1));
     }
     None
 }
 
-/// Largest `d` such that a MSG frame with worst-case `count`/`index` up to
-/// `max_count` and `d` data bytes fits in `space`.
-fn max_data(space: usize, seq: u64, max_count: u64) -> Option<usize> {
-    let mut d = space;
-    // The frame length is monotonic in `d`; overhead is at most ~25 bytes,
-    // so a short downward search from the upper bound converges quickly.
-    while d > 0 {
-        if msg_frame_len(seq, max_count, max_count, d) <= space {
-            return Some(d);
+impl FragmentPlan {
+    /// The MSG part descriptor of fragment `index` (`None` when
+    /// unfragmented).
+    pub fn part(&self, index: u64, record_len: usize) -> Option<Part> {
+        if self.count <= 1 {
+            return None;
         }
-        let over = msg_frame_len(seq, max_count, max_count, d).saturating_sub(space);
-        d = d.saturating_sub(over.max(1));
+        Some(Part {
+            offset: u64::try_from(self.range(index, record_len).start).unwrap_or(u64::MAX),
+            last: index.saturating_add(1) >= self.count,
+        })
     }
-    None
 }
 
 #[cfg(test)]
@@ -84,7 +85,7 @@ mod tests {
                         let r = plan.range(i, len);
                         assert!(!r.is_empty(), "mtu {mtu} len {len} frag {i}");
                         total += r.len();
-                        assert!(msg_frame_len(seq, plan.count, i, r.len()) <= space);
+                        assert!(msg_frame_len(seq, plan.part(i, len), r.len()) <= space);
                     }
                     assert_eq!(total, len);
                 }

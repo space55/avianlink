@@ -562,12 +562,29 @@ fn no_wall_clock_omits_timestamp() {
 #[test]
 fn oversized_frag_ack_does_not_livelock() {
     let (mut b, _) = engine(B, A, 48);
-    // One fragment of a 250-fragment message: its FRAG_ACK bitmap is 32
-    // bytes, which cannot share a 48-byte packet with an ACK.
+    // One byte of a long message, then its last byte at 4000: the FRAG_ACK
+    // bitmap (1-byte blocks) is far larger than a 48-byte packet.
     let keys = PairKeys::derive(&id(A), &pk(B)).unwrap();
     let mut pkt = Vec::new();
     begin_packet(&mut pkt, keys.tx_tag, 0);
-    put_msg_frame(&mut pkt, 0, 250, 0, b"x");
+    put_msg_frame(
+        &mut pkt,
+        0,
+        Some(wire::Part {
+            offset: 0,
+            last: false,
+        }),
+        b"x",
+    );
+    put_msg_frame(
+        &mut pkt,
+        0,
+        Some(wire::Part {
+            offset: 3999,
+            last: true,
+        }),
+        b"y",
+    );
     keys.seal(&mut pkt, header_len(0), 0).unwrap();
     b.handle_packet(L, &pkt, t(1));
     let at = b.next_timeout().unwrap();
@@ -768,4 +785,140 @@ fn not_a_point() -> PublicKey {
         })
         .find(|k| ed25519_dalek::VerifyingKey::from_bytes(&k.0).is_err())
         .unwrap()
+}
+
+/// Delivers every packet from `from` to `to` except those `drop` selects
+/// (by position), and returns how many were sent.
+fn deliver_except(from: &mut E, to: &mut E, now: Timestamp, drop: impl Fn(usize) -> bool) -> usize {
+    let pkts = drain_tx(from, now);
+    for (i, p) in pkts.iter().enumerate() {
+        if !drop(i) {
+            to.handle_packet(L, p, now);
+        }
+    }
+    pkts.len()
+}
+
+/// Runs A→B traffic with every third A packet lost until B has reported
+/// loss and A has turned FEC on. Returns the engines and A's conversation.
+fn lossy_until_fec() -> (E, E, ConversationId) {
+    let (mut a, ca) = engine(A, B, 128);
+    let (mut b, cb) = engine(B, A, 128);
+    let mut n = 0usize;
+    let mut now = 0;
+    while a
+        .contact_status(ca)
+        .unwrap()
+        .loss_out_permille
+        .is_none_or(|p| p < 20)
+    {
+        a.send_text(ca, "tick", t(now)).unwrap();
+        let sent = drain_tx(&mut a, t(now));
+        for p in &sent {
+            n += 1;
+            if !n.is_multiple_of(3) {
+                b.handle_packet(L, p, t(now));
+            }
+        }
+        let at = b.next_timeout().unwrap_or(t(now)).max(t(now));
+        deliver(&mut a, &drain_tx(&mut b, at), at);
+        drain_events(&mut a);
+        drain_events(&mut b);
+        now = at.as_millis() + 1000;
+        assert!(now < 3_600_000, "FEC never activated");
+    }
+    let _ = cb;
+    (a, b, ca)
+}
+
+#[test]
+fn loss_reports_turn_fec_on_and_repairs_recover_without_retransmission() {
+    let (mut a, mut b, ca) = lossy_until_fec();
+    let st = b.contact_status(b.contacts().next().unwrap().0).unwrap();
+    assert!(st.loss_in_permille.is_some_and(|p| p > 200), "{st:?}");
+    // Two packet-sized messages share a window (k = 2 earns 1.5 repairs of
+    // credit at ~33% loss). The first source is lost; the XOR repair and the
+    // second source recover it.
+    let before = b.stats().fec_recovered;
+    let now = 10_000_000;
+    let q = a.send_text(ca, &"saved by FEC ".repeat(6), t(now)).unwrap();
+    a.send_text(ca, &"second source ".repeat(6), t(now))
+        .unwrap();
+    let sent = deliver_except(&mut a, &mut b, t(now), |i| i == 0);
+    assert_eq!(sent, 2, "one packet per message");
+    let flush = a.next_timeout().unwrap();
+    assert!(
+        flush <= t(now + a.config().fec_flush_ms),
+        "window flush timer"
+    );
+    let sent = deliver_except(&mut a, &mut b, flush, |_| false);
+    assert!(sent >= 1, "repair sent at window close");
+    let got = drain_events(&mut b);
+    assert!(
+        got.iter()
+            .any(|e| matches!(e, Event::MessageReceived(m) if m.id == q.id)),
+        "{got:?}"
+    );
+    assert_eq!(b.stats().fec_recovered, before + 1);
+    assert!(a.stats().fec_repairs_sent > 0);
+}
+
+#[test]
+fn fec_stays_off_on_budget_poor_links_and_in_backoff() {
+    // A 1%-duty LoRa-like link: one MTU packet costs ~37 s of budget.
+    let lora = LinkConfig {
+        mtu: 51,
+        budget: LinkBudget::DutyCycle {
+            permille: 10,
+            window_ms: 3_600_000,
+            airtime: AirtimeModel {
+                per_packet_us: 160_000,
+                per_byte_us: 4_100,
+            },
+        },
+        cost: 1,
+    };
+    let mut a = Engine::new(Config::default(), id(A), MemoryStorage::new(), rng(A)).unwrap();
+    a.add_link(L, lora).unwrap();
+    let ca = a.add_contact(pk(B)).unwrap();
+    let (mut b, _) = engine(B, A, 51);
+    // B claims 50% loss.
+    let keys = PairKeys::derive(&id(B), &pk(A)).unwrap();
+    let mut pkt = Vec::new();
+    begin_packet(&mut pkt, keys.tx_tag, 0);
+    wire::put_loss_frame(&mut pkt, 500);
+    keys.seal(&mut pkt, header_len(0), 0).unwrap();
+    a.handle_packet(L, &pkt, t(0));
+    assert_eq!(a.contact_status(ca).unwrap().loss_out_permille, Some(500));
+    for i in 0..5 {
+        a.send_text(ca, "x", t(i)).unwrap();
+        drain_tx(&mut a, t(i));
+    }
+    drain_tx(&mut a, t(10_000));
+    assert_eq!(a.stats().fec_sources, 0);
+    assert_eq!(a.stats().fec_repairs_sent, 0);
+    let _ = &mut b;
+
+    // On a rich link, backoff suspends FEC too.
+    let (mut a, _b, ca) = lossy_until_fec();
+    let now = 20_000_000;
+    a.send_text(ca, "into the void", t(now)).unwrap();
+    drain_tx(&mut a, t(now));
+    // Nothing comes back: retransmission timers fire into silence.
+    let mut at = a.next_timeout().unwrap();
+    for _ in 0..3 {
+        drain_tx(&mut a, at);
+        at = a.next_timeout().unwrap();
+    }
+    assert!(a.contact_status(ca).unwrap().unreachable);
+    let repairs = a.stats().fec_repairs_sent;
+    for _ in 0..5 {
+        drain_tx(&mut a, at);
+        at = a.next_timeout().unwrap();
+    }
+    assert_eq!(
+        a.stats().fec_repairs_sent,
+        repairs,
+        "no repairs into an outage"
+    );
 }

@@ -183,8 +183,17 @@ impl Scenario {
         sc
     }
 
+    /// `disaster_cellular`'s bursty ~35% loss, heavy-tailed delay and
+    /// corruption, but no outages: the case FEC is for.
+    pub fn bursty_loss(seed: u64) -> Self {
+        let mut sc = Self::new(Profile::DisasterCellular, seed);
+        sc.name = "bursty_loss".to_string();
+        sc.link.outage = None;
+        sc
+    }
+
     /// Scenario names accepted by [`Scenario::named`].
-    pub const NAMES: [&'static str; 8] = [
+    pub const NAMES: [&'static str; 9] = [
         "clean",
         "geo_satellite",
         "edge_2g",
@@ -193,6 +202,7 @@ impl Scenario {
         "harsh_64",
         "harsh_64_crashy",
         "disaster_hostile",
+        "bursty_loss",
     ];
 
     /// A profile's default scenario, or one of the stress scenarios.
@@ -201,6 +211,7 @@ impl Scenario {
             "harsh_64" => Some(Self::harsh_64(seed)),
             "harsh_64_crashy" => Some(Self::harsh_64_crashy(seed)),
             "disaster_hostile" => Some(Self::disaster_hostile(seed)),
+            "bursty_loss" => Some(Self::bursty_loss(seed)),
             _ => Profile::from_name(name).map(|p| Self::new(p, seed)),
         }
     }
@@ -381,7 +392,13 @@ pub fn add_stats(a: &Stats, b: &Stats) -> Stats {
         acks_sent,
         frag_acks_sent,
         rtt_samples,
-        storage_errors
+        storage_errors,
+        fec_sources,
+        fec_repairs_sent,
+        fec_repairs_dropped,
+        fec_repairs_received,
+        fec_recovered,
+        loss_reports_sent
     )
 }
 

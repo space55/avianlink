@@ -4,7 +4,7 @@
 use avianlink_core::wire::{
     self, decode_record, encode_record, frame_space, msg_frame_len, plan_fragments, put_ack_frame,
     put_frag_ack_frame, put_msg_frame, put_varint, record_len, AckFrame, FragAckFrame, Frame,
-    Frames, MsgFrame, Reader, Record,
+    Frames, MsgFrame, Part, Reader, Record,
 };
 use proptest::prelude::*;
 
@@ -48,26 +48,25 @@ proptest! {
         let mut out = Vec::new();
         for f in &frames {
             match f {
-                OwnedFrame::Msg { seq, count, index, data } =>
-                    put_msg_frame(&mut out, *seq, *count, *index, data),
+                OwnedFrame::Msg { seq, part, data } => put_msg_frame(&mut out, *seq, *part, data),
                 OwnedFrame::Ack { cum, largest, delay, bitmap } =>
                     put_ack_frame(&mut out, *cum, *largest, *delay, bitmap),
-                OwnedFrame::FragAck { seq, count, bitmap } =>
-                    put_frag_ack_frame(&mut out, *seq, *count, bitmap),
+                OwnedFrame::FragAck { seq, unit, bitmap } =>
+                    put_frag_ack_frame(&mut out, *seq, *unit, bitmap),
             }
         }
         let parsed: Vec<Frame<'_>> = Frames::new(&out).collect::<Result<_, _>>().unwrap();
         prop_assert_eq!(parsed.len(), frames.len());
         for (p, f) in parsed.iter().zip(&frames) {
             let expected = match f {
-                OwnedFrame::Msg { seq, count, index, data } => Frame::Msg(MsgFrame {
-                    seq: *seq, count: *count, index: if *count > 1 { *index } else { 0 }, data,
+                OwnedFrame::Msg { seq, part, data } => Frame::Msg(MsgFrame {
+                    seq: *seq, part: *part, data,
                 }),
                 OwnedFrame::Ack { cum, largest, delay, bitmap } => Frame::Ack(AckFrame {
                     cum: *cum, largest: *largest, ack_delay: *delay, bitmap,
                 }),
-                OwnedFrame::FragAck { seq, count, bitmap } => Frame::FragAck(FragAckFrame {
-                    seq: *seq, count: *count, bitmap,
+                OwnedFrame::FragAck { seq, unit, bitmap } => Frame::FragAck(FragAckFrame {
+                    seq: *seq, unit: *unit, bitmap,
                 }),
             };
             prop_assert_eq!(*p, expected);
@@ -96,7 +95,7 @@ proptest! {
             let r = plan.range(i, len);
             prop_assert_eq!(r.start, covered);
             prop_assert!(!r.is_empty());
-            prop_assert!(msg_frame_len(seq, plan.count, i, r.len()) <= space);
+            prop_assert!(msg_frame_len(seq, plan.part(i, len), r.len()) <= space);
             covered = r.end;
         }
         prop_assert_eq!(covered, len);
@@ -107,8 +106,7 @@ proptest! {
 enum OwnedFrame {
     Msg {
         seq: u64,
-        count: u64,
-        index: u64,
+        part: Option<Part>,
         data: Vec<u8>,
     },
     Ack {
@@ -119,25 +117,22 @@ enum OwnedFrame {
     },
     FragAck {
         seq: u64,
-        count: u64,
+        unit: u64,
         bitmap: Vec<u8>,
     },
 }
 
 fn arb_frame() -> impl Strategy<Value = OwnedFrame> {
+    let part = proptest::option::of(
+        (0u64..(1 << 62), any::<bool>()).prop_map(|(offset, last)| Part { offset, last }),
+    );
     prop_oneof![
         (
             any::<u64>(),
-            1u64..300,
-            any::<u64>(),
+            part,
             prop::collection::vec(any::<u8>(), 0..64)
         )
-            .prop_map(|(seq, count, index, data)| OwnedFrame::Msg {
-                seq,
-                count,
-                index,
-                data
-            }),
+            .prop_map(|(seq, part, data)| OwnedFrame::Msg { seq, part, data }),
         (
             any::<u64>(),
             any::<u64>(),
@@ -155,7 +150,7 @@ fn arb_frame() -> impl Strategy<Value = OwnedFrame> {
             any::<u64>(),
             prop::collection::vec(any::<u8>(), 0..16)
         )
-            .prop_map(|(seq, count, bitmap)| OwnedFrame::FragAck { seq, count, bitmap }),
+            .prop_map(|(seq, unit, bitmap)| OwnedFrame::FragAck { seq, unit, bitmap }),
     ]
 }
 
@@ -166,16 +161,20 @@ fn single_packet_text(space: usize) -> usize {
         .rev()
         .find(|&t| {
             let rec = 1 + 2 + 4 + t;
-            msg_frame_len(100, 1, 0, rec) <= space
+            msg_frame_len(100, None, rec) <= space
         })
         .unwrap_or(0)
 }
 
-/// Fragment payload per packet: seq < 128, fewer than 128 fragments.
+/// Fragment payload per packet: seq < 128, record of 128–16383 bytes.
 fn fragment_payload(space: usize) -> usize {
+    let part = Some(Part {
+        offset: 1000,
+        last: false,
+    });
     (0..space)
         .rev()
-        .find(|&d| msg_frame_len(100, 127, 126, d) <= space)
+        .find(|&d| msg_frame_len(100, part, d) <= space)
         .unwrap_or(0)
 }
 

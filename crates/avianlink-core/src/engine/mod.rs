@@ -1,3 +1,4 @@
+mod fec_rx;
 mod persist;
 mod state;
 
@@ -6,28 +7,31 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 use rand_core::CryptoRng;
 
-use crate::config::MAX_SEQ;
+use crate::config::{FecMode, MAX_SEQ};
 use crate::crypto::{Identity, PairKeys};
+use crate::fec;
 use crate::hash;
 use crate::pacer::Pacer;
 use crate::reassembly::{Insert, Reassembly};
 use crate::wire::{
     self, ack_frame_len, begin_packet, decode_record, encode_record, frag_ack_frame_len,
-    frame_space, header_len, msg_frame_len, plan_fragments, put_ack_frame, put_frag_ack_frame,
-    put_msg_frame, AckFrame, DecodeError, FragAckFrame, Frame, Frames, MsgFrame, PairTag, Record,
-    AEAD_TAG_LEN, TIMESTAMP_EPOCH_UNIX_SECS,
+    frame_space, header_len, loss_frame_len, msg_frame_len, plan_fragments, put_ack_frame,
+    put_frag_ack_frame, put_loss_frame, put_msg_frame, put_repair_frame, repair_frame_len,
+    AckFrame, DecodeError, FragAckFrame, Frame, Frames, MsgFrame, PairTag, Record, AEAD_TAG_LEN,
+    TIMESTAMP_EPOCH_UNIX_SECS,
 };
 use crate::{
     Config, ConversationId, Error, Event, LinkConfig, LinkId, MessageId, Packet, PublicKey,
     ReceivedMessage, Storage, Timestamp,
 };
+use fec_rx::{FecRx, Window};
 use persist::{
     contact_key, decode_event, decode_inbox, decode_outbox, decode_version, encode_event,
     encode_inbox, encode_outbox, event_key, inbox_key, outbox_key, parse_conv_key, parse_event_key,
     parse_outbox_key, version_record, ContactRecord, Op, KEY_VERSION, PREFIX_CONTACT, PREFIX_EVENT,
     PREFIX_INBOX, PREFIX_OUTBOX, SCHEMA,
 };
-use state::{Contact, FragState, OutMsg, Planned, Replay, Timers};
+use state::{Contact, FragState, OutMsg, Planned, RepairOut, Replay, Timers};
 
 /// A packet the host should send.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,6 +112,10 @@ pub struct ContactStatus {
     pub unreachable: bool,
     /// Undelivered outgoing messages to this contact.
     pub outbox_len: usize,
+    /// Loss we measure on packets from the contact, permille (before FEC).
+    pub loss_in_permille: Option<u64>,
+    /// Loss the contact reports on our packets, permille.
+    pub loss_out_permille: Option<u64>,
 }
 
 /// Diagnostic counters. All counters saturate.
@@ -163,6 +171,18 @@ pub struct Stats {
     pub rtt_samples: u64,
     /// Storage operations that failed (the triggering input was dropped).
     pub storage_errors: u64,
+    /// Packets added to an FEC window as sources.
+    pub fec_sources: u64,
+    /// REPAIR packets sent.
+    pub fec_repairs_sent: u64,
+    /// Repairs discarded because the link had no spare budget.
+    pub fec_repairs_dropped: u64,
+    /// REPAIR frames received.
+    pub fec_repairs_received: u64,
+    /// Lost packets reconstructed from repairs.
+    pub fec_recovered: u64,
+    /// LOSS frames sent.
+    pub loss_reports_sent: u64,
 }
 
 fn bump(c: &mut u64) {
@@ -221,6 +241,7 @@ pub struct Engine<S, R> {
     contacts: BTreeMap<ConversationId, Contact>,
     by_tag: BTreeMap<PairTag, Vec<ConversationId>>,
     reassembly: Reassembly,
+    fec_rx: FecRx,
     /// Pending events with their storage key number (`None`: transient).
     events: VecDeque<(Option<u64>, Event)>,
     next_event_key: u64,
@@ -369,8 +390,11 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             identity,
             reassembly: Reassembly::new(
                 usize_of(config.max_reassembly_bytes),
-                u64::from(config.max_fragments),
                 usize_of(config.max_record_len()),
+            ),
+            fec_rx: FecRx::new(
+                usize_of(config.max_fec_rx_bytes),
+                usize::from(config.max_fec_pending_repairs),
             ),
             config,
             local,
@@ -603,17 +627,73 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         if let Some(contact) = self.contacts.get_mut(&conv) {
             contact.route = Some(link);
             contact.heard(self.now, counter);
+            contact.arrivals.mark(counter);
+            contact.rx_since_report = contact.rx_since_report.saturating_add(1);
         }
-        for frame in Frames::new(&frames).flatten() {
+        // A repair packet carries only its REPAIR frame and is not a source.
+        if let Some(Ok(Frame::Repair(r))) = Frames::new(&frames).next() {
+            bump(&mut self.stats.fec_repairs_received);
+            if let Some(window) = self.fec_rx.add_repair(conv, &r) {
+                self.fec_recover(conv, alloc::vec![window]);
+            } else {
+                bump(&mut self.stats.frames_dropped_invalid);
+            }
+            return true;
+        }
+        self.fec_rx.store(conv, counter, &frames);
+        self.apply_frames(conv, &frames);
+        let windows = self.fec_rx.windows_with(conv, counter);
+        self.fec_recover(conv, windows);
+        true
+    }
+
+    /// Applies the frames of an authenticated (or FEC-recovered) packet.
+    fn apply_frames(&mut self, conv: ConversationId, frames: &[u8]) {
+        for frame in Frames::new(frames).flatten() {
             match frame {
                 Frame::Padding => {}
                 Frame::Unknown { .. } => bump(&mut self.stats.frames_unknown),
                 Frame::Msg(msg) => self.on_msg(conv, msg),
                 Frame::Ack(ack) => self.on_ack(conv, ack),
                 Frame::FragAck(fa) => self.on_frag_ack(conv, fa),
+                Frame::Loss(p) => {
+                    if let Some(c) = self.contacts.get_mut(&conv) {
+                        c.peer_loss = Some(p.min(1000));
+                    }
+                }
+                // Only valid as the sole frame of a packet.
+                Frame::Repair(_) => bump(&mut self.stats.frames_dropped_invalid),
             }
         }
-        true
+    }
+
+    /// Decodes the given windows and processes whatever they recover, which
+    /// may in turn complete further windows.
+    fn fec_recover(&mut self, conv: ConversationId, mut windows: Vec<Window>) {
+        let mut budget = usize::from(self.config.max_fec_pending_repairs);
+        while let Some(window) = windows.pop() {
+            if budget == 0 {
+                break;
+            }
+            budget = budget.saturating_sub(1);
+            for (counter, plain) in self.fec_rx.try_window(conv, window) {
+                let Some(contact) = self.contacts.get_mut(&conv) else {
+                    return;
+                };
+                if !contact.replay.fresh(counter) {
+                    continue;
+                }
+                if wire::validate_frames(&plain).is_err() {
+                    bump(&mut self.stats.packets_dropped_malformed);
+                    continue;
+                }
+                contact.replay.mark(counter);
+                bump(&mut self.stats.fec_recovered);
+                self.fec_rx.store(conv, counter, &plain);
+                self.apply_frames(conv, &plain);
+                windows.extend(self.fec_rx.windows_with(conv, counter));
+            }
+        }
     }
 
     fn on_msg(&mut self, conv: ConversationId, msg: MsgFrame<'_>) {
@@ -643,10 +723,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             bump(&mut self.stats.frames_dropped_backpressure);
             return;
         }
-        let record = match self
-            .reassembly
-            .insert(conv, msg.seq, msg.count, msg.index, msg.data)
-        {
+        let record = match self.reassembly.insert(conv, msg.seq, msg.part, msg.data) {
             Insert::Incomplete => {
                 contact.frag_ack_pending.insert(msg.seq);
                 schedule_ack(contact);
@@ -772,19 +849,38 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
 
     fn on_frag_ack(&mut self, conv: ConversationId, fa: FragAckFrame<'_>) {
         let now = self.now;
-        let Some(planned) = self
+        let Ok(unit) = usize::try_from(fa.unit) else {
+            return;
+        };
+        let Some(msg) = self
             .contacts
             .get_mut(&conv)
             .and_then(|c| c.outbox.get_mut(&fa.seq))
-            .and_then(|m| m.plan.as_mut())
         else {
             return;
         };
-        if planned.plan.count != fa.count {
+        let len = msg.record.len();
+        let Some(planned) = msg.plan.as_mut() else {
+            return;
+        };
+        if unit == 0 {
             return;
         }
+        let plan = planned.plan;
+        // Fragment [a, b) is held when every block it touches is (wire §3.3).
         for (i, f) in (0u64..).zip(planned.frags.iter_mut()) {
-            if fa.has(i) && f.held_at.is_none() {
+            let r = plan.range(i, len);
+            if r.is_empty() || f.held_at.is_some() {
+                continue;
+            }
+            let (Some(first), Some(last)) = (
+                r.start.checked_div(unit),
+                r.end.saturating_sub(1).checked_div(unit),
+            ) else {
+                continue;
+            };
+            let held = (first..=last).all(|k| fa.has(u64::try_from(k).unwrap_or(u64::MAX)));
+            if held {
                 f.held_at = Some(now);
             }
         }
@@ -844,9 +940,10 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
                 .collect(),
             None => self.contacts.keys().copied().collect(),
         };
-        for data_pass in [true, false] {
+        self.fec_tick();
+        for pass in [Pass::Data, Pass::Repair, Pass::Ack] {
             for &conv in &order {
-                if let Some(tx) = self.try_transmit(conv, data_pass) {
+                if let Some(tx) = self.try_transmit(conv, pass) {
                     return Some(tx);
                 }
             }
@@ -854,16 +951,76 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         None
     }
 
-    fn try_transmit(&mut self, conv: ConversationId, data_pass: bool) -> Option<Transmit> {
+    /// Whether outgoing traffic to `c` is FEC-coded right now.
+    fn fec_on(&self, c: &Contact) -> bool {
+        fec_enabled(&self.config, c) && self.fec_link_ok(c)
+    }
+
+    /// Whether `c`'s link has the budget for redundancy.
+    fn fec_link_ok(&self, c: &Contact) -> bool {
+        self.route_of(c)
+            .and_then(|l| self.links.get(&l))
+            .is_some_and(|l| {
+                Pacer::packet_cost_ms(&l.config.budget, l.config.mtu)
+                    <= self.config.fec_max_packet_cost_ms
+            })
+    }
+
+    /// Closes FEC windows that are full or have waited `fec_flush_ms`, and
+    /// drops FEC state for contacts where FEC is off (e.g. in backoff).
+    fn fec_tick(&mut self) {
+        let now = self.now;
+        let cfg = self.config;
+        let link_ok: Vec<(ConversationId, bool)> = self
+            .contacts
+            .iter()
+            .map(|(k, c)| (*k, self.fec_link_ok(c)))
+            .collect();
+        for (k, ok) in link_ok {
+            let Some(c) = self.contacts.get_mut(&k) else {
+                continue;
+            };
+            if !ok || !fec_enabled(&cfg, c) {
+                c.fec_tx.sources.clear();
+                c.fec_tx.pending.clear();
+                continue;
+            }
+            let full = c.fec_tx.sources.len() >= usize::from(cfg.fec_max_sources);
+            let due = c.fec_tx.opened.saturating_add_millis(cfg.fec_flush_ms) <= now;
+            if !c.fec_tx.sources.is_empty() && (full || due) {
+                close_fec_window(c, cfg.fec);
+            }
+        }
+    }
+
+    /// When FEC wants attention for `c`: a pending repair, or a window
+    /// waiting to close.
+    fn fec_due(&self, c: &Contact) -> Option<Timestamp> {
+        if !self.fec_on(c) {
+            return None;
+        }
+        if !c.fec_tx.pending.is_empty() {
+            return Some(self.now);
+        }
+        (!c.fec_tx.sources.is_empty()).then(|| {
+            c.fec_tx
+                .opened
+                .saturating_add_millis(self.config.fec_flush_ms)
+        })
+    }
+
+    fn try_transmit(&mut self, conv: ConversationId, pass: Pass) -> Option<Transmit> {
         let now = self.now;
         let min_space = self.min_frame_space()?;
+        let min_mtu = self.links.values().map(|l| l.config.mtu).min()?;
         let default_link = self.default_link()?;
         let contact = self.contacts.get(&conv)?;
         let timers = self.timers(contact);
-        let due = if data_pass {
-            contact.data_due(timers)
-        } else {
-            contact.ack_due
+        let fec = self.fec_on(contact);
+        let due = match pass {
+            Pass::Data => contact.data_due(timers),
+            Pass::Repair => (fec && !contact.fec_tx.pending.is_empty()).then_some(now),
+            Pass::Ack => contact.ack_due,
         };
         if due.is_none_or(|t| t > now) {
             return None;
@@ -877,29 +1034,60 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         if link.pacer.ready_at(now, mtu) > now {
             return None;
         }
+        // Repairs only use spare budget: if sending one would leave no room
+        // for an MTU-sized packet right after, the link is busy with data and
+        // redundancy would only delay it. Such repairs are dropped; the
+        // retransmission timer covers any loss.
+        if pass == Pass::Repair && link.pacer.ready_at(now, mtu.saturating_mul(2)) > now {
+            let dropped = self.contacts.get_mut(&conv).map_or(0, |c| {
+                let n = c.fec_tx.pending.len();
+                c.fec_tx.pending.clear();
+                n
+            });
+            self.stats.fec_repairs_dropped = self
+                .stats
+                .fec_repairs_dropped
+                .saturating_add(u64_of(dropped));
+            return None;
+        }
         self.reserve_counter(conv)?;
 
+        let counter = self.contacts.get(&conv)?.tx_counter;
+        let fec_cap = fec.then(|| fec_symbol_cap(usize::from(mtu), counter));
+        let plan_space = if fec {
+            min_space.min(fec_symbol_cap(usize::from(min_mtu), counter))
+        } else {
+            min_space
+        };
         let ctx = BuildCtx {
             conv,
             mtu: usize::from(mtu),
             min_space,
+            plan_space,
+            fec_cap,
+            fec_mode: self.config.fec,
+            fec_max_sources: usize::from(self.config.fec_max_sources),
             now,
             timers,
-            data: data_pass,
+            data: pass == Pass::Data,
             max_ack_bitmap: usize::from(self.config.max_ack_bitmap_bytes),
             max_frag_acks: usize::from(self.config.max_frag_acks_per_packet),
         };
         let contact = self.contacts.get_mut(&conv)?;
         let counter = contact.tx_counter;
         let mut announced = Vec::new();
-        let bytes = build_packet(
-            contact,
-            &ctx,
-            &self.reassembly,
-            &mut self.rng,
-            &mut self.stats,
-            &mut announced,
-        )?;
+        let bytes = if pass == Pass::Repair {
+            build_repair(contact, &ctx, &mut self.stats)?
+        } else {
+            build_packet(
+                contact,
+                &ctx,
+                &self.reassembly,
+                &mut self.rng,
+                &mut self.stats,
+                &mut announced,
+            )?
+        };
         let room = usize_of(self.config.max_pending_events).saturating_sub(self.events.len());
         self.events
             .extend(announced.into_iter().take(room).map(|id| {
@@ -971,7 +1159,10 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         self.contacts
             .values()
             .filter_map(|c| {
-                let work = c.next_work(self.timers(c))?;
+                let work = match (c.next_work(self.timers(c)), self.fec_due(c)) {
+                    (Some(a), Some(b)) => a.min(b),
+                    (a, b) => a.or(b)?,
+                };
                 let link_id = c
                     .route
                     .filter(|l| self.links.contains_key(l))
@@ -1012,6 +1203,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             }
         }
         self.reassembly.discard_conversation(conversation);
+        self.fec_rx.discard_conversation(conversation);
         self.outbox_len = self.outbox_len.saturating_sub(contact.outbox.len());
         if self.last_served == Some(conversation) {
             self.last_served = None;
@@ -1067,6 +1259,8 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             rto_ms: self.timers(c).rto,
             unreachable: c.backoff > 0,
             outbox_len: c.outbox.len(),
+            loss_in_permille: c.arrivals.loss_permille(),
+            loss_out_permille: c.peer_loss,
         })
     }
 
@@ -1115,10 +1309,114 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
     }
 }
 
+/// Transmit passes, in priority order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pass {
+    Data,
+    Repair,
+    Ack,
+}
+
+fn fec_enabled(cfg: &Config, c: &Contact) -> bool {
+    cfg.fec != FecMode::Off
+        && c.backoff == 0
+        && c.peer_loss
+            .is_some_and(|p| p >= u64::from(cfg.fec_min_loss_permille))
+}
+
+/// Largest plaintext that can be a source: a REPAIR frame carrying it
+/// (with a base near `counter` and a 16-bit mask) must fit a worst-case
+/// packet on a link with this MTU.
+fn fec_symbol_cap(mtu: usize, counter: u64) -> usize {
+    let space = frame_space(mtu);
+    let overhead =
+        repair_frame_len(counter.saturating_add(64), 0xffff, space).saturating_sub(space);
+    space.saturating_sub(overhead)
+}
+
+/// Turns the current window into repairs.
+fn close_fec_window(c: &mut Contact, mode: FecMode) {
+    let sources = core::mem::take(&mut c.fec_tx.sources);
+    let Some(&(base, _)) = sources.first() else {
+        return;
+    };
+    let k = sources.len();
+    // Each window accrues its expected repair need; whole repairs are sent
+    // when the credit covers them, so sparse, lightly lossy traffic does not
+    // pay a full duplicate per lone packet (D-038).
+    let loss = c.peer_loss.unwrap_or(0);
+    c.fec_tx.credit = c
+        .fec_tx
+        .credit
+        .saturating_add(fec::repair_credit(k, loss))
+        .min(2000u64.saturating_mul(u64::try_from(k).unwrap_or(0)));
+    let whole = usize::try_from(c.fec_tx.credit / 1000).unwrap_or(0);
+    let m = match mode {
+        FecMode::Off => 0,
+        FecMode::Xor => whole.min(1),
+        FecMode::ReedSolomon => whole.min(k),
+    };
+    c.fec_tx.credit = c
+        .fec_tx
+        .credit
+        .saturating_sub(u64::try_from(m).unwrap_or(0).saturating_mul(1000));
+    if m == 0 {
+        return;
+    }
+    let mask = sources.iter().fold(0u64, |m, &(ctr, _)| {
+        m | ctr
+            .checked_sub(base)
+            .filter(|&d| d < 16)
+            .map_or(0, |d| 1u64 << d)
+    });
+    let refs: Vec<&[u8]> = sources.iter().map(|(_, s)| &s[..]).collect();
+    let shape_m = u8::try_from(m.saturating_sub(1)).unwrap_or(0) << 4;
+    for (j, data) in fec::encode(&refs, m).into_iter().enumerate() {
+        let shape = shape_m | u8::try_from(j).unwrap_or(0) & 0x0f;
+        c.fec_tx.pending.push_back(RepairOut {
+            base,
+            mask,
+            shape,
+            data,
+        });
+    }
+    while c.fec_tx.pending.len() > 2 * fec::MAX_SOURCES {
+        c.fec_tx.pending.pop_front();
+    }
+}
+
+/// Builds a REPAIR-only packet from the contact's oldest pending repair.
+/// Repairs that no longer fit (the counter grew too much) are dropped.
+fn build_repair(contact: &mut Contact, ctx: &BuildCtx, stats: &mut Stats) -> Option<Vec<u8>> {
+    let r = contact.fec_tx.pending.pop_front()?;
+    let counter = contact.tx_counter;
+    let mut out = Vec::with_capacity(ctx.mtu);
+    begin_packet(&mut out, contact.keys.tx_tag, counter);
+    let limit = ctx.mtu.saturating_sub(AEAD_TAG_LEN);
+    if out
+        .len()
+        .saturating_add(repair_frame_len(r.base, r.mask, r.data.len()))
+        > limit
+    {
+        return None;
+    }
+    put_repair_frame(&mut out, r.base, r.mask, r.shape, &r.data);
+    contact.keys.seal(&mut out, header_len(counter), counter)?;
+    contact.tx_counter = counter.saturating_add(1);
+    bump(&mut stats.fec_repairs_sent);
+    Some(out)
+}
+
 struct BuildCtx {
     conv: ConversationId,
     mtu: usize,
     min_space: usize,
+    /// Frame space for new fragment plans (smaller while FEC is on).
+    plan_space: usize,
+    /// While FEC is on: the largest plaintext that can be a source.
+    fec_cap: Option<usize>,
+    fec_mode: FecMode,
+    fec_max_sources: usize,
     now: Timestamp,
     timers: Timers,
     /// Whether data may be included (false: ACK-only pass).
@@ -1139,10 +1437,17 @@ fn build_packet<R: CryptoRng>(
     announced: &mut Vec<MessageId>,
 ) -> Option<Vec<u8>> {
     let now = ctx.now;
-    let limit = ctx.mtu.saturating_sub(AEAD_TAG_LEN);
+    let hard = ctx.mtu.saturating_sub(AEAD_TAG_LEN);
     let mut out = Vec::with_capacity(ctx.mtu);
     let counter = contact.tx_counter;
     begin_packet(&mut out, contact.keys.tx_tag, counter);
+    let hlen = out.len();
+    // While FEC is on, pack only up to what a repair can carry, so the
+    // packet can be a source. A fragment planned before FEC turned on may
+    // still exceed that; `write_data` lets it through alone (uncoded).
+    let limit = ctx
+        .fec_cap
+        .map_or(hard, |cap| hard.min(hlen.saturating_add(cap)));
     let mut wrote = false;
 
     if contact.ack_due.is_some() {
@@ -1160,6 +1465,14 @@ fn build_packet<R: CryptoRng>(
             contact.ack_due = None;
             bump(&mut stats.acks_sent);
             wrote = true;
+            if let Some(loss) = contact.loss_report_due() {
+                if out.len().saturating_add(loss_frame_len(loss)) <= limit {
+                    put_loss_frame(&mut out, loss);
+                    contact.loss_reported = Some(loss);
+                    contact.rx_since_report = 0;
+                    bump(&mut stats.loss_reports_sent);
+                }
+            }
         }
         let pending: Vec<u64> = contact.frag_ack_pending.iter().copied().collect();
         let mut sent = 0usize;
@@ -1196,11 +1509,32 @@ fn build_packet<R: CryptoRng>(
     }
 
     if ctx.data && !contact.outbox.is_empty() {
-        wrote |= write_data(contact, ctx, &mut out, limit, rng, stats, announced);
+        wrote |= write_data(contact, ctx, &mut out, limit, hard, rng, stats, announced);
     }
 
     if !wrote {
         return None;
+    }
+    if let (Some(cap), Some(plain)) = (ctx.fec_cap, out.get(hlen..)) {
+        if plain.len() <= cap {
+            let window = &mut contact.fec_tx;
+            if window
+                .sources
+                .first()
+                .is_some_and(|&(base, _)| counter.saturating_sub(base) >= 16)
+            {
+                close_fec_window(contact, ctx.fec_mode);
+            }
+            let window = &mut contact.fec_tx;
+            if window.sources.is_empty() {
+                window.opened = now;
+            }
+            window.sources.push((counter, plain.to_vec()));
+            bump(&mut stats.fec_sources);
+            if window.sources.len() >= ctx.fec_max_sources {
+                close_fec_window(contact, ctx.fec_mode);
+            }
+        }
     }
     contact.keys.seal(&mut out, header_len(counter), counter)?;
     contact.tx_counter = counter.saturating_add(1);
@@ -1208,11 +1542,13 @@ fn build_packet<R: CryptoRng>(
 }
 
 /// Writes due fragments into `out`. Returns whether any were written.
+#[allow(clippy::too_many_arguments)]
 fn write_data<R: CryptoRng>(
     contact: &mut Contact,
     ctx: &BuildCtx,
     out: &mut Vec<u8>,
     limit: usize,
+    hard: usize,
     rng: &mut R,
     stats: &mut Stats,
     announced: &mut Vec<MessageId>,
@@ -1225,7 +1561,7 @@ fn write_data<R: CryptoRng>(
         if msg.plan.as_ref().is_some_and(|p| p.space <= ctx.min_space) {
             continue;
         }
-        let Some(plan) = plan_fragments(ctx.min_space, seq, msg.record.len()) else {
+        let Some(plan) = plan_fragments(ctx.plan_space, seq, msg.record.len()) else {
             continue;
         };
         let count = usize::try_from(plan.count).unwrap_or(0);
@@ -1295,11 +1631,13 @@ fn write_data<R: CryptoRng>(
         let Some(data) = msg.record.get(plan.range(index, msg.record.len())) else {
             continue;
         };
-        if out
-            .len()
-            .saturating_add(msg_frame_len(seq, plan.count, index, data.len()))
-            > limit
-        {
+        let part = plan.part(index, msg.record.len());
+        let flen = msg_frame_len(seq, part, data.len());
+        let end = out.len().saturating_add(flen);
+        // A frame that cannot fit `limit` even alone (planned before FEC
+        // turned on) may use the hard limit; that packet is not coded.
+        let oversize = flen > limit.saturating_sub(header_len(contact.tx_counter));
+        if end > limit && !(oversize && end <= hard) {
             continue;
         }
         let Some(frag) = usize::try_from(index)
@@ -1308,7 +1646,7 @@ fn write_data<R: CryptoRng>(
         else {
             continue;
         };
-        put_msg_frame(out, seq, plan.count, index, data);
+        put_msg_frame(out, seq, part, data);
         wrote = true;
         if !msg.announced {
             msg.announced = true;

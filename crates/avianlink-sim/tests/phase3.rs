@@ -1,5 +1,6 @@
 //! Phase 3 acceptance scenarios.
 
+use avianlink_core::FecMode;
 use avianlink_sim::{Adversary, Profile, Report, Scenario};
 
 fn assert_clean(r: &Report) {
@@ -46,16 +47,21 @@ fn on_path_attacker_achieves_nothing() {
 /// Done-criterion, part 2: Phase 2 metrics regress by no more than the
 /// documented header overhead (`wire-format.md` §6: +12 bytes per packet,
 /// and correspondingly smaller fragments at small MTUs). Phase 2 values
-/// are seed-1 results recorded before the switch (commit 895c3ff).
+/// are seed-1 results recorded before the switch (commit 895c3ff). FEC
+/// (Phase 4) is off here: this measures header overhead alone.
 #[test]
 fn regression_matches_documented_overhead() {
+    let no_fec = |mut sc: Scenario| {
+        sc.config.fec = FecMode::Off;
+        sc
+    };
     const PAYLOAD: f64 = 100_305.0; // seed-1 workload, identical across phases
     let tolerance = 1.02; // Phase 2 ratios were recorded to 2 decimals
     for (profile, p2_wire_per_payload, p2_pkts_per_msg) in [
         (Profile::Edge2g, 1.89, 2.60),
         (Profile::DisasterCellular, 4.99, 4.30),
     ] {
-        let r = Scenario::new(profile, 1).run();
+        let r = no_fec(Scenario::new(profile, 1)).run();
         assert_clean(&r);
         assert_eq!(r.payload_bytes as f64, PAYLOAD);
         let p2_wire = p2_wire_per_payload * PAYLOAD;
@@ -73,7 +79,7 @@ fn regression_matches_documented_overhead() {
         (Scenario::new(Profile::LoraLike, 1), 8.52, 33.0 / 21.0),
         (Scenario::harsh_64(1), 11.69, 46.0 / 34.0),
     ] {
-        let r = sc.run();
+        let r = no_fec(sc).run();
         assert_clean(&r);
         let allowed = p2_pkts_per_msg * r.messages as f64 * ratio * tolerance;
         assert!(
