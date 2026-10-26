@@ -130,6 +130,21 @@ impl Reassembly {
         }
     }
 
+    /// Fragments held for `(conv, seq)`: the fragment count and a bitmap
+    /// (bit `i` = fragment `i`), for a FRAG_ACK.
+    pub(crate) fn held(&self, conv: ConversationId, seq: u64) -> Option<(u64, Vec<u8>)> {
+        let p = self.partials.get(&(conv, seq))?;
+        let bytes = usize::try_from(p.count.div_ceil(8)).ok()?;
+        let mut bitmap = alloc::vec![0u8; bytes];
+        for &i in p.frags.keys() {
+            let i = usize::try_from(i).ok()?;
+            if let Some(b) = bitmap.get_mut(i / 8) {
+                *b |= 1u8 << (i % 8);
+            }
+        }
+        Some((p.count, bitmap))
+    }
+
     fn remove(&mut self, key: &(ConversationId, u64)) -> Option<Partial> {
         let p = self.partials.remove(key)?;
         self.total_bytes = self.total_bytes.saturating_sub(p.bytes);
@@ -160,6 +175,7 @@ impl Reassembly {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     const C: ConversationId = ConversationId([1; 16]);
 
@@ -168,12 +184,14 @@ mod tests {
         let mut r = Reassembly::new(10_000, 16, 1000);
         assert_eq!(r.insert(C, 0, 3, 2, b"ef"), Insert::Incomplete);
         assert_eq!(r.insert(C, 0, 3, 0, b"ab"), Insert::Incomplete);
+        assert_eq!(r.held(C, 0), Some((3, vec![0b101])));
         assert_eq!(r.insert(C, 0, 3, 0, b"ab"), Insert::Incomplete);
         assert_eq!(
             r.insert(C, 0, 3, 1, b"cd"),
             Insert::Complete(b"abcdef".to_vec())
         );
         assert_eq!(r.total_bytes(), 0);
+        assert_eq!(r.held(C, 0), None);
     }
 
     #[test]

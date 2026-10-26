@@ -12,8 +12,9 @@ mod varint;
 use core::fmt;
 
 pub use frame::{
-    ack_frame_len, msg_frame_len, put_ack_frame, put_msg_frame, validate_frames, AckFrame, Frame,
-    Frames, MsgFrame, FRAME_ACK, FRAME_MSG, FRAME_PADDING,
+    ack_frame_len, frag_ack_frame_len, msg_frame_len, put_ack_frame, put_frag_ack_frame,
+    put_msg_frame, validate_frames, AckFrame, FragAckFrame, Frame, Frames, MsgFrame, FRAME_ACK,
+    FRAME_FRAG_ACK, FRAME_MSG, FRAME_PADDING,
 };
 pub use packet::{
     begin_packet, header_len, peek_tag, seal_packet, split_verified, verify_check, PairTag,

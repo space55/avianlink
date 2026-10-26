@@ -34,9 +34,29 @@ pub struct Config {
     /// Duty-cycle log entries per link. When full, the link is out of
     /// budget until the oldest entry ages out.
     pub max_duty_log_entries: u32,
-    /// Fixed retransmission interval (Phase 1; adaptive in Phase 2). Each
-    /// retransmission adds up to 25% random jitter.
-    pub retransmit_interval_ms: u64,
+    /// Retransmission timeout before the first RTT sample.
+    pub initial_rto_ms: u64,
+    /// Lower bound on the adaptive retransmission timeout.
+    pub min_rto_ms: u64,
+    /// Upper bound on the retransmission timeout and on the backoff probe
+    /// interval: an unreachable peer is probed at least this often, forever,
+    /// unless the link's budget demands slower probing
+    /// (`docs/reliability.md` §3).
+    pub max_rto_ms: u64,
+    /// RTO = SRTT + this × RTTVAR. RFC 6298 uses 4; the default 2 suits
+    /// heavy-tailed delay, where 4 inflates the RTO toward its cap (D-028).
+    pub rttvar_multiplier: u8,
+    /// Probes to an unreachable peer sent at the plain RTO before the
+    /// interval starts doubling.
+    pub backoff_grace: u8,
+    /// Packet send times remembered per contact for RTT sampling. ACKs for
+    /// older packets yield no sample.
+    pub max_sent_log: u16,
+    /// FRAG_ACK frames per packet, at most.
+    pub max_frag_acks_per_packet: u8,
+    /// Packet counters reserved in storage per write; a restored engine
+    /// skips to the reservation, so counters never repeat.
+    pub counter_reservation: u32,
     /// How long an ACK may wait for a data packet to piggyback on.
     pub ack_delay_ms: u64,
     /// Whether `now` is Unix-epoch wall-clock time. If false, messages carry
@@ -57,7 +77,14 @@ impl Default for Config {
             max_reorder_window: 4096,
             max_ack_bitmap_bytes: 32,
             max_duty_log_entries: 1024,
-            retransmit_interval_ms: 4_000,
+            initial_rto_ms: 3_000,
+            min_rto_ms: 1_000,
+            max_rto_ms: 30_000,
+            rttvar_multiplier: 2,
+            backoff_grace: 2,
+            max_sent_log: 256,
+            max_frag_acks_per_packet: 2,
+            counter_reservation: 1024,
             ack_delay_ms: 100,
             wall_clock: true,
         }
@@ -78,7 +105,11 @@ impl Config {
             || self.max_fragments == 0
             || self.max_reorder_window == 0
             || self.max_duty_log_entries == 0
-            || self.retransmit_interval_ms == 0
+            || self.min_rto_ms == 0
+            || self.min_rto_ms > self.max_rto_ms
+            || self.initial_rto_ms == 0
+            || self.max_sent_log == 0
+            || self.counter_reservation == 0
         {
             return Err(Error::InvalidConfig);
         }

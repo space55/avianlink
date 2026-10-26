@@ -3,7 +3,8 @@
 
 use avianlink_core::wire::{
     self, decode_record, encode_record, frame_space, msg_frame_len, plan_fragments, put_ack_frame,
-    put_msg_frame, put_varint, record_len, AckFrame, Frame, Frames, MsgFrame, Reader, Record,
+    put_frag_ack_frame, put_msg_frame, put_varint, record_len, AckFrame, FragAckFrame, Frame,
+    Frames, MsgFrame, Reader, Record,
 };
 use proptest::prelude::*;
 
@@ -49,7 +50,10 @@ proptest! {
             match f {
                 OwnedFrame::Msg { seq, count, index, data } =>
                     put_msg_frame(&mut out, *seq, *count, *index, data),
-                OwnedFrame::Ack { cum, bitmap } => put_ack_frame(&mut out, *cum, bitmap),
+                OwnedFrame::Ack { cum, largest, delay, bitmap } =>
+                    put_ack_frame(&mut out, *cum, *largest, *delay, bitmap),
+                OwnedFrame::FragAck { seq, count, bitmap } =>
+                    put_frag_ack_frame(&mut out, *seq, *count, bitmap),
             }
         }
         let parsed: Vec<Frame<'_>> = Frames::new(&out).collect::<Result<_, _>>().unwrap();
@@ -59,7 +63,12 @@ proptest! {
                 OwnedFrame::Msg { seq, count, index, data } => Frame::Msg(MsgFrame {
                     seq: *seq, count: *count, index: if *count > 1 { *index } else { 0 }, data,
                 }),
-                OwnedFrame::Ack { cum, bitmap } => Frame::Ack(AckFrame { cum: *cum, bitmap }),
+                OwnedFrame::Ack { cum, largest, delay, bitmap } => Frame::Ack(AckFrame {
+                    cum: *cum, largest: *largest, ack_delay: *delay, bitmap,
+                }),
+                OwnedFrame::FragAck { seq, count, bitmap } => Frame::FragAck(FragAckFrame {
+                    seq: *seq, count: *count, bitmap,
+                }),
             };
             prop_assert_eq!(*p, expected);
         }
@@ -104,6 +113,13 @@ enum OwnedFrame {
     },
     Ack {
         cum: u64,
+        largest: u64,
+        delay: u64,
+        bitmap: Vec<u8>,
+    },
+    FragAck {
+        seq: u64,
+        count: u64,
         bitmap: Vec<u8>,
     },
 }
@@ -122,8 +138,24 @@ fn arb_frame() -> impl Strategy<Value = OwnedFrame> {
                 index,
                 data
             }),
-        (any::<u64>(), prop::collection::vec(any::<u8>(), 0..16))
-            .prop_map(|(cum, bitmap)| OwnedFrame::Ack { cum, bitmap }),
+        (
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+            prop::collection::vec(any::<u8>(), 0..16)
+        )
+            .prop_map(|(cum, largest, delay, bitmap)| OwnedFrame::Ack {
+                cum,
+                largest,
+                delay,
+                bitmap
+            }),
+        (
+            any::<u64>(),
+            any::<u64>(),
+            prop::collection::vec(any::<u8>(), 0..16)
+        )
+            .prop_map(|(seq, count, bitmap)| OwnedFrame::FragAck { seq, count, bitmap }),
     ]
 }
 

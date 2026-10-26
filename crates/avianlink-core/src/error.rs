@@ -30,8 +30,15 @@ pub enum Error {
     OutboxFull,
     /// A sequence counter is exhausted.
     Exhausted,
-    /// The host's [`crate::Storage`] reported a failure.
+    /// The host's [`crate::Storage`] reported a failure. Nothing changed.
     Storage,
+    /// `Engine::new` on storage that already holds an engine; use
+    /// `Engine::restore`.
+    StorageNotEmpty,
+    /// `Engine::restore` found missing or undecodable state.
+    CorruptStorage,
+    /// `Engine::restore` with a different identity than the stored one.
+    IdentityMismatch,
 }
 
 impl fmt::Display for Error {
@@ -49,6 +56,9 @@ impl fmt::Display for Error {
             Self::OutboxFull => "outbox full",
             Self::Exhausted => "sequence counter exhausted",
             Self::Storage => "storage failure",
+            Self::StorageNotEmpty => "storage already holds an engine",
+            Self::CorruptStorage => "stored engine state is corrupt",
+            Self::IdentityMismatch => "stored engine belongs to another identity",
         };
         f.write_str(msg)
     }

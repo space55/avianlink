@@ -1,19 +1,25 @@
 //! Runs simulator scenarios and prints metrics.
 //!
 //! ```text
-//! simrun [--profile NAME|all] [--seed N] [--seeds K] [--messages N]
+//! simrun [--profile NAME|all|everything] [--seed N] [--seeds K] [--messages N]
 //!        [--interval-ms N] [--verbose]
+//!        [--max-rto MS] [--min-rto MS] [--initial-rto MS] [--var-mult N] [--grace N]
+//!
+//! NAME is a profile (clean, geo_satellite, edge_2g, disaster_cellular,
+//! lora_like) or a stress scenario (harsh_64, harsh_64_crashy). `all` runs
+//! the profiles; `everything` adds the stress scenarios.
 //! ```
 
-use avianlink_sim::{Profile, Report, Scenario};
+use avianlink_sim::{Report, Scenario};
 
 fn main() {
-    let mut profiles: Vec<Profile> = Profile::ALL.to_vec();
+    let mut profiles: Vec<&str> = Scenario::NAMES[..5].to_vec();
     let mut seed = 1u64;
     let mut seeds = 1u64;
     let mut messages = None;
     let mut interval = None;
     let mut verbose = false;
+    let mut tweak: Vec<(String, u64)> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut val = || {
@@ -23,16 +29,23 @@ fn main() {
         match a.as_str() {
             "--profile" => {
                 let v = val();
-                if v != "all" {
-                    profiles = vec![Profile::from_name(&v)
-                        .unwrap_or_else(|| usage(&format!("unknown profile {v}")))];
-                }
+                profiles = match v.as_str() {
+                    "all" => Scenario::NAMES[..5].to_vec(),
+                    "everything" => Scenario::NAMES.to_vec(),
+                    _ => vec![Scenario::NAMES
+                        .into_iter()
+                        .find(|n| *n == v)
+                        .unwrap_or_else(|| usage(&format!("unknown scenario {v}")))],
+                };
             }
             "--seed" => seed = num(&val()),
             "--seeds" => seeds = num(&val()),
             "--messages" => messages = Some(num(&val()) as usize),
             "--interval-ms" => interval = Some(num(&val())),
             "--verbose" | "-v" => verbose = true,
+            "--max-rto" | "--min-rto" | "--initial-rto" | "--var-mult" | "--grace" => {
+                tweak.push((a.clone(), num(&val())))
+            }
             _ => usage(&format!("unknown argument {a}")),
         }
     }
@@ -41,12 +54,21 @@ fn main() {
     let mut details = Vec::new();
     for p in profiles {
         for s in seed..seed + seeds {
-            let mut sc = Scenario::new(p, s);
+            let mut sc = Scenario::named(p, s).expect("known name");
             if let Some(m) = messages {
                 sc.messages = m;
             }
             if let Some(i) = interval {
                 sc.mean_interval_ms = i;
+            }
+            for (k, v) in &tweak {
+                match k.as_str() {
+                    "--max-rto" => sc.config.max_rto_ms = *v,
+                    "--min-rto" => sc.config.min_rto_ms = *v,
+                    "--initial-rto" => sc.config.initial_rto_ms = *v,
+                    "--var-mult" => sc.config.rttvar_multiplier = *v as u8,
+                    _ => sc.config.backoff_grace = *v as u8,
+                }
             }
             let r = sc.run();
             println!("{}", r.table_row());
@@ -72,6 +94,6 @@ fn num(s: &str) -> u64 {
 
 fn usage(msg: &str) -> ! {
     eprintln!("simrun: {msg}");
-    eprintln!("usage: simrun [--profile NAME|all] [--seed N] [--seeds K] [--messages N] [--interval-ms N] [--verbose]");
+    eprintln!("usage: simrun [--profile NAME|all|everything] [--seed N] [--seeds K] [--messages N] [--interval-ms N] [--verbose] [--max-rto MS] [--min-rto MS] [--initial-rto MS] [--var-mult N] [--grace N]");
     std::process::exit(2)
 }

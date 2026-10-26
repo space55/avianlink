@@ -82,6 +82,20 @@ impl Pacer {
         }
     }
 
+    /// Budget time one MTU-sized packet costs, in ms: how long the budget
+    /// needs to earn it back. Zero for unlimited links.
+    pub(crate) fn packet_cost_ms(budget: &LinkBudget, mtu: u16) -> u64 {
+        match budget {
+            LinkBudget::Unlimited => 0,
+            LinkBudget::BytesPerSecond(rate) => {
+                (u64::from(mtu).saturating_mul(1000)).div_ceil(u64::from(*rate).max(1))
+            }
+            LinkBudget::DutyCycle {
+                permille, airtime, ..
+            } => airtime_us(airtime, usize::from(mtu)).div_ceil(u64::from(*permille).max(1)),
+        }
+    }
+
     /// Earliest time at which an MTU-sized packet fits. Pure.
     pub(crate) fn ready_at(&self, now: Timestamp, mtu: u16) -> Timestamp {
         match self {

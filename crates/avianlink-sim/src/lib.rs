@@ -20,7 +20,7 @@ use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 
 pub use metrics::{fmt_ms, percentile, Report};
-pub use sim::{total_channel_stats, LengthMix, Scenario, SIM_EPOCH_MS};
+pub use sim::{add_stats, total_channel_stats, CrashModel, LengthMix, Scenario, SIM_EPOCH_MS};
 
 /// Named impairment profiles; parameters in [`Profile::link`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

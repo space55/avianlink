@@ -8,6 +8,8 @@ pub const FRAME_PADDING: u64 = 0x00;
 pub const FRAME_MSG: u64 = 0x01;
 /// ACK frame type: selective acknowledgement.
 pub const FRAME_ACK: u64 = 0x02;
+/// FRAG_ACK frame type: per-fragment acknowledgement.
+pub const FRAME_FRAG_ACK: u64 = 0x05;
 
 /// A message fragment. Semantic validity (`count >= 1`, `index < count`) is
 /// the caller's to check.
@@ -28,6 +30,10 @@ pub struct MsgFrame<'a> {
 pub struct AckFrame<'a> {
     /// Every seq below this has been received.
     pub cum: u64,
+    /// Largest packet counter received from the peer.
+    pub largest: u64,
+    /// Milliseconds between that packet's arrival and this ACK.
+    pub ack_delay: u64,
     /// Bit `i` set: seq `cum + 1 + i` received.
     pub bitmap: &'a [u8],
 }
@@ -58,6 +64,29 @@ impl AckFrame<'_> {
     }
 }
 
+/// Fragments held of a partially reassembled message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FragAckFrame<'a> {
+    /// The message.
+    pub seq: u64,
+    /// Fragment count of the plan this refers to.
+    pub count: u64,
+    /// Bit `i` set: fragment `i` held.
+    pub bitmap: &'a [u8],
+}
+
+impl FragAckFrame<'_> {
+    /// Whether fragment `index` is held.
+    pub fn has(&self, index: u64) -> bool {
+        let Ok(i) = usize::try_from(index) else {
+            return false;
+        };
+        self.bitmap
+            .get(i / 8)
+            .is_some_and(|b| b & (1u8 << (i % 8)) != 0)
+    }
+}
+
 /// A decoded frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Frame<'a> {
@@ -67,6 +96,8 @@ pub enum Frame<'a> {
     Msg(MsgFrame<'a>),
     /// Acknowledgement.
     Ack(AckFrame<'a>),
+    /// Per-fragment acknowledgement.
+    FragAck(FragAckFrame<'a>),
     /// A frame type this version does not know; skipped.
     Unknown {
         /// The unknown type.
@@ -111,8 +142,21 @@ impl<'a> Frames<'a> {
             }
             FRAME_ACK => {
                 let cum = b.varint()?;
+                let largest = b.varint()?;
+                let ack_delay = b.varint()?;
                 Frame::Ack(AckFrame {
                     cum,
+                    largest,
+                    ack_delay,
+                    bitmap: b.rest(),
+                })
+            }
+            FRAME_FRAG_ACK => {
+                let seq = b.varint()?;
+                let count = b.varint()?;
+                Frame::FragAck(FragAckFrame {
+                    seq,
+                    count,
                     bitmap: b.rest(),
                 })
             }
@@ -173,16 +217,45 @@ pub fn put_msg_frame(out: &mut Vec<u8>, seq: u64, count: u64, index: u64, data: 
 }
 
 /// Encoded length of an ACK frame.
-pub fn ack_frame_len(cum: u64, bitmap_len: usize) -> usize {
-    frame_len(FRAME_ACK, varint_len(cum).saturating_add(bitmap_len))
+pub fn ack_frame_len(cum: u64, largest: u64, ack_delay: u64, bitmap_len: usize) -> usize {
+    let body = varint_len(cum)
+        .saturating_add(varint_len(largest))
+        .saturating_add(varint_len(ack_delay))
+        .saturating_add(bitmap_len);
+    frame_len(FRAME_ACK, body)
 }
 
 /// Appends an ACK frame.
-pub fn put_ack_frame(out: &mut Vec<u8>, cum: u64, bitmap: &[u8]) {
-    let body = varint_len(cum).saturating_add(bitmap.len());
+pub fn put_ack_frame(out: &mut Vec<u8>, cum: u64, largest: u64, ack_delay: u64, bitmap: &[u8]) {
+    let body = varint_len(cum)
+        .saturating_add(varint_len(largest))
+        .saturating_add(varint_len(ack_delay))
+        .saturating_add(bitmap.len());
     put_varint(out, FRAME_ACK);
     put_varint(out, u64::try_from(body).unwrap_or(u64::MAX));
     put_varint(out, cum);
+    put_varint(out, largest);
+    put_varint(out, ack_delay);
+    out.extend_from_slice(bitmap);
+}
+
+/// Encoded length of a FRAG_ACK frame.
+pub fn frag_ack_frame_len(seq: u64, count: u64, bitmap_len: usize) -> usize {
+    let body = varint_len(seq)
+        .saturating_add(varint_len(count))
+        .saturating_add(bitmap_len);
+    frame_len(FRAME_FRAG_ACK, body)
+}
+
+/// Appends a FRAG_ACK frame.
+pub fn put_frag_ack_frame(out: &mut Vec<u8>, seq: u64, count: u64, bitmap: &[u8]) {
+    let body = varint_len(seq)
+        .saturating_add(varint_len(count))
+        .saturating_add(bitmap.len());
+    put_varint(out, FRAME_FRAG_ACK);
+    put_varint(out, u64::try_from(body).unwrap_or(u64::MAX));
+    put_varint(out, seq);
+    put_varint(out, count);
     out.extend_from_slice(bitmap);
 }
 
@@ -194,6 +267,8 @@ mod tests {
     fn ack_covers() {
         let ack = AckFrame {
             cum: 10,
+            largest: 0,
+            ack_delay: 0,
             bitmap: &[0b0000_0101, 0b1000_0000],
         };
         assert!(ack.covers(0) && ack.covers(9));
@@ -211,7 +286,8 @@ mod tests {
         put_varint(&mut out, 0x7e); // unknown type
         put_varint(&mut out, 2);
         out.extend_from_slice(&[9, 9]);
-        put_ack_frame(&mut out, 7, &[1]);
+        put_ack_frame(&mut out, 7, 300, 5, &[1]);
+        put_frag_ack_frame(&mut out, 9, 12, &[0b11, 0b1000]);
         let frames: Vec<_> = Frames::new(&out).collect::<Result<_, _>>().unwrap();
         assert_eq!(
             frames,
@@ -225,14 +301,28 @@ mod tests {
                 Frame::Unknown { frame_type: 0x7e },
                 Frame::Ack(AckFrame {
                     cum: 7,
+                    largest: 300,
+                    ack_delay: 5,
                     bitmap: &[1]
+                }),
+                Frame::FragAck(FragAckFrame {
+                    seq: 9,
+                    count: 12,
+                    bitmap: &[0b11, 0b1000]
                 }),
             ]
         );
         assert_eq!(
-            msg_frame_len(5, 3, 2, 3) + ack_frame_len(7, 1) + 4,
+            msg_frame_len(5, 3, 2, 3)
+                + ack_frame_len(7, 300, 5, 1)
+                + frag_ack_frame_len(9, 12, 2)
+                + 4,
             out.len()
         );
+        let Frame::FragAck(fa) = frames[3] else {
+            panic!()
+        };
+        assert!(fa.has(0) && fa.has(1) && !fa.has(2) && fa.has(11) && !fa.has(12));
     }
 
     #[test]

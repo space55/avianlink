@@ -62,6 +62,12 @@ pub struct Report {
     pub duplicate_deliveries: u64,
     /// Events with unknown IDs, wrong text, or wrong direction (bug).
     pub integrity_violations: u64,
+    /// Messages that arrived before an earlier one from the same sender.
+    pub out_of_order: u64,
+    /// Simulated process crashes.
+    pub crashes: u64,
+    /// Largest committed storage footprint of either node, in bytes.
+    pub max_storage_bytes: usize,
     /// Per-direction channel counters (0: peer A → B).
     pub channels: [ChannelStats; 2],
     /// Per-peer engine counters.
@@ -188,12 +194,21 @@ impl fmt::Display for Report {
         )?;
         writeln!(
             f,
-            "  engine          retx {} acks {} unauth-drops {} dup-msgs {} reasm-full {}",
+            "  engine          retx {} probes {} acks {} frag-acks {} rtt-samples {} unauth-drops {} dup-msgs {} reasm-full {} storage-errors {}",
             e(|s| s.retransmissions),
+            e(|s| s.probes_sent),
             e(|s| s.acks_sent),
+            e(|s| s.frag_acks_sent),
+            e(|s| s.rtt_samples),
             e(|s| s.packets_dropped_unauthenticated),
             e(|s| s.messages_duplicate),
-            e(|s| s.fragments_dropped_reassembly_full)
+            e(|s| s.fragments_dropped_reassembly_full),
+            e(|s| s.storage_errors)
+        )?;
+        writeln!(
+            f,
+            "  host            crashes {}, out-of-order arrivals {}, max storage {} B, outbox-full retries {}",
+            self.crashes, self.out_of_order, self.max_storage_bytes, self.outbox_full_retries
         )?;
         writeln!(
             f,

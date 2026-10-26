@@ -52,11 +52,11 @@ mod types;
 pub mod wire;
 
 pub use config::Config;
-pub use engine::{Engine, Stats, Transmit};
+pub use engine::{Engine, Queued, Stats, Transmit};
 pub use error::Error;
 pub use event::{Event, ReceivedMessage};
 pub use link::{AirtimeModel, LinkBudget, LinkConfig, LinkId, MIN_MTU};
-pub use storage::{MemoryStorage, Storage};
+pub use storage::{MemoryStorage, MemoryStorageError, Storage};
 pub use time::Timestamp;
 pub use types::{ConversationId, MessageId, Packet, PublicKey};
 

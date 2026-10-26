@@ -30,6 +30,9 @@ pub struct ReceivedMessage {
     pub seq: u64,
     /// Lamport clock value; the causal order key.
     pub lamport: u64,
+    /// Earlier messages from this sender not yet received. Non-zero means
+    /// this one overtook them in the network.
+    pub missing_before: u64,
     /// Sender-asserted wall-clock time, second precision, if the sender has a
     /// wall clock. Display metadata only.
     pub sender_time: Option<Timestamp>,

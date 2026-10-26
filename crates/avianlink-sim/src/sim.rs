@@ -11,7 +11,9 @@ use avianlink_core::{
 use rand_chacha::ChaCha20Rng;
 use rand_core::RngCore;
 
-use crate::impair::{below, unit, Channel, ChannelStats, LinkProfile, Outages};
+use crate::impair::{
+    below, unit, Channel, ChannelStats, GilbertElliott, LinkProfile, OutageModel, Outages,
+};
 use crate::metrics::{percentile, Report};
 use crate::Profile;
 
@@ -61,6 +63,17 @@ impl Default for LengthMix {
     }
 }
 
+/// Random process crashes. A crash discards everything not committed to
+/// storage; the node then restarts with `Engine::restore`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CrashModel {
+    /// Mean time between crashes per node (exponential).
+    pub mean_interval_ms: u64,
+    /// How long a crashed node stays down; packets to it are lost and its
+    /// application's sends wait.
+    pub downtime_ms: u64,
+}
+
 /// A complete, reproducible simulation setup.
 #[derive(Clone, Debug)]
 pub struct Scenario {
@@ -80,12 +93,14 @@ pub struct Scenario {
     pub lengths: LengthMix,
     /// Give up after this much simulated time.
     pub deadline_ms: u64,
+    /// Process crashes, if any.
+    pub crashes: Option<CrashModel>,
 }
 
 impl Scenario {
     /// Defaults for a named profile: 1000 messages, one every 30 s on
     /// average (every 10 min on `lora_like`, whose 1% duty cycle carries only
-    /// ~3 KB/hour), 30-day deadline.
+    /// ~3 KB/hour), 30-day deadline, no crashes.
     pub fn new(profile: Profile, seed: u64) -> Self {
         let mean_interval_ms = match profile {
             Profile::LoraLike => 600_000,
@@ -100,6 +115,60 @@ impl Scenario {
             mean_interval_ms,
             lengths: LengthMix::default(),
             deadline_ms: 30 * 24 * 3_600_000,
+            crashes: None,
+        }
+    }
+
+    /// The Phase 2 stress scenario: `disaster_cellular` shrunk to a 64-byte
+    /// MTU, with ~50% Gilbert-Elliott loss and outages of 90 s up / 10 min
+    /// down on average.
+    pub fn harsh_64(seed: u64) -> Self {
+        let mut sc = Self::new(Profile::DisasterCellular, seed);
+        sc.name = "harsh_64".to_string();
+        sc.link.mtu = 64;
+        sc.link.loss = GilbertElliott {
+            p_good_to_bad: 0.1,
+            p_bad_to_good: 0.1,
+            loss_good: 0.2,
+            loss_bad: 0.8,
+        };
+        sc.link.outage = Some(OutageModel {
+            up_ms: 90_000,
+            down_ms: 600_000,
+            randomize: true,
+        });
+        sc
+    }
+
+    /// [`Scenario::harsh_64`] with both nodes crashing every 30 minutes on
+    /// average and staying down 30 s.
+    pub fn harsh_64_crashy(seed: u64) -> Self {
+        let mut sc = Self::harsh_64(seed);
+        sc.name = "harsh_64_crashy".to_string();
+        sc.crashes = Some(CrashModel {
+            mean_interval_ms: 30 * 60_000,
+            downtime_ms: 30_000,
+        });
+        sc
+    }
+
+    /// Scenario names accepted by [`Scenario::named`].
+    pub const NAMES: [&'static str; 7] = [
+        "clean",
+        "geo_satellite",
+        "edge_2g",
+        "disaster_cellular",
+        "lora_like",
+        "harsh_64",
+        "harsh_64_crashy",
+    ];
+
+    /// A profile's default scenario, or one of the stress scenarios.
+    pub fn named(name: &str, seed: u64) -> Option<Self> {
+        match name {
+            "harsh_64" => Some(Self::harsh_64(seed)),
+            "harsh_64_crashy" => Some(Self::harsh_64_crashy(seed)),
+            _ => Profile::from_name(name).map(|p| Self::new(p, seed)),
         }
     }
 
@@ -111,9 +180,25 @@ impl Scenario {
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Ev {
-    Send { msg: usize },
-    Arrive { node: usize, bytes: Vec<u8> },
-    Wake { node: usize, generation: u64 },
+    Send {
+        msg: usize,
+    },
+    Arrive {
+        node: usize,
+        bytes: Vec<u8>,
+    },
+    Wake {
+        node: usize,
+        generation: u64,
+    },
+    /// Arms a crash: it happens inside the node's next input, before the
+    /// host drains events (the harshest point).
+    Crash {
+        node: usize,
+    },
+    Restart {
+        node: usize,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -123,11 +208,21 @@ struct Scheduled {
     ev: Ev,
 }
 
+type SimEngine = Engine<MemoryStorage, ChaCha20Rng>;
+
 struct Node {
-    engine: Engine<MemoryStorage, ChaCha20Rng>,
+    key: PublicKey,
+    /// `None` while crashed.
+    engine: Option<SimEngine>,
+    /// Storage left behind by a crash, waiting for the restart.
+    wreck: Option<MemoryStorage>,
     conv: ConversationId,
     wake: Option<u64>,
     generation: u64,
+    crash_armed: bool,
+    incarnation: u64,
+    /// Counters of previous incarnations.
+    retired: Stats,
 }
 
 struct Msg {
@@ -148,14 +243,20 @@ struct Sim<'a> {
     nodes: Vec<Node>,
     channels: [Channel; 2],
     outages: Outages,
+    crash_rng: ChaCha20Rng,
     msgs: Vec<Msg>,
     by_id: BTreeMap<MessageId, usize>,
     delivered: usize,
     acked: usize,
+    wire_bytes: u64,
+    packets: u64,
     stalls: u64,
     outbox_full_retries: u64,
     duplicate_deliveries: u64,
     integrity_violations: u64,
+    out_of_order: u64,
+    crashes: u64,
+    max_storage_bytes: usize,
 }
 
 fn stream(seed: u64, n: u64) -> ChaCha20Rng {
@@ -209,6 +310,42 @@ fn random_text(rng: &mut ChaCha20Rng, target: usize) -> String {
     s
 }
 
+fn exp_ms(rng: &mut ChaCha20Rng, mean: u64) -> u64 {
+    ((-(unit(rng).max(f64::MIN_POSITIVE)).ln()) * mean as f64) as u64
+}
+
+/// Field-wise sum, for counters that span engine incarnations.
+pub fn add_stats(a: &Stats, b: &Stats) -> Stats {
+    macro_rules! sum {
+        ($($f:ident),*) => { Stats { $($f: a.$f + b.$f),* } };
+    }
+    sum!(
+        packets_received,
+        packets_dropped_unknown_link,
+        packets_dropped_version,
+        packets_dropped_malformed,
+        packets_dropped_unauthenticated,
+        frames_unknown,
+        frames_dropped_invalid,
+        frames_dropped_window,
+        frames_dropped_backpressure,
+        fragments_dropped_reassembly_full,
+        records_malformed,
+        messages_received,
+        messages_duplicate,
+        messages_delivered,
+        packets_sent,
+        bytes_sent,
+        fragments_sent,
+        retransmissions,
+        probes_sent,
+        acks_sent,
+        frag_acks_sent,
+        rtt_samples,
+        storage_errors
+    )
+}
+
 impl<'a> Sim<'a> {
     fn new(sc: &'a Scenario) -> Self {
         let mut keys = [PublicKey([0; 32]); 2];
@@ -230,10 +367,15 @@ impl<'a> Sim<'a> {
                     .expect("valid profile link");
                 let conv = engine.add_contact(keys[1 - i]).expect("fresh contact");
                 Node {
-                    engine,
+                    key: keys[i],
+                    engine: Some(engine),
+                    wreck: None,
                     conv,
                     wake: None,
                     generation: 0,
+                    crash_armed: false,
+                    incarnation: 0,
+                    retired: Stats::default(),
                 }
             })
             .collect();
@@ -242,8 +384,7 @@ impl<'a> Sim<'a> {
         let mut t = SIM_EPOCH_MS;
         let msgs: Vec<Msg> = (0..sc.messages)
             .map(|_| {
-                t += (-(unit(&mut wl).max(f64::MIN_POSITIVE)).ln() * sc.mean_interval_ms as f64)
-                    as u64;
+                t += exp_ms(&mut wl, sc.mean_interval_ms);
                 let r = unit(&mut wl);
                 let len = if r < sc.lengths.short {
                     5 + below(&mut wl, 76)
@@ -275,18 +416,27 @@ impl<'a> Sim<'a> {
                 Channel::new(sc.link, stream(sc.seed, 4)),
             ],
             outages: Outages::new(sc.link.outage, stream(sc.seed, 5), SIM_EPOCH_MS),
+            crash_rng: stream(sc.seed, 6),
             msgs,
             by_id: BTreeMap::new(),
             delivered: 0,
             acked: 0,
+            wire_bytes: 0,
+            packets: 0,
             stalls: 0,
             outbox_full_retries: 0,
             duplicate_deliveries: 0,
             integrity_violations: 0,
+            out_of_order: 0,
+            crashes: 0,
+            max_storage_bytes: 0,
         };
         for i in 0..sim.msgs.len() {
             let at = sim.msgs[i].scheduled_at;
             sim.schedule(at, Ev::Send { msg: i });
+        }
+        for node in 0..2 {
+            sim.schedule_crash(node);
         }
         sim
     }
@@ -298,6 +448,13 @@ impl<'a> Sim<'a> {
             order: self.order,
             ev,
         }));
+    }
+
+    fn schedule_crash(&mut self, node: usize) {
+        if let Some(c) = self.sc.crashes {
+            let at = self.now + exp_ms(&mut self.crash_rng, c.mean_interval_ms).max(1);
+            self.schedule(at, Ev::Crash { node });
+        }
     }
 
     fn done(&self) -> bool {
@@ -313,40 +470,13 @@ impl<'a> Sim<'a> {
                 break;
             }
             self.now = s.at;
-            let now = Timestamp::from_millis(self.now);
-            let node = match s.ev {
-                Ev::Send { msg } => {
-                    let m = &self.msgs[msg];
-                    let n = &mut self.nodes[m.from];
-                    match n.engine.send_text(n.conv, &m.text, now) {
-                        Ok(id) => {
-                            let m = &mut self.msgs[msg];
-                            m.sent_at = Some(self.now);
-                            m.id = Some(id);
-                            self.by_id.insert(id, msg);
-                        }
-                        Err(Error::OutboxFull) => {
-                            self.outbox_full_retries += 1;
-                            self.schedule(self.now + 1_000, Ev::Send { msg });
-                        }
-                        Err(e) => panic!("send_text failed: {e}"),
-                    }
-                    self.msgs[msg].from
+            if let Some(node) = self.step(s.ev) {
+                if self.nodes[node].crash_armed {
+                    self.crash(node);
+                } else {
+                    self.pump(node);
                 }
-                Ev::Arrive { node, bytes } => {
-                    self.nodes[node].engine.handle_packet(LINK, &bytes, now);
-                    node
-                }
-                Ev::Wake { node, generation } => {
-                    if generation != self.nodes[node].generation {
-                        continue;
-                    }
-                    self.nodes[node].wake = None;
-                    self.nodes[node].engine.handle_timeout(now);
-                    node
-                }
-            };
-            self.pump(node);
+            }
             if self.done() {
                 break;
             }
@@ -354,11 +484,111 @@ impl<'a> Sim<'a> {
         self.report(wall.elapsed().as_secs_f64() * 1000.0)
     }
 
+    /// Applies one event; returns the node to pump afterwards, if any.
+    fn step(&mut self, ev: Ev) -> Option<usize> {
+        let now = Timestamp::from_millis(self.now);
+        match ev {
+            Ev::Send { msg } => {
+                let from = self.msgs[msg].from;
+                let n = &mut self.nodes[from];
+                let Some(engine) = n.engine.as_mut() else {
+                    // The app waits for its node to come back.
+                    self.schedule(self.now + 1_000, Ev::Send { msg });
+                    return None;
+                };
+                match engine.send_text(n.conv, &self.msgs[msg].text, now) {
+                    Ok(q) => {
+                        let m = &mut self.msgs[msg];
+                        m.sent_at = Some(self.now);
+                        m.id = Some(q.id);
+                        self.by_id.insert(q.id, msg);
+                    }
+                    Err(Error::OutboxFull) => {
+                        self.outbox_full_retries += 1;
+                        self.schedule(self.now + 1_000, Ev::Send { msg });
+                    }
+                    Err(e) => panic!("send_text failed: {e}"),
+                }
+                Some(from)
+            }
+            Ev::Arrive { node, bytes } => {
+                let engine = self.nodes[node].engine.as_mut()?;
+                engine.handle_packet(LINK, &bytes, now);
+                Some(node)
+            }
+            Ev::Wake { node, generation } => {
+                let n = &mut self.nodes[node];
+                if generation != n.generation {
+                    return None;
+                }
+                n.wake = None;
+                n.engine.as_mut()?.handle_timeout(now);
+                Some(node)
+            }
+            Ev::Crash { node } => {
+                self.nodes[node].crash_armed = true;
+                None
+            }
+            Ev::Restart { node } => {
+                self.restart(node);
+                Some(node)
+            }
+        }
+    }
+
+    /// Kills the node mid-call: queued events, timers and anything not
+    /// committed are lost.
+    fn crash(&mut self, node: usize) {
+        let n = &mut self.nodes[node];
+        n.crash_armed = false;
+        let Some(engine) = n.engine.take() else {
+            return;
+        };
+        self.crashes += 1;
+        n.retired = add_stats(&n.retired, &engine.stats());
+        n.wreck = Some(engine.storage().crash_snapshot());
+        n.generation += 1;
+        n.wake = None;
+        let downtime = self.sc.crashes.map_or(0, |c| c.downtime_ms);
+        self.schedule(self.now + downtime, Ev::Restart { node });
+    }
+
+    fn restart(&mut self, node: usize) {
+        let sc = self.sc;
+        let n = &mut self.nodes[node];
+        let Some(storage) = n.wreck.take() else {
+            return;
+        };
+        n.incarnation += 1;
+        let rng = stream(sc.seed, 100 + 2 * n.incarnation + node as u64);
+        let mut engine = Engine::restore(sc.config, n.key, storage, rng).expect("restore");
+        engine
+            .add_link(LINK, sc.link.engine_link())
+            .expect("valid profile link");
+        n.engine = Some(engine);
+        self.schedule_crash(node);
+    }
+
     fn pump(&mut self, node: usize) {
         let now = Timestamp::from_millis(self.now);
-        while let Some(tx) = self.nodes[node].engine.poll_transmit(now) {
-            let copies =
-                self.channels[node].send(self.now, tx.packet.into_vec(), &mut self.outages);
+        let Some(engine) = self.nodes[node].engine.as_mut() else {
+            return;
+        };
+        let mut sent = Vec::new();
+        while let Some(tx) = engine.poll_transmit(now) {
+            sent.push(tx.packet.into_vec());
+        }
+        let mut events = Vec::new();
+        while let Some(ev) = engine.poll_event() {
+            events.push(ev);
+        }
+        let next = engine.next_timeout().map(|t| t.as_millis());
+        self.max_storage_bytes = self.max_storage_bytes.max(engine.storage().bytes());
+
+        for bytes in sent {
+            self.packets += 1;
+            self.wire_bytes += bytes.len() as u64;
+            let copies = self.channels[node].send(self.now, bytes, &mut self.outages);
             for (at, bytes) in copies {
                 self.schedule(
                     at,
@@ -369,11 +599,10 @@ impl<'a> Sim<'a> {
                 );
             }
         }
-        while let Some(ev) = self.nodes[node].engine.poll_event() {
+        for ev in events {
             self.on_event(node, ev);
         }
-        let next = self.nodes[node].engine.next_timeout().map(|t| {
-            let t = t.as_millis();
+        let next = next.map(|t| {
             if t <= self.now {
                 // The engine claims work is due now but produced nothing.
                 self.stalls += 1;
@@ -408,6 +637,9 @@ impl<'a> Sim<'a> {
                 if msg.delivered_at.is_some() {
                     self.duplicate_deliveries += 1;
                     return;
+                }
+                if m.missing_before > 0 {
+                    self.out_of_order += 1;
                 }
                 msg.delivered_at = Some(self.now);
                 self.delivered += 1;
@@ -448,9 +680,14 @@ impl<'a> Sim<'a> {
             .filter(|m| m.delivered_at.is_some())
             .map(|m| m.text.len() as u64)
             .sum();
-        let stats: Vec<Stats> = self.nodes.iter().map(|n| n.engine.stats()).collect();
-        let wire_bytes: u64 = stats.iter().map(|s| s.bytes_sent).sum();
-        let packets: u64 = stats.iter().map(|s| s.packets_sent).sum();
+        let stats: Vec<Stats> = self
+            .nodes
+            .iter()
+            .map(|n| {
+                let live = n.engine.as_ref().map(|e| e.stats()).unwrap_or_default();
+                add_stats(&n.retired, &live)
+            })
+            .collect();
         let duration = self.now - SIM_EPOCH_MS;
         let downtime = self.outages.downtime(SIM_EPOCH_MS, self.now);
         let n = self.msgs.len();
@@ -467,8 +704,8 @@ impl<'a> Sim<'a> {
             ack_p50_ms: percentile(&ack_latency, 50),
             ack_p95_ms: percentile(&ack_latency, 95),
             payload_bytes,
-            wire_bytes,
-            packets,
+            wire_bytes: self.wire_bytes,
+            packets: self.packets,
             sim_duration_ms: duration,
             downtime_ms: downtime,
             wall_ms,
@@ -476,6 +713,9 @@ impl<'a> Sim<'a> {
             outbox_full_retries: self.outbox_full_retries,
             duplicate_deliveries: self.duplicate_deliveries,
             integrity_violations: self.integrity_violations,
+            out_of_order: self.out_of_order,
+            crashes: self.crashes,
+            max_storage_bytes: self.max_storage_bytes,
             channels: [self.channels[0].stats, self.channels[1].stats],
             engines: [stats[0], stats[1]],
         }
