@@ -26,6 +26,8 @@ export interface MockSeed {
   links?: unknown[];
   /** Commands that should reject, mapped to the error to throw. */
   failures?: Record<string, { kind: string; message: string }>;
+  /** Whether to report that the simulated engine is running. */
+  simulated?: boolean;
 }
 
 export const FINGERPRINT = 'd033-9b2b-d44b-ab05-ec86';
@@ -71,6 +73,29 @@ export function mockMessage(overrides: Record<string, unknown> = {}) {
     delivered_at: null,
     attempts: null,
     arrived_late: false,
+    missing_before: 0,
+    ...overrides,
+  };
+}
+
+/** A link shaped like the Rust `Link`. */
+export function mockLink(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 1,
+    label: 'Simulated link',
+    kind: 'fake',
+    enabled: true,
+    status: 'up',
+    mtu: 512,
+    config: { kind: 'fake', profile: 'disaster_cellular' },
+    packets_sent: 0,
+    packets_received: 0,
+    bytes_sent: 0,
+    bytes_received: 0,
+    recent_loss_permille: null,
+    last_sent_at: null,
+    last_received_at: null,
+    budget_blocked_until: null,
     ...overrides,
   };
 }
@@ -96,7 +121,22 @@ const SCRIPT = `
     settings: {
       display_name: null,
       show_receive_time_threshold_ms: 300000,
-      fake_engine: null,
+      fake_engine: seed.simulated
+        ? {
+            profile: 'disaster_cellular',
+            available_profiles: [
+              'clean',
+              'geo_satellite',
+              'edge_2g',
+              'disaster_cellular',
+              'lora_like',
+            ],
+            reply_delay_ms: 20000,
+            reply_jitter_ms: 90000,
+            scripted_replies: true,
+            outages: true,
+          }
+        : null,
     },
   };
 
@@ -148,6 +188,7 @@ const SCRIPT = `
           delivered_at: null,
           attempts: 0,
           arrived_late: false,
+          missing_before: 0,
         };
         state.messages[args.conversation_id] = [...existing, message];
         return message;
@@ -183,8 +224,39 @@ const SCRIPT = `
       }
       case 'configure_link':
         return state.links.find((l) => l.id === args.id);
+      case 'set_contact_verified': {
+        state.conversations = state.conversations.map((c) =>
+          c.conversation_id === args.conversation_id
+            ? { ...c, contact: { ...c.contact, verified: args.verified } }
+            : c,
+        );
+        return state.conversations.find((c) => c.conversation_id === args.conversation_id)
+          ?.contact;
+      }
+      case 'add_simulated_contact': {
+        const id = String(state.conversations.length + 1).repeat(32).slice(0, 32);
+        const conversation = {
+          conversation_id: id,
+          contact: {
+            conversation_id: id,
+            public_key: 'd'.repeat(64),
+            fingerprint: ${JSON.stringify(FINGERPRINT)},
+            display_name: args.display_name || 'Simulated contact',
+            verified: false,
+            added_at: Date.now(),
+            last_packet_at: null,
+            last_message_at: null,
+            unread_count: 0,
+          },
+          last_message: null,
+          unread_count: 0,
+          undelivered_count: 0,
+        };
+        state.conversations = [...state.conversations, conversation];
+        state.messages[id] = [];
+        return conversation.contact;
+      }
       case 'mark_conversation_read':
-      case 'set_contact_verified':
       case 'reset_local_data':
         return null;
       default:

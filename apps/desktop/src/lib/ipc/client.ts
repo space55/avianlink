@@ -19,6 +19,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
 import type {
   AddContactArgs,
+  AddSimulatedContactArgs,
   ConfigureLinkArgs,
   Contact,
   ConversationSummary,
@@ -55,6 +56,7 @@ export const COMMAND_NAMES = [
   'set_contact_verified',
   'get_settings',
   'set_settings',
+  'add_simulated_contact',
   'reset_local_data',
 ] as const;
 
@@ -130,6 +132,9 @@ export const commands = {
   setContactVerified: (args: SetContactVerifiedArgs) => call<Contact>('set_contact_verified', args),
   getSettings: () => call<Settings>('get_settings'),
   setSettings: (args: SetSettingsArgs) => call<Settings>('set_settings', args),
+  /** Simulated engine only; fails on the real engine. */
+  addSimulatedContact: (args: AddSimulatedContactArgs) =>
+    call<Contact>('add_simulated_contact', args),
   resetLocalData: () => call<void>('reset_local_data'),
 };
 

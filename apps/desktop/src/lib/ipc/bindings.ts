@@ -18,6 +18,21 @@ display_name: string,
 verified: boolean, };
 
 /**
+ * Arguments to `add_simulated_contact`.
+ */
+export type AddSimulatedContactArgs = { 
+/**
+ * Local label. May be empty.
+ */
+display_name: string, 
+/**
+ * How many scripted messages the contact should already have sent. They
+ * travel the real simulated link, so they arrive over the next seconds
+ * rather than appearing at once.
+ */
+history: number, };
+
+/**
  * Arguments to `configure_link`.
  */
 export type ConfigureLinkArgs = { 
@@ -61,11 +76,11 @@ added_at: number,
 /**
  * Last packet attributed to this peer, unix milliseconds. Best effort.
  */
-last_packet_at: number, 
+last_packet_at: number | null, 
 /**
  * Last message received from this peer, unix milliseconds.
  */
-last_message_at: number, 
+last_message_at: number | null, 
 /**
  * Messages received but not yet marked read.
  */
@@ -97,38 +112,44 @@ unread_count: number,
 undelivered_count: number, };
 
 /**
- * Impairments the fake engine applies, so the UI can be driven through every
- * state on demand. Dev builds only.
+ * How the simulated engine behaves, so a reviewer can drive the interface
+ * through every state on demand. Present only when the app is running on
+ * `FakeEngine`.
+ *
+ * The packet-level impairments — delay, jitter, bursty loss, corruption,
+ * duplication, reordering, MTU, airtime budget and outage schedule — all
+ * come from the named `profile`, whose parameters are `avianlink-sim`'s and
+ * are shared with `scripts/netem/`. Only the knobs that have no equivalent
+ * in the simulator are exposed separately.
  */
 export type FakeEngineSettings = { 
 /**
- * Impairment profile name.
+ * Active impairment profile.
  */
 profile: string, 
 /**
- * Base one-way delay, milliseconds.
+ * Every profile that can be selected, in a stable order.
  */
-delay_ms: number, 
+available_profiles: Array<string>, 
 /**
- * Uniform jitter added to the delay, milliseconds.
+ * How long a scripted contact takes to begin answering, before the
+ * link's own delay is added.
  */
-jitter_ms: number, 
+reply_delay_ms: number, 
 /**
- * Per-packet loss, parts per thousand.
+ * Uniform jitter on top of `reply_delay_ms`. Large by default, so
+ * replies land anywhere from seconds to hours after the message they
+ * answer.
  */
-loss_permille: number, 
+reply_jitter_ms: number, 
 /**
- * Probability a delivered packet is reordered, parts per thousand.
+ * Whether scripted contacts answer at all.
  */
-reorder_permille: number, 
+scripted_replies: boolean, 
 /**
- * Whether scripted link outages are running.
+ * Whether the profile's scheduled link outages run.
  */
-outages: boolean, 
-/**
- * Whether scripted peers reply.
- */
-scripted_replies: boolean, };
+outages: boolean, };
 
 /**
  * Arguments to `get_messages`.
@@ -239,15 +260,15 @@ recent_loss_permille: number | null,
 /**
  * Unix milliseconds.
  */
-last_sent_at: number, 
+last_sent_at: number | null, 
 /**
  * Unix milliseconds.
  */
-last_received_at: number, 
+last_received_at: number | null, 
 /**
  * Pacing, not a fault: the link is up but out of airtime until then.
  */
-budget_blocked_until: number, };
+budget_blocked_until: number | null, };
 
 /**
  * What a link is carried by.
@@ -328,11 +349,11 @@ order_key: string,
 /**
  * Sender-asserted wall clock, unix milliseconds.
  */
-sent_at: number, 
+sent_at: number | null, 
 /**
  * When our engine received it, unix milliseconds. Incoming only.
  */
-received_at: number, 
+received_at: number | null, 
 /**
  * Outgoing only; `None` for incoming messages.
  */
@@ -340,7 +361,7 @@ status: MessageStatus | null,
 /**
  * Unix milliseconds. Outgoing only.
  */
-delivered_at: number, 
+delivered_at: number | null, 
 /**
  * Transmissions so far. Outgoing only.
  */
@@ -348,7 +369,16 @@ attempts: number | null,
 /**
  * Set at insert time if a strictly greater `order_key` already existed.
  */
-arrived_late: boolean, };
+arrived_late: boolean, 
+/**
+ * Earlier messages from this sender that have not arrived yet.
+ *
+ * Reported by the engine. Non-zero means this message overtook others in
+ * the network, and the thread shows a gap marker above it: the
+ * forward-looking counterpart to `arrived_late`. Always 0 for our own
+ * messages.
+ */
+missing_before: number, };
 
 /**
  * A page of messages, oldest first.
@@ -422,7 +452,7 @@ status: MessageStatus,
 /**
  * Unix milliseconds; set when `status` is `delivered`.
  */
-delivered_at: number, 
+delivered_at: number | null, 
 /**
  * Transmissions so far.
  */

@@ -13,6 +13,14 @@
 
 :root {
   /* Type. One family, three sizes, two weights. */
+  /*
+   * Contrast note: --text-faint and --status-queued are held at WCAG AA
+   * (4.5:1) against every surface, not the 3:1 that "decorative" tones often
+   * get. They carry timestamps, link health and the queued state — all real
+   * information at small sizes. `src/lib/tokens.test.ts` enforces it, because
+   * this is the token a designer keeps nudging quieter.
+   */
+
   --font-sans:
     -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, 'Helvetica Neue', Arial,
     sans-serif;
@@ -50,7 +58,7 @@
   --border-strong: #c4c9d0;
   --text: #15181c;
   --text-muted: #5c6672;
-  --text-faint: #8a939e;
+  --text-faint: #686f78;
   --accent: #2b5f8f;
   --accent-text: #ffffff;
   --accent-soft: #e4edf5;
@@ -58,7 +66,7 @@
      these links is normal, and must not read as an alarm. */
   --status-delivered: #2f6b4f;
   --status-sent: #5c6672;
-  --status-queued: #8a939e;
+  --status-queued: #686f78;
   --status-failed: #8c3b35;
   --focus-ring: #2b5f8f;
 
@@ -78,13 +86,13 @@
     --border-strong: #3c434c;
     --text: #e6eaef;
     --text-muted: #9aa4b0;
-    --text-faint: #6e7883;
+    --text-faint: #7c8794;
     --accent: #7eb0dc;
     --accent-text: #0f1317;
     --accent-soft: #1d2a36;
     --status-delivered: #7cc3a0;
     --status-sent: #9aa4b0;
-    --status-queued: #6e7883;
+    --status-queued: #7c8794;
     --status-failed: #e08a82;
     --focus-ring: #7eb0dc;
 
