@@ -1084,3 +1084,15 @@ fn sync_reveals_tail_loss() {
     assert!(b.stats().syncs_received >= 1);
     let _ = now;
 }
+
+#[test]
+fn handle_packet_reports_the_authenticated_sender() {
+    let (_, mut b, pkt) = one_packet();
+    let conv_b = b.contacts().next().unwrap().0;
+    assert_eq!(b.handle_packet(L, &pkt, t(1)), Some(conv_b));
+    assert_eq!(b.handle_packet(L, &pkt, t(2)), None, "replay");
+    assert_eq!(b.handle_packet(L, &[0u8; 40], t(3)), None, "garbage");
+    let mut bad = pkt.clone();
+    *bad.last_mut().unwrap() ^= 1;
+    assert_eq!(b.handle_packet(L, &bad, t(4)), None, "forged");
+}

@@ -1,6 +1,16 @@
-//! UDP link adapter and driver loop for avianlink (Phase 6).
+//! UDP link adapter, durable file storage and driver loop for avianlink
+//! (`docs/hosting.md`).
 //!
-//! Owns the socket and the wall clock, and pumps an
-//! [`avianlink_core::Engine`]: received datagrams go to `handle_packet`,
-//! `poll_transmit` output goes to `send_to`, and the loop sleeps until
-//! `next_timeout`.
+//! [`UdpHost`] owns an [`avianlink_core::Engine`], a UDP socket and the wall
+//! clock, and pumps the engine on its own thread. A UI talks to it through
+//! [`Command`] and [`HostEvent`] channels.
+
+mod host;
+mod identity;
+mod storage;
+
+pub use host::{
+    now, os_rng, Command, HostConfig, HostError, HostEvent, StatusReport, UdpHost, LINK,
+};
+pub use identity::{load_or_create_identity, parse_public_key, public_key_hex};
+pub use storage::{FileStorage, FileStorageError};

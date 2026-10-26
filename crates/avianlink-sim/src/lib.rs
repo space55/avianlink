@@ -13,7 +13,9 @@
 pub mod fuzz_harness;
 pub mod impair;
 mod metrics;
+pub mod netem;
 mod profiles;
+pub mod proxy;
 mod sim;
 
 use rand_chacha::ChaCha20Rng;

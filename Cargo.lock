@@ -23,6 +23,7 @@ name = "avianlink-cli"
 version = "0.0.0"
 dependencies = [
  "avianlink-core",
+ "avianlink-sim",
  "avianlink-udp",
 ]
 
@@ -62,6 +63,11 @@ name = "avianlink-udp"
 version = "0.0.0"
 dependencies = [
  "avianlink-core",
+ "avianlink-sim",
+ "getrandom",
+ "rand_chacha",
+ "rand_core",
+ "sha2",
 ]
 
 [[package]]

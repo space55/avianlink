@@ -50,7 +50,8 @@ pub enum Jitter {
 }
 
 impl Jitter {
-    fn sample(&self, rng: &mut ChaCha20Rng) -> u64 {
+    /// Draws one jitter value in ms.
+    pub fn sample(&self, rng: &mut ChaCha20Rng) -> u64 {
         match *self {
             Self::None => 0,
             Self::Uniform { max_ms } => below(rng, max_ms.saturating_add(1)),
@@ -185,9 +186,10 @@ pub struct ChannelStats {
     pub duty_violations: u64,
 }
 
-/// Outage schedule, generated lazily and queryable at any time.
+/// Outage schedule, generated lazily and queryable at any time. Shared by
+/// both directions of a link.
 #[derive(Debug)]
-pub(crate) struct Outages {
+pub struct Outages {
     model: Option<OutageModel>,
     /// Scheduled [start, end) outages in addition to the model.
     fixed: Vec<(u64, u64)>,
@@ -198,7 +200,8 @@ pub(crate) struct Outages {
 }
 
 impl Outages {
-    pub(crate) fn new(model: Option<OutageModel>, rng: ChaCha20Rng, start: u64) -> Self {
+    /// A schedule following `model` from time `start` (ms).
+    pub fn new(model: Option<OutageModel>, rng: ChaCha20Rng, start: u64) -> Self {
         Self {
             model,
             fixed: Vec::new(),
@@ -209,16 +212,17 @@ impl Outages {
     }
 
     /// Adds a scheduled outage [start, end).
-    pub(crate) fn add_fixed(&mut self, start: u64, end: u64) {
+    pub fn add_fixed(&mut self, start: u64, end: u64) {
         self.fixed.push((start, end));
     }
 
     /// Whether `t` falls in a scheduled outage.
-    pub(crate) fn in_fixed(&self, t: u64) -> bool {
+    pub fn in_fixed(&self, t: u64) -> bool {
         self.fixed.iter().any(|&(s, e)| s <= t && t < e)
     }
 
-    pub(crate) fn is_down(&mut self, t: u64) -> bool {
+    /// Whether the link is down at time `t`.
+    pub fn is_down(&mut self, t: u64) -> bool {
         if self.in_fixed(t) {
             return true;
         }
@@ -243,7 +247,7 @@ impl Outages {
     }
 
     /// Total down time within `[from, to)`.
-    pub(crate) fn downtime(&mut self, from: u64, to: u64) -> u64 {
+    pub fn downtime(&mut self, from: u64, to: u64) -> u64 {
         let fixed: u64 = self
             .fixed
             .iter()
@@ -264,9 +268,11 @@ impl Outages {
     }
 }
 
-/// One direction of a link.
+/// One direction of a link: applies a [`LinkProfile`]'s impairments to each
+/// packet. Drivable in virtual time (the simulator) or real time
+/// (`udp-impair`).
 #[derive(Debug)]
-pub(crate) struct Channel {
+pub struct Channel {
     profile: LinkProfile,
     rng: ChaCha20Rng,
     bad: bool,
@@ -277,7 +283,15 @@ pub(crate) struct Channel {
 }
 
 impl Channel {
-    pub(crate) fn new(profile: LinkProfile, rng: ChaCha20Rng) -> Self {
+    /// Counters so far.
+    pub fn stats(&self) -> ChannelStats {
+        self.stats
+    }
+}
+
+impl Channel {
+    /// A channel applying `profile`, with its own random stream.
+    pub fn new(profile: LinkProfile, rng: ChaCha20Rng) -> Self {
         Self {
             profile,
             rng,
@@ -320,14 +334,9 @@ impl Channel {
         }
     }
 
-    /// Sends `bytes` at `now`; returns the (arrival time, bytes) of every
-    /// copy that survives.
-    pub(crate) fn send(
-        &mut self,
-        now: u64,
-        bytes: Vec<u8>,
-        outages: &mut Outages,
-    ) -> Vec<(u64, Vec<u8>)> {
+    /// Sends `bytes` at `now` (ms); returns the (arrival time, bytes) of
+    /// every copy that survives, in no particular order.
+    pub fn send(&mut self, now: u64, bytes: Vec<u8>, outages: &mut Outages) -> Vec<(u64, Vec<u8>)> {
         self.stats.sent += 1;
         self.stats.sent_bytes += bytes.len() as u64;
         if bytes.len() > usize::from(self.profile.mtu) {

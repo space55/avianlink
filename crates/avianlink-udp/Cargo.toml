@@ -1,6 +1,6 @@
 [package]
 name = "avianlink-udp"
-description = "UDP link adapter and driver loop for avianlink"
+description = "UDP link adapter, durable file storage and driver loop for avianlink"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,13 @@ license.workspace = true
 
 [dependencies]
 avianlink-core = { workspace = true, features = ["std"] }
+rand_chacha = { workspace = true }
+rand_core = { workspace = true }
+getrandom = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+avianlink-sim = { workspace = true }
 
 [lints]
 workspace = true

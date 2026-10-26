@@ -95,7 +95,9 @@ pub fn handle_packet(data: &[u8]) {
         now += u64::from(op >> 3) * 250;
         let t = Timestamp::from_millis(now);
         match op & 3 {
-            0 => e.handle_packet(link, chunk, t),
+            0 => {
+                e.handle_packet(link, chunk, t);
+            }
             1 => {
                 let mut pkt = Vec::new();
                 begin_packet(&mut pkt, keys.tx_tag, counter);

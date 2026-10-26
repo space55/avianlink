@@ -570,42 +570,51 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         Ok(Queued { id, seq, lamport })
     }
 
-    /// Feeds a packet received on `link`. Malformed or unauthenticated
-    /// packets are dropped and counted in [`Stats`]; this never fails or
-    /// panics.
-    pub fn handle_packet(&mut self, link: LinkId, bytes: &[u8], now: Timestamp) {
+    /// Feeds a packet received on `link`. Returns the conversation it
+    /// authenticated to: hosts on point-to-point transports use it to keep
+    /// the contact's address current (only authenticated packets may move
+    /// an address). Malformed, unauthenticated or replayed packets are
+    /// dropped, counted in [`Stats`], and return `None`; this never fails
+    /// or panics.
+    pub fn handle_packet(
+        &mut self,
+        link: LinkId,
+        bytes: &[u8],
+        now: Timestamp,
+    ) -> Option<ConversationId> {
         self.observe(now);
         bump(&mut self.stats.packets_received);
         let Some(l) = self.links.get_mut(&link) else {
             bump(&mut self.stats.packets_dropped_unknown_link);
-            return;
+            return None;
         };
         bump(&mut l.stats.packets_received);
         l.stats.bytes_received = l.stats.bytes_received.saturating_add(u64_of(bytes.len()));
-        if !self.process_packet(link, bytes) {
+        let sender = self.process_packet(link, bytes);
+        if sender.is_none() {
             if let Some(l) = self.links.get_mut(&link) {
                 bump(&mut l.stats.packets_dropped);
             }
         }
+        sender
     }
 
-    /// Authenticates and applies one packet. Returns whether it was
-    /// accepted.
-    fn process_packet(&mut self, link: LinkId, bytes: &[u8]) -> bool {
+    /// Authenticates and applies one packet. Returns the sender if accepted.
+    fn process_packet(&mut self, link: LinkId, bytes: &[u8]) -> Option<ConversationId> {
         let tag = match wire::peek_tag(bytes) {
             Ok(tag) => tag,
             Err(DecodeError::UnknownVersion(_)) => {
                 bump(&mut self.stats.packets_dropped_version);
-                return false;
+                return None;
             }
             Err(_) => {
                 bump(&mut self.stats.packets_dropped_malformed);
-                return false;
+                return None;
             }
         };
         let Ok((_, counter, hlen)) = wire::parse_header(bytes) else {
             bump(&mut self.stats.packets_dropped_malformed);
-            return false;
+            return None;
         };
         // Trial decryption over the (usually single) contact with this tag.
         // The replay check is cheap and comes first, but the window only
@@ -631,14 +640,14 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             } else {
                 bump(&mut self.stats.packets_dropped_unauthenticated);
             }
-            return false;
+            return None;
         };
         if let Some(contact) = self.contacts.get_mut(&conv) {
             contact.replay.mark(counter);
         }
         if wire::validate_frames(&frames).is_err() {
             bump(&mut self.stats.packets_dropped_malformed);
-            return false;
+            return None;
         }
         if let Some(contact) = self.contacts.get_mut(&conv) {
             contact.route = Some(link);
@@ -654,13 +663,13 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             } else {
                 bump(&mut self.stats.frames_dropped_invalid);
             }
-            return true;
+            return Some(conv);
         }
         self.fec_rx.store(conv, counter, &frames);
         self.apply_frames(conv, &frames);
         let windows = self.fec_rx.windows_with(conv, counter);
         self.fec_recover(conv, windows);
-        true
+        Some(conv)
     }
 
     /// Applies the frames of an authenticated (or FEC-recovered) packet.
