@@ -47,8 +47,9 @@ fn on_path_attacker_achieves_nothing() {
 /// Done-criterion, part 2: Phase 2 metrics regress by no more than the
 /// documented header overhead (`wire-format.md` §6: +12 bytes per packet,
 /// and correspondingly smaller fragments at small MTUs). Phase 2 values
-/// are seed-1 results recorded before the switch (commit 895c3ff). FEC
-/// (Phase 4) is off here: this measures header overhead alone.
+/// are seed-1 results recorded before the switch (commit 895c3ff), with the
+/// workload of that time (`legacy_workload`). FEC (Phase 4) is off here:
+/// this measures header overhead alone.
 #[test]
 fn regression_matches_documented_overhead() {
     let no_fec = |mut sc: Scenario| {
@@ -61,7 +62,7 @@ fn regression_matches_documented_overhead() {
         (Profile::Edge2g, 1.89, 2.60),
         (Profile::DisasterCellular, 4.99, 4.30),
     ] {
-        let r = no_fec(Scenario::new(profile, 1)).run();
+        let r = no_fec(Scenario::new(profile, 1).legacy_workload()).run();
         assert_clean(&r);
         assert_eq!(r.payload_bytes as f64, PAYLOAD);
         let p2_wire = p2_wire_per_payload * PAYLOAD;
@@ -76,8 +77,12 @@ fn regression_matches_documented_overhead() {
     // Small MTUs: packet count grows by at most the fragment-efficiency
     // ratio of the overhead table (51 B: 33 → 21; 64 B: 46 → 34).
     for (sc, p2_pkts_per_msg, ratio) in [
-        (Scenario::new(Profile::LoraLike, 1), 8.52, 33.0 / 21.0),
-        (Scenario::harsh_64(1), 11.69, 46.0 / 34.0),
+        (
+            Scenario::new(Profile::LoraLike, 1).legacy_workload(),
+            8.52,
+            33.0 / 21.0,
+        ),
+        (Scenario::harsh_64(1).legacy_workload(), 11.69, 46.0 / 34.0),
     ] {
         let r = no_fec(sc).run();
         assert_clean(&r);

@@ -591,3 +591,50 @@ dead links cheap.
 **Rejected:** unbounded doubling. Bytes would be logarithmic in the outage
 length, but return latency could reach days. `nudge()` lets hosts that
 know connectivity changed skip the wait entirely.
+
+## D-041: Simulator workload re-based to ~200-byte messages (after Phase 5)
+
+**Decision.** The default message mix is now 45% short (5–80 B), 42%
+medium (80–300 B) and 13% long (300–1200 B). The measured mean is 199.6
+bytes, the expected real workload. The old mix (80/15/5, about 100 B) is
+kept as `LengthMix::LEGACY`. `Scenario::legacy_workload()` restores it,
+and the Phase 3 overhead-regression test uses it, because it pins seed-1
+numbers from that time.
+
+**LoRa interval.** At the old 10-minute interval, 200-byte messages
+overload a 1% duty cycle: about 10 fragments each at a 51-byte MTU, and p95
+over a day. `lora_like` now sends one message every 25 minutes, which
+keeps its airtime utilization where it was. Measured p95: 22.9m at 20 min,
+11.1m at 25 min, 6.2m at 30 min.
+
+**FEC default re-checked** on the new workload, with 60 paired seeds, XOR
+vs Reed-Solomon:
+
+| scenario | p95 XOR → RS | p50 XOR → RS | bytes RS vs XOR |
+|---|--:|--:|--:|
+| bursty_loss, MTU 64 | 42.9s → 31.5s (RS better on 50/60) | 3.3s → 1.6s (60/60) | +15% |
+| bursty_loss, MTU 51 | 35.9s → 26.3s (47/60) | 5.1s → 3.6s (60/60) | +14% |
+| bursty_loss, MTU 256 | 38.3s → 40.7s (tie) | 1.0s → 1.0s | +4% |
+| disaster_cellular, harsh_64 | tie | tie | +2–4% |
+
+Reed-Solomon stays the default (D-038). It is clearly better where
+messages span several packets, and within a few percent elsewhere.
+
+**New baseline** (20 seeds, medians of per-seed values, default config):
+
+| scenario | delivered | p50 | p95 | p99 | wire/payload | pkts/msg |
+|---|--:|--:|--:|--:|--:|--:|
+| clean | 100% | 5ms | 5ms | 5ms | 1.31 | 2.00 |
+| geo_satellite | 100% | 318ms | 428ms | 23.9s | 1.49 | 2.17 |
+| edge_2g | 100% | 414ms | 1.8s | 38.6s | 2.02 | 3.13 |
+| disaster_cellular | 100% | 7.3s | 6.8m | 11.6m | 5.14 | 8.00 |
+| lora_like | 100% | 3.1s | 11.1m | 49.2m | 5.04 | 24.64 |
+| harsh_64 | 100% | 12.1m | 57.5m | 1.2h | 8.64 | 32.20 |
+| harsh_64_crashy | 100% | 10.7m | 53.4m | 1.2h | 9.71 | 34.81 |
+| disaster_hostile | 100% | 9.0s | 7.2m | 12.4m | 5.61 | 9.06 |
+| bursty_loss | 100% | 1.0s | 43.5s | 2.0m | 4.51 | 8.23 |
+| week_offline | 100% | 2.5d | 6.6d | 6.9d | 1.94 | 2.08 |
+
+Wire bytes per payload byte drop on every profile compared with the
+100-byte workload: fixed per-packet and per-ACK costs are spread over
+more payload. Packets per message rise with fragmentation.

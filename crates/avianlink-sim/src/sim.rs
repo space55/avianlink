@@ -54,12 +54,25 @@ pub struct LengthMix {
     pub medium: f64,
 }
 
+impl LengthMix {
+    /// The default: messages average about 200 bytes, the expected real
+    /// workload (D-041).
+    pub const TYPICAL: Self = Self {
+        short: 0.45,
+        medium: 0.42,
+    };
+
+    /// The Phase 1–5 workload, averaging about 100 bytes. Kept so tests
+    /// that pin numbers from those phases stay comparable.
+    pub const LEGACY: Self = Self {
+        short: 0.80,
+        medium: 0.15,
+    };
+}
+
 impl Default for LengthMix {
     fn default() -> Self {
-        Self {
-            short: 0.80,
-            medium: 0.15,
-        }
+        Self::TYPICAL
     }
 }
 
@@ -121,12 +134,12 @@ pub struct Scenario {
 }
 
 impl Scenario {
-    /// Defaults for a named profile: 1000 messages, one every 30 s on
-    /// average (every 10 min on `lora_like`, whose 1% duty cycle carries only
-    /// ~3 KB/hour), 30-day deadline, no crashes.
+    /// Defaults for a named profile: 1000 messages averaging ~200 bytes,
+    /// one every 30 s on average (every 25 min on `lora_like`, whose 1% duty
+    /// cycle carries only ~3 KB/hour), 30-day deadline, no crashes.
     pub fn new(profile: Profile, seed: u64) -> Self {
         let mean_interval_ms = match profile {
-            Profile::LoraLike => 600_000,
+            Profile::LoraLike => 1_500_000,
             _ => 30_000,
         };
         Self {
@@ -237,6 +250,16 @@ impl Scenario {
             "week_offline" => Some(Self::week_offline(seed)),
             _ => Profile::from_name(name).map(|p| Self::new(p, seed)),
         }
+    }
+
+    /// This scenario with the Phase 1–5 workload (~100-byte messages; one
+    /// every 10 min on LoRa), for comparisons pinned to those phases.
+    pub fn legacy_workload(mut self) -> Self {
+        self.lengths = LengthMix::LEGACY;
+        if self.mean_interval_ms == 1_500_000 {
+            self.mean_interval_ms = 600_000;
+        }
+        self
     }
 
     /// Runs the scenario to completion or deadline.
