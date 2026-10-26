@@ -158,3 +158,161 @@ GHSA-85c8-ppgw-ccpr, prototype pollution to RCE in `tinypool`). `npm audit`
 is clean on 5. A dev-only dependency still runs with repository write access
 on every contributor's machine, so "dev-only" is not a reason to carry a
 known RCE.
+
+## DA-012: `FakeEngine` runs two real engines, not an imitation (Phase 1)
+
+**Decision.** `FakeEngine` owns a real `avianlink_core::Engine` for this
+machine and one more per simulated contact, connected by an impaired channel.
+It does not imitate the protocol; it runs it. Fragmentation at the real MTU,
+real acknowledgements, real adaptive retransmission, real duplicate
+suppression and real causal ordering all happen, over a link that really does
+lose, delay, corrupt, duplicate and reorder packets.
+
+**Why.** The brief asks the fake to "behave like a bad link, not a perfect
+one, so the UI is designed against reality from day one". A hand-written fake
+that emits plausible events would let the interface be built against behaviour
+the real engine never produces, and every difference would surface in the
+app's Phase 3 as a UI bug found late. Running the real engine makes the Phase 3
+adapter a change of _where packets go_ and nothing else.
+
+It also turned out to be less code, not more: the peer's acknowledgements,
+retransmission timers and reassembly are the library's problem, not the app's.
+
+**Cost.** The app's test suite now depends on the library's behaviour, so a
+library regression fails the app's tests. That is arguably a feature. It also
+means the app cannot be built while the library is mid-refactor, which
+happened twice during Phase 1.
+
+## DA-013: Dependency: `avianlink-sim`, for impairment parameters only (Phase 1)
+
+**Decision.** `avianlink-sim` is a normal dependency of the app, used for
+`Profile::link() -> LinkProfile`: the tuned delay, bursty-loss, corruption,
+duplication, reordering, MTU, airtime and outage parameters of the five named
+profiles. The code that _applies_ them is reimplemented in
+`src-tauri/src/engine/channel.rs`.
+
+**Why not reuse the simulator's channel.** It is `pub(crate)`, and the only
+public entry point, `Scenario::run()`, executes a whole batch over virtual
+time — the wrong shape for a GUI advancing in real time. Filed as AR-009.
+
+**Why reuse the parameters.** They are the half that was tuned against real
+links and that `scripts/netem/` mirrors. A second set of invented numbers
+would make the app's "disaster cellular" mean something different from the
+library's, which would make every comparison between them meaningless.
+
+**Flagged.** Shipping a simulator inside the release binary is wrong
+long-term. Phase 3 should put `FakeEngine` and this dependency behind a
+feature that is off by default.
+
+## DA-014: Dependency: `@paulmillr/qr` 0.3 for the QR code (Phase 1)
+
+The brief requires showing your own public key as a QR code. `@paulmillr/qr`
+has no dependencies, is maintained by the author of the `noble` cryptography
+libraries, and its `encodeQR(value, 'raw')` returns a boolean matrix — which
+is what the app wants, because it renders the code as inline SVG rather than
+to a canvas. SVG is crisp at any size, prints, and needs no `<canvas>`
+permission or pixel-ratio handling.
+
+**Rejected:** `qrcode` (pulls a CLI and several dependencies) and hand-rolling
+one (Reed–Solomon over GF(256), mask selection and version tables, to draw a
+square — not a good use of a budget that should go to the interface).
+
+## DA-015: A single `Simulation` escape hatch, not scattered `is_fake()` checks (Phase 1)
+
+**Decision.** `EngineHandle::simulation() -> Option<&mut dyn Simulation>`
+returns `Some` only for `FakeEngine`. Everything that exists only in the
+simulation — impairment settings, inventing a contact, seeding history,
+forcing a message into `failed` — is behind it.
+
+**Why.** The alternative is a scattering of capability questions through the
+command layer, each of which quietly becomes a place where a dev-only path can
+leak into a release build. One named hatch makes the set of such things
+explicit and finite, and makes `add_simulated_contact` fail honestly on the
+real engine rather than creating a contact nothing will ever answer.
+
+## DA-016: The app is English-only, and relative times are hand-written (Phase 1)
+
+`Intl.RelativeTimeFormat` produces "2 hours ago", which is the wrong register
+and too wide for the sidebar; the app wants "2h". There is no localisation
+layer, so the terse English in `lib/format.ts` is written directly. Absolute
+times and dates _do_ go through `Intl`, because those are the parts where the
+user's locale and timezone genuinely matter.
+
+**Revisit** if the app is ever localised, at which point the terse forms need
+a proper message catalogue rather than string concatenation.
+
+## DA-017: Contrast is enforced by a test, not by eye (Phase 1)
+
+**Decision.** `tests/tokens.test.ts` parses `src/app.css`, computes WCAG
+contrast ratios for every text token against every surface token in both
+themes, and fails below 4.5:1.
+
+**Why.** It found a real defect immediately: `--text-faint` was at 3.01:1 in
+light and 3.97:1 in dark. That token carries timestamps, link health and the
+queued state — all real information at small sizes, all of which WCAG holds to
+the full 4.5:1. It is also exactly the token a designer keeps nudging quieter,
+so it is the one most likely to drift back.
+
+Both themes' faint tones were darkened/lightened to clear the threshold.
+
+## DA-018: The bindings check asks whether regeneration changed the file (Phase 1)
+
+**Decision.** `scripts/desktop-ci.sh` snapshots `bindings.ts`, runs
+`cargo test` (which regenerates it), and compares against the snapshot.
+
+**Reversed from DA-007**, which compared against git `HEAD`. That version
+failed on _any_ uncommitted work, including the commit that was introducing
+the change — it was testing "is the working tree clean" rather than "is the
+generated file current", which made the gate unrunnable mid-change.
+
+## DA-019: Brand assets are used as supplied, and the tier is chosen by rendered size (Phase 1)
+
+**Decision.** The `avianlink-logo` package (v1.0) is vendored into
+`src/assets/brand/` and `src-tauri/icons/`, and the app follows its sizing
+rules rather than scaling one file everywhere:
+
+| Where                           | File                      | Rule                            |
+| ------------------------------- | ------------------------- | ------------------------------- |
+| Sidebar header, sidebar ≥ 248px | compact lockup, 24px tall | lockup 24–47px → compact        |
+| Sidebar header, narrower        | wordmark alone, 16px tall | below 24px → wordmark alone     |
+| Empty-state placeholder         | full mark, 112px wide     | mark ≥ 96px → full              |
+| App icon                        | full icon, 1024px         | icon ≥ 128px → full             |
+| `index.html`                    | `favicon.svg`             | micro mark, adapts to dark mode |
+
+**Why the `-currentcolor` variants.** They inherit the surrounding text
+colour, so one file is correct in both themes. The alternative — a `-dark`
+and a `-light` file swapped by a media query — is two files that can drift and
+a second place for the theme to be wrong.
+
+**Why inline SVG rather than `<img>`.** `currentColor` does not resolve inside
+an `<img>`; the image is an isolated document. The files are imported with
+Vite's `?raw` and inserted with `{@html}`, which keeps them byte-identical to
+the package. The guidelines say to use the supplied files as they are and not
+to rebuild the lockup from its parts, and a component that reconstructed the
+mark from its rectangles would be doing exactly that.
+
+**Clear space** — half the mark's height on every side, with nothing entering
+it — is implemented as padding on the wrapper with a compensating negative
+margin, so the reserved space is real but the element still aligns to its
+container's edge.
+
+**The accessible name comes from the file.** Every supplied SVG already
+carries `role="img"` and `aria-label="avianlink"`; the wrapper adds neither,
+because nesting two identical image roles is worse than nesting none.
+
+## DA-020: The app icon is rendered by Chromium, not reimplemented (Phase 1)
+
+**Decision.** `src-tauri/icons/render-source.mjs` loads the supplied
+1024×1024 icon SVG in headless Chromium (via the Playwright the test suite
+already depends on) and screenshots it to `source.png`, which `tauri icon`
+expands into the platform set.
+
+**Rejected:** the previous placeholder generator, which drew rounded
+rectangles from scratch in pure Python. Reimplementing the mark's 14 lines and
+their per-line opacity would produce an approximation of the brand asset
+rather than the asset itself — and the icon is the one place where being
+approximately on-brand is indistinguishable from being off-brand.
+
+**Rejected:** adding `resvg`/`librsvg`/ImageMagick. A build-time dependency on
+a native image toolchain, for one file that changes about once a year, when a
+real browser engine is already installed.

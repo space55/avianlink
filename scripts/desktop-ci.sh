@@ -29,18 +29,23 @@ cargo fmt -p avianlink-desktop -- --check
 step "cargo clippy (app only, warnings are errors)"
 cargo clippy -p avianlink-desktop --all-targets --locked --no-deps -- -D warnings
 
+BINDINGS="$APP/src/lib/ipc/bindings.ts"
+BEFORE="$(mktemp)"
+trap 'rm -f "$BEFORE"' EXIT
+cp "$BINDINGS" "$BEFORE"
+
 step "cargo test"
 # This also regenerates src/lib/ipc/bindings.ts via ts-rs.
 cargo test -p avianlink-desktop --locked
 
 step "generated bindings are current"
-# `cargo test` rewrites the bindings; if that changed the file, the committed
-# copy was stale. The frontend jobs typecheck against the committed copy
-# without a Rust toolchain, so it has to be right (DA-007).
-BINDINGS="apps/desktop/src/lib/ipc/bindings.ts"
-if ! git diff --quiet -- "$BINDINGS"; then
-    git --no-pager diff --stat -- "$BINDINGS"
-    fail "$BINDINGS is out of date; commit the regenerated file"
+# The question is whether *regenerating* changed the file, not whether it
+# differs from git: the frontend jobs typecheck against the committed copy
+# without a Rust toolchain, so a stale copy would typecheck a lie (DA-007).
+# Comparing against HEAD instead would fail on any uncommitted work.
+if ! diff -q "$BEFORE" "$BINDINGS" >/dev/null; then
+    diff -u "$BEFORE" "$BINDINGS" | head -40 || true
+    fail "src/lib/ipc/bindings.ts was stale; it has been regenerated, commit it"
 fi
 
 step "prettier --check"

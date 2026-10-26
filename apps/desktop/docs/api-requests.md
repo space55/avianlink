@@ -6,8 +6,12 @@ proposed signature, and the workaround the app uses in the meantime.
 
 Status values: **open**, **accepted**, **declined**, **done**.
 
-Observed against `avianlink-core` as of the library's Phase 2 work in
-progress (`Queued`, `ReceivedMessage::missing_before`, `MemoryStorageError`).
+Observed against `avianlink-core` after the library's Phase 3 (cryptography).
+
+**Nine of the eleven entries below are now done.** The library adopted the
+proposed shapes closely enough that the app's workarounds were deletions
+rather than migrations. What is left is AR-003 (which may be the right answer
+already) and AR-006/AR-009, neither of which blocks the app's Phase 1.
 
 ---
 
@@ -17,195 +21,98 @@ progress (`Queued`, `ReceivedMessage::missing_before`, `MemoryStorageError`).
 
 ```rust
 pub struct Queued { pub id: MessageId, pub seq: u64, pub lamport: u64 }
-pub fn send_text(&mut self, conversation: ConversationId, text: &str, now: Timestamp)
-    -> Result<Queued, Error>
 ```
 
 The app re-exports `avianlink_core::Queued` from `engine::Queued` rather than
-declaring its own, and the mirrored-Lamport workaround described here is gone.
+declaring its own.
 
-_Original request, for the record:_ the app has to interleave its own
-outgoing messages with incoming ones in one thread, and ordering outgoing
-messages by local queue time while ordering incoming ones by Lamport does not
-compose — a reply written in response to our message can sort above it. The
-workaround was for the app to mirror the engine's Lamport rule in its own
-store, which it could not verify and which would have broken silently if the
-library ever added a frame type that advanced the clock.
+_Why it mattered:_ the app interleaves its own outgoing messages with incoming
+ones in one thread. Ordering outgoing messages by local queue time while
+ordering incoming ones by Lamport does not compose — a reply written in
+response to our message can sort above it.
 
-## AR-001a — `ReceivedMessage::missing_before` should have a counterpart for history
+## AR-002 — A signal that a message has actually been transmitted
 
-**Status:** open. **Severity:** low; a refinement, not a gap.
+**Status: done.** `Event::MessageTransmitted { conversation, id }`, with retry
+counts from `Engine::outgoing(conversation) -> Vec<OutgoingStatus>`.
 
-The library added
+This removed the app's worst workaround. The driver used to promote _every_
+still-queued message in a conversation to `sent` whenever any packet for that
+conversation was flushed, because `Transmit` names a conversation and not the
+messages inside it. That over-reported in exactly the direction the brief says
+not to be optimistic about. Both the workaround and the
+`EngineHandle::reports_transmissions` flag that gated it are gone.
 
-```rust
-/// Earlier messages from this sender not yet received. Non-zero means
-/// this one overtook them in the network.
-pub missing_before: u64,
-```
-
-which is genuinely useful: it lets the thread say "two earlier messages are
-still on their way" rather than leaving a silent gap, and the app will use it
-in Phase 1.
-
-It answers the _forward_ question (what is still missing below this message).
-The app also needs the _backward_ one: did this message land behind messages
-the user was already looking at? That is what the "arrived later" marker
-means, and only the host can answer it, because it depends on what the host
-had already displayed. No library change is needed — this entry exists so the
-distinction is written down and `missing_before` is not mistaken for the
-same thing.
-
-## AR-002 — No signal that a message has actually been transmitted
-
-**Status:** open. **Blocks:** the _sent_ message state.
-
-The UI distinguishes **queued** (saved locally) from **sent** (at least one
-transmission went out) from **delivered** (acknowledged). The engine reports
-delivery (`Event::MessageDelivered`) but nothing for transmission.
-`poll_transmit` returns
-
-```rust
-pub struct Transmit { pub link: LinkId, pub to: ConversationId, pub packet: Packet }
-```
-
-which names the conversation but not the messages inside the packet, and a
-packet may carry several messages (library D-012) or only ACKs.
-
-**Proposed.** Either add the carried messages to `Transmit`:
-
-```rust
-pub struct Transmit {
-    pub link: LinkId,
-    pub to: ConversationId,
-    pub packet: Packet,
-    /// Messages with at least one fragment in this packet. Empty for a
-    /// packet that carries only acknowledgements.
-    pub contains: Vec<MessageId>,
-}
-```
-
-or emit an event the first time a message leaves:
-
-```rust
-Event::MessageTransmitted { conversation: ConversationId, id: MessageId, attempt: u32 }
-```
-
-The event form is cheaper for a host that only wants the state change, and
-`attempt` would let the UI show "retried 4 times" on hover, which on these
-links is the information a user actually wants. The `Transmit` form avoids an
-event-queue slot per transmission.
-
-**Workaround.** The driver marks _every_ not-yet-sent outgoing message in a
-conversation as _sent_ when any `Transmit` for that conversation is flushed.
-This over-reports: an ACK-only packet, or a packet carrying the first of
-three queued messages, promotes all three. The app's status display is
-therefore optimistic in exactly the direction the brief says not to be.
+**A note worth recording**, since it shaped the app's design before the event
+landed: while `wire` was public and packets were plaintext, the host could
+parse an outgoing packet and read the sequence numbers out of its MSG frames,
+which was exact. Phase 3's encryption closed that door — an outgoing packet is
+now AEAD-sealed and the host cannot read its own frames back without
+decrypting. So the event is not merely more convenient than parsing; after
+Phase 3 it is the only way a host can know.
 
 ## AR-003 — No "gave up" event, so _failed_ is unreachable
 
-**Status:** open. **Blocks:** the _failed_ message state.
+**Status:** open, and possibly correctly so.
 
-The brief specifies _failed_ "only if the library gives up". Phase 1
-retransmits on a fixed interval forever, and there is no event for
-abandoning a message. `Config` has `max_outbox_messages` but reaching it
-fails the _new_ `send_text` rather than giving up on an old message.
+The brief specifies _failed_ "only if the library gives up". The engine still
+has no abandonment event, and the right default for avianlink is probably
+**never give up**: a peer silent for days is normal, and an app that showed
+_failed_ after an hour would be lying.
 
-**Proposed.**
+Phase 3 added `ContactStatus::unreachable` — "the engine currently believes
+the contact unreachable and is only probing" — which is a _better_ answer for
+the common case than a terminal failure, because it is reversible and is
+about the peer rather than the message.
+
+What is still missing is the genuinely terminal case: a message evicted
+because the outbox filled.
 
 ```rust
 Event::MessageAbandoned {
     conversation: ConversationId,
     id: MessageId,
-    reason: AbandonReason, // OutboxEvicted, RetryLimit, ContactRemoved
+    reason: AbandonReason, // OutboxEvicted, ContactRemoved
 }
 ```
 
-plus a `Config` field for the policy. Note that the right default for
-avianlink is probably _never give up_: a peer silent for days is normal
-(library spec, "Reliability"), so an app that shows _failed_ after an hour
-would be lying. A host-chosen `max_message_age_ms` with no default limit
-seems right.
+**Workaround.** The state exists in the IPC enum, the UI renders it, and
+`FakeEngine::abandon` produces it on demand so it is designed and tested
+rather than designed blind. Against the real engine it will not occur.
 
-**Workaround.** The app never shows _failed_ from the real engine. The state
-exists in the IPC enum, the UI renders it, and `FakeEngine` can produce it on
-demand so the state is designed and tested — but against the real engine it
-will not occur until this lands.
+**Suggestion for the library:** if abandonment stays out, consider surfacing
+`unreachable` as an event rather than only as a polled field, so a host does
+not have to ask about every contact on every pump to notice it changed.
 
 ## AR-004 — Fingerprint derivation belongs in the library
 
-**Status:** open. **Severity:** medium (correctness is fine; interop is not).
+**Status: done.** `PublicKey::fingerprint() -> [u8; FINGERPRINT_LEN]` and
+`format_fingerprint`, with the same domain-separation label and the same
+five-groups-of-four rendering the app had been using. Fingerprints did not
+change when the app switched over, which is how it should be.
 
-Adding a contact is the app's only authentication step, and it rests on a
-human comparing a short fingerprint out of band. If the desktop app, the CLI
-demo and a future mobile app each derive that string differently, users
-comparing across clients will see a mismatch and learn to ignore mismatches.
+`apps/desktop/src-tauri/src/identity.rs` is now a one-line delegation. This is
+the entry that mattered most for correctness-in-the-large: two avianlink
+clients showing _different_ fingerprints for the same key would teach users to
+ignore mismatches.
 
-**Proposed.** One derivation in core, with the hash already present:
+## AR-005 — Contact enumeration and removal
 
-```rust
-impl PublicKey {
-    /// 80-bit domain-separated fingerprint for out-of-band comparison.
-    pub fn fingerprint(&self) -> [u8; 10];
-}
-
-/// Canonical rendering: five groups of four lowercase hex characters.
-pub fn format_fingerprint(fp: &[u8; 10]) -> alloc::string::String;
-```
-
-**Workaround.** `apps/desktop/src-tauri/src/identity.rs` computes
-`SHA-256("avianlink-fingerprint-v1" || pk)[..10]` with the same grouping, so
-the library can adopt the app's definition unchanged (desktop DA-009).
-
-## AR-005 — No contact enumeration or removal
-
-**Status:** open. **Severity:** low (the app owns this state anyway).
-
-`add_contact(key) -> ConversationId` is the only contact API. There is no
-`contacts()`, no `remove_contact`, and no way to recover the `PublicKey` for
-a `ConversationId`. After a restart the host must re-add every contact in
-order to repopulate the engine.
-
-**Proposed.**
-
-```rust
-pub fn contacts(&self) -> impl Iterator<Item = (ConversationId, PublicKey)> + '_;
-pub fn contact_key(&self, conversation: ConversationId) -> Option<PublicKey>;
-pub fn remove_contact(&mut self, conversation: ConversationId) -> Result<(), Error>;
-```
-
-`remove_contact` needs a documented answer for the contact's outbox and
-partial reassemblies.
-
-**Workaround.** The app's SQLite store is the source of truth for contacts
-and replays `add_contact` for each one at startup. This is not really a
-workaround — the app needs display names and verification state that the
-library should not know about — so only `remove_contact` is genuinely
-missing, for the "delete contact" action.
+**Status: done.** `Engine::contacts()`, `Engine::contact_key()` and
+`Engine::remove_contact() -> Result<Vec<MessageId>, Error>` — the last of
+which answers the question the original request raised about the removed
+contact's outbox by returning the abandoned message ids.
 
 ## AR-006 — `Storage` needs atomic batches to keep its durability promise
 
 **Status:** open. **Severity:** high for the app's Phase 2/3.
 
-The trait is three independent calls:
-
-```rust
-fn load(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
-fn store(&mut self, key: &[u8], value: &[u8]) -> Result<(), Self::Error>;
-fn remove(&mut self, key: &[u8]) -> Result<(), Self::Error>;
-```
-
-with the documented contract that a `store` returning `Ok` is durable. The
-library already marks this provisional and plans prefix iteration for its
-Phase 2. The missing piece for a crash-safe host is **atomicity across
-keys**: queueing a message updates both the outbox entry and the sequence
-counter, and a crash between the two leaves the engine with a counter that
-has outrun its outbox.
-
-Per-call durability is also expensive done literally — one `fsync` per key
-means several fsyncs per queued message.
-
-**Proposed.** Let the engine delimit a set of writes that must land together:
+The trait is still three independent calls with a documented promise that a
+`store` returning `Ok` is durable. The missing piece for a crash-safe host is
+**atomicity across keys**: queueing a message updates both the outbox entry
+and the sequence counter, and a crash between the two leaves the engine with a
+counter that has outrun its outbox. Per-call durability is also expensive done
+literally — one `fsync` per key means several per queued message.
 
 ```rust
 pub trait Storage {
@@ -221,64 +128,97 @@ pub trait Storage {
 }
 ```
 
-Default bodies keep `MemoryStorage` and existing hosts working. A prefix
-scan (`iter_prefix`) is the library's own Phase 2 item and is also needed.
+Default bodies keep `MemoryStorage` and existing hosts working.
 
-**Workaround.** None available at Phase 1: the engine does not persist yet,
-so the app's SQLite `Storage` implementation has nothing to be
-non-atomic about. The app's _own_ history and outbox-mirror writes use
-SQLite transactions. This becomes blocking at the app's Phase 3.
+**Workaround.** None needed yet: the app's store is still in memory. This
+becomes blocking when the app implements `Storage` on SQLite in its Phase 2,
+and it is the one entry here that should be settled before then.
 
-## AR-007 — Per-link and per-contact statistics for the link-health display
+## AR-007 — Per-link and per-contact statistics
 
-**Status:** open. **Severity:** medium.
+**Status: done.** `Engine::link_stats(link) -> LinkStats` and
+`Engine::contact_status(conversation) -> ContactStatus`.
 
-`Stats` is a flat set of global counters. The UI needs, per link: up/down,
-packets in and out, recent loss, and time since the last packet. Per contact
-it needs time since the last packet _from that contact_, which is the single
-most useful number on a link where silence for a day is normal.
+Both landed with the fields the link-health display needed, including the two
+that mattered most:
 
-**Proposed.**
-
-```rust
-pub struct LinkStats {
-    pub packets_sent: u64,
-    pub packets_received: u64,
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
-    pub packets_dropped: u64,
-    pub budget_blocked_until: Option<Timestamp>,
-}
-pub fn link_stats(&self, link: LinkId) -> Option<LinkStats>;
-pub fn last_packet_from(&self, conversation: ConversationId) -> Option<Timestamp>;
-```
-
-`budget_blocked_until` matters for duty-cycled links: "nothing is wrong, the
-radio is out of airtime until 14:02" is a calm and true thing to show, and
-the engine's pacer is the only thing that knows it.
-
-**Workaround.** The driver counts packets per link itself (it is the one
-handing them to the engine) and records `last_packet_from` by watching which
-conversation each inbound packet resolved to — which it can only do for
-packets that produced an event, so a packet carrying only an ACK does not
-update the contact's "last heard from" time. Loss is not observable to the
-host at all; the UI shows loss only for `FakeEngine`, where the fake knows
-what it dropped.
+- `LinkStats::budget_blocked_until` — "nothing is wrong, the radio is out of
+  airtime until 14:02" is a calm and true thing to show, and the pacer is the
+  only thing that knows it.
+- `ContactStatus::last_heard` — explicitly including acknowledgement-only
+  packets. The app previously had to infer this from messages, so a peer that
+  was acknowledging but not talking looked silent. The thread header's "heard
+  from Rook 3h ago" is now true rather than merely plausible.
 
 ## AR-008 — Restoring an engine from `Storage`
 
-**Status:** open. **Severity:** blocking for the app's Phase 3, not before.
+**Status: done.** `Engine::restore(config, identity, storage, rng)`, explicit
+rather than making `new` implicitly resume. The app will use it in Phase 3.
 
-`Engine::new(config, local, storage, rng)` takes storage but there is no
-documented "resume from what is in storage" path, so a restart loses the
-outbox. This is the library's own Phase 2 goal ("the engine can be restored
-from `Storage` mid-run without losing or duplicating messages"), listed here
-only so the app's dependency on it is written down. A constructor that makes
-the intent explicit, e.g.
+## AR-009 — The simulator's impairment engine is not reachable from a host
+
+**Status:** open. **Severity:** low; a convenience, with a real duplication
+cost.
+
+`avianlink-sim` exposes its tuned impairment _parameters_ publicly
+(`Profile::link() -> LinkProfile`, with `DelayModel`, `GilbertElliott`,
+`OutageModel` and friends all public) but keeps the thing that _applies_ them
+private: `impair::Channel` is `pub(crate)`, and `Jitter::sample` is a private
+method on a public enum with public fields.
+
+The only public way to drive impairments is `Scenario::run()`, which executes
+a whole batch over virtual time. That is the right shape for the library's
+metrics and the wrong shape for a GUI advancing in real time, one pump at a
+time.
+
+**Proposed.** Make the per-direction channel public and drivable:
 
 ```rust
-pub fn restore(config: Config, local: PublicKey, storage: S, rng: R)
-    -> Result<Self, Error>
+impl Channel {
+    pub fn new(profile: LinkProfile, rng: ChaCha20Rng) -> Self;
+    /// Hands a packet to the link at `now`.
+    pub fn send(&mut self, now: u64, bytes: &[u8], link_down: bool);
+    /// Packets due at or before `now`, in arrival order.
+    pub fn take_due(&mut self, now: u64) -> Vec<Vec<u8>>;
+    pub fn next_arrival(&self) -> Option<u64>;
+    pub fn stats(&self) -> ChannelStats;
+}
 ```
 
-would be clearer than making `new` implicitly resume.
+plus `pub fn Jitter::sample(&self, rng: &mut ChaCha20Rng) -> u64`.
+
+**Workaround.** `apps/desktop/src-tauri/src/engine/channel.rs` reimplements
+the ~150 lines of "roll a die, drop or delay the packet" against the
+library's public parameters. Reusing the numbers and not the code is the
+better half to duplicate — the numbers are what was tuned against real links
+— but the two will drift, and the app's channel does not implement rate
+serialisation or the duty log, so it is a strictly weaker model than the
+simulator's.
+
+## AR-010 — `ReceivedMessage::missing_before` has no counterpart for history
+
+**Status:** open. **Severity:** low; a note, not a gap.
+
+`missing_before` is genuinely useful and the app uses it: the thread shows
+"2 earlier messages are still on their way" above a message that overtook
+others. It answers the _forward_ question — what is still missing below this
+message.
+
+The app also needs the _backward_ one: did this message land behind messages
+the user was already looking at? That is what the "arrived out of order"
+marker means. No library change is needed — only the host knows what it had
+already displayed — and this entry exists so the two are not confused.
+
+## AR-011 — `Identity::secret_bytes` is exactly the right keychain hook
+
+**Status: done**, recorded as confirmation rather than as a request.
+
+```rust
+pub fn secret_bytes(&self) -> Zeroizing<[u8; 32]>;
+pub fn from_secret_bytes(secret: &[u8; 32]) -> Self;
+```
+
+A 32-byte seed, zeroized on drop, documented as never written to `Storage` by
+the engine. That is precisely the shape the app's Phase 2 needs for the OS
+keychain: small enough for every keychain's value limits, with the engine
+explicitly disclaiming responsibility for persisting it.

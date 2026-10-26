@@ -146,7 +146,8 @@ Message {
   status: MessageStatus | null,    // outgoing only
   delivered_at: number | null,     // outgoing only
   attempts: number | null,         // transmissions so far; outgoing only
-  arrived_late: boolean            // see below
+  arrived_late: boolean,           // see below
+  missing_before: number           // earlier messages not yet arrived
 }
 ```
 
@@ -210,9 +211,14 @@ gone). A link that is `up` but has heard nothing for two days is still `up` —
 silence is not a fault on these links, and `last_received_at` is where that
 information lives.
 
-`recent_loss_permille` is `null` against the real engine (AR-007). It is
-populated by `FakeEngine`, which knows exactly what it dropped. `null` must
-render as "not measured", never as 0.
+`recent_loss_permille` is populated by `FakeEngine`, which knows exactly what
+it dropped, and is `null` against the real engine, which cannot observe loss
+from one end. `null` must render as "not measured", never as 0 — claiming a
+perfect link because nothing measured it is the worst available failure.
+
+`budget_blocked_until` comes from `LinkStats::budget_blocked_until`: the
+pacer is the only thing that knows when a duty-cycled radio will next have
+airtime.
 
 `budget_blocked_until` is a duty-cycle or rate limit, not an error. It is
 separate from `status` so the UI can say "out of airtime until 14:02" while
@@ -347,13 +353,41 @@ The "I compared the fingerprint" toggle. Emits `contact_changed`.
 Settings {
   display_name: string | null,
   show_receive_time_threshold_ms: number,   // default 300000 (5 min)
-  fake_engine: FakeEngineSettings | null    // present only in dev builds
+  fake_engine: FakeEngineSettings | null    // present only on FakeEngine
+}
+
+FakeEngineSettings {
+  profile: string,                 // active impairment profile
+  available_profiles: string[],    // every profile that can be selected
+  reply_delay_ms: number,          // before a scripted contact begins answering
+  reply_jitter_ms: number,         // uniform jitter on top
+  scripted_replies: boolean,
+  outages: boolean                 // run the profile's link outages
 }
 ```
+
+The packet-level impairments — delay, jitter, bursty loss, corruption,
+duplication, reordering, MTU, airtime budget and outage schedule — all come
+from the named `profile`, whose parameters are `avianlink-sim`'s and are
+shared with `scripts/netem/`. Only knobs with no equivalent in the simulator
+are exposed separately. Changing `profile` re-aims the links without
+discarding packets already in flight.
 
 `show_receive_time_threshold_ms` is the gap above which the UI shows both
 times. It is a setting rather than a constant because the right value
 depends entirely on the link the user is on.
+
+### `add_simulated_contact(args: { display_name: string, history: number }) -> Contact`
+
+Adds a contact backed by a simulated device that answers. Only meaningful on
+`FakeEngine`; on the real engine it fails with `bad_request` rather than
+silently creating a contact nothing will ever answer.
+
+It exists because the interface cannot be reviewed, screenshotted or driven
+through its states without a peer, and inventing a key by hand to paste into
+the add-contact dialog is a pointless ritual. `history` seeds that many
+scripted messages, which travel the real simulated link and so arrive over the
+following seconds rather than appearing at once.
 
 ### `reset_local_data() -> void`
 
