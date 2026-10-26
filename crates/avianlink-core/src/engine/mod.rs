@@ -954,13 +954,20 @@ fn build_packet<R: CryptoRngCore>(
             if sent >= ctx.max_frag_acks {
                 break;
             }
-            let Some((count, bm)) = reassembly.held(ctx.conv, seq) else {
+            let Some((count, mut bm)) = reassembly.held(ctx.conv, seq) else {
                 contact.frag_ack_pending.remove(&seq);
                 continue;
             };
-            let len = frag_ack_frame_len(seq, count, bm.len());
-            if out.len().saturating_add(len) > limit {
+            // FRAG_ACK is advisory, so a bitmap prefix is still correct:
+            // truncate to the room left rather than never sending it.
+            let room = limit.saturating_sub(out.len());
+            let overhead = frag_ack_frame_len(seq, count, 0);
+            if overhead.saturating_add(1) > room {
                 break;
+            }
+            bm.truncate(room.saturating_sub(overhead));
+            while frag_ack_frame_len(seq, count, bm.len()) > room {
+                bm.pop();
             }
             put_frag_ack_frame(&mut out, seq, count, &bm);
             contact.frag_ack_pending.remove(&seq);
@@ -968,8 +975,9 @@ fn build_packet<R: CryptoRngCore>(
             sent = sent.saturating_add(1);
             wrote = true;
         }
-        if !contact.frag_ack_pending.is_empty() && contact.ack_due.is_none() {
+        if sent > 0 && !contact.frag_ack_pending.is_empty() && contact.ack_due.is_none() {
             // More progress to report than fitted; keep the ACK timer armed.
+            // Only after progress, so every re-armed packet shrinks the set.
             contact.ack_due = Some(now);
         }
     }

@@ -534,3 +534,26 @@ fn no_wall_clock_omits_timestamp() {
     let ev = drain_events(&mut b);
     assert!(matches!(&ev[..], [Event::MessageReceived(m)] if m.sender_time.is_none()));
 }
+
+/// Regression (found by fuzzing): a FRAG_ACK too large to fit beside the
+/// ACK kept the ACK timer re-armed at "now", so `poll_transmit` produced
+/// ACK-only packets forever.
+#[test]
+fn oversized_frag_ack_does_not_livelock() {
+    let (mut b, _) = engine(B, A, 48);
+    // One fragment of a 250-fragment message: its FRAG_ACK bitmap is 32
+    // bytes, which cannot share a 48-byte packet with an ACK.
+    let mut pkt = Vec::new();
+    begin_packet(&mut pkt, hash::pair_tag(&A, &B), 0);
+    put_msg_frame(&mut pkt, 0, 250, 0, b"x");
+    seal_packet(&mut pkt, &A, &B);
+    b.handle_packet(L, &pkt, t(1));
+    let at = b.next_timeout().unwrap();
+    let mut n = 0;
+    while let Some(tx) = b.poll_transmit(at) {
+        assert!(tx.packet.len() <= 48);
+        n += 1;
+        assert!(n < 10, "poll_transmit never ran dry");
+    }
+    assert!(b.next_timeout().is_none_or(|t| t > at));
+}

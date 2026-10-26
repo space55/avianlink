@@ -87,9 +87,14 @@ pub fn handle_packet(data: &[u8]) {
             }
             _ => e.handle_timeout(t),
         }
+        let mut sent = 0;
         while let Some(tx) = e.poll_transmit(t) {
             let mtu = MTUS[usize::from(tx.link.0)];
             assert!(tx.packet.len() <= usize::from(mtu), "packet exceeds MTU");
+            sent += 1;
+            // Turn a livelock into a crash the fuzzer can report. The most
+            // one call can owe is every queued fragment once.
+            assert!(sent < 100_000, "poll_transmit never runs dry");
         }
         while let Some(ev) = e.poll_event() {
             if let Event::MessageReceived(m) = ev {
@@ -146,8 +151,11 @@ pub fn restore(data: &[u8]) {
     for step in 0..4u64 {
         let t = Timestamp::from_millis(crate::SIM_EPOCH_MS + step * 60_000);
         e.handle_timeout(t);
+        let mut sent = 0;
         while let Some(tx) = e.poll_transmit(t) {
             assert!(tx.packet.len() <= 64, "packet exceeds MTU");
+            sent += 1;
+            assert!(sent < 100_000, "poll_transmit never runs dry");
         }
         while e.poll_event().is_some() {}
         if let Some(next) = e.next_timeout() {

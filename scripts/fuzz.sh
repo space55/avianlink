@@ -12,5 +12,5 @@ if [ ${#targets[@]} -eq 0 ]; then
 fi
 for t in "${targets[@]}"; do
     printf '\n==> fuzz %s for %ss\n' "$t" "$secs"
-    cargo +nightly fuzz run "$t" -- -max_total_time="$secs" -max_len=2048
+    cargo +nightly fuzz run "$t" -- -max_total_time="$secs" -max_len=2048 -timeout=10
 done
