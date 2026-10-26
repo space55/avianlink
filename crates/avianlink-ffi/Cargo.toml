@@ -1,0 +1,13 @@
+[package]
+name = "avianlink-ffi"
+description = "C ABI for avianlink (Phase 7); basis for iOS/Swift bindings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+avianlink-core = { workspace = true }
+
+[lints]
+workspace = true

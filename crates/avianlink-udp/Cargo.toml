@@ -1,0 +1,13 @@
+[package]
+name = "avianlink-udp"
+description = "UDP link adapter and driver loop for avianlink"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+avianlink-core = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "avianlink-cli"
+description = "Terminal demo: two avianlink peers chatting over UDP"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "avianlink"
+path = "src/main.rs"
+
+[dependencies]
+avianlink-core = { workspace = true, features = ["std"] }
+avianlink-udp = { workspace = true }
+
+[lints]
+workspace = true

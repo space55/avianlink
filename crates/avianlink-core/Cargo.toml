@@ -1,0 +1,18 @@
+[package]
+name = "avianlink-core"
+description = "Sans-IO, no_std engine for encrypted text messaging over lossy packet links"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Conveniences for hosted platforms. The engine itself never needs std.
+std = []
+
+[dependencies]
+rand_core = { workspace = true }
+
+[lints]
+workspace = true

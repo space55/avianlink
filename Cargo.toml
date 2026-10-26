@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/avianlink-core",
+    "crates/avianlink-sim",
+    "crates/avianlink-udp",
+    "crates/avianlink-cli",
+    "crates/avianlink-ffi",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.81"
+publish = false
+
+[workspace.dependencies]
+avianlink-core = { path = "crates/avianlink-core" }
+avianlink-sim = { path = "crates/avianlink-sim" }
+avianlink-udp = { path = "crates/avianlink-udp" }
+rand_core = { version = "0.6.4", default-features = false }
+rand_chacha = { version = "0.3.1", default-features = false }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
