@@ -26,6 +26,7 @@ dependencies = [
  "curve25519-dalek",
  "ed25519-dalek",
  "hkdf",
+ "hmac",
  "rand_core",
  "sha2",
  "zeroize",
