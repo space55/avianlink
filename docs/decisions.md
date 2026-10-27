@@ -696,3 +696,95 @@ more payload. Packets per message rise with fragmentation.
   could not load its simulator plug-in, and Command Line Tools installs
   have no `xcodebuild` at all. The Swift smoke test consumes the result
   through SwiftPM's `binaryTarget`, which validates the bundle either way.
+
+## D-044: Hello: unencrypted, authenticated contact requests (after Phase 7, proposal)
+
+**Problem.** Pairwise keys need no exchange, since each side derives them
+from the other's public key. But a receiver that doesn't know the sender's
+key can't find a routing tag for it and drops everything silently. Relays
+and gateways coming online must register clients, and each other, without
+every pair having swapped keys first. Specified in `wire-format.md` §2.5,
+`security.md` §2.1, §6, §8 and §9, and `reliability.md` §3, §4 and §7.
+
+**Decisions.**
+- **Byte 0 is the packet kind** (`0x01` data, `0x02` Hello). Old receivers
+  already drop unknown values. **Rejected:** a reserved routing-tag value
+  (real tags would collide with it, and it special-cases the lookup); a
+  Hello frame inside a data packet (the receiver can't decrypt it without
+  the key the Hello is meant to deliver).
+- **A Hello always travels alone.** **Rejected:** prepending it to a data
+  packet in the same datagram. That saves a round trip on UDP but couples
+  the two formats, and it doesn't work on small links anyway.
+- **Unencrypted, MAC-authenticated, 47 bytes:** kind, a 2-byte recipient
+  hint, the sender's key, and a 12-byte truncated HMAC-SHA256 under a key
+  from the existing static Diffie-Hellman. It fits the 48-byte minimum MTU,
+  per the user's requirement. **Rejected:** an Ed25519 signature (+64 bytes);
+  a Noise-`X` sealed Hello (~97 bytes) that hides the sender (doesn't fit
+  small links, and the user's goal is reliability over metadata privacy,
+  §8); a 4-byte hint (53 bytes, over LoRa's MTU).
+- **Dependency: `hmac` 0.13,** already in the tree as a dependency of
+  `hkdf`, so no new code. It is used directly for its constant-time
+  truncated verify. **Rejected:** truncating a Poly1305 tag (the audited
+  AEAD crate doesn't verify truncated tags, and composing the parts
+  ourselves is out, D-032).
+- **No counter, so replayable on purpose.** Hellos are idempotent: a
+  replay can only re-raise a request or draw one SYNC. Consequently **a
+  Hello never moves an address.**
+- **Unconfirmed contacts start in backoff,** sending a Hello plus one probe
+  packet per round until the peer answers. Accepting a request (any
+  `add_contact`) sends an immediate SYNC that ends the peer's backoff.
+  **Rejected:** buffering unknown-tag packets at the receiver and replaying
+  them after acceptance. It saves about one RTT, but the buffer is memory
+  any attacker can fill.
+- **Hellos in backoff too** (default), so a relay that restarts empty
+  relearns its clients within one probe interval.
+- **The engine reports requests; the host decides.** No auto-accept in the
+  engine.
+
+**API (proposed; breaking).**
+- `Engine::handle_packet` returns a new `Received` enum instead of
+  `Option<ConversationId>`:
+  - `None`;
+  - `Contact(ConversationId)`, an authenticated data packet, after which
+    the address may be updated;
+  - `Hello(PublicKey)`, a verified Hello from an unknown key, whose
+    address is a candidate only.
+- `Event::ContactRequest { public_key, link, received_at }`, persisted
+  until polled like other events.
+- `Config`:
+  - `hello: HelloMode` (`Off`, `Unconfirmed`, `UnconfirmedAndBackoff`;
+    default `UnconfirmedAndBackoff`);
+  - `hello_verify_per_minute` (default 60; 0 disables receiving Hellos
+    from unknown keys);
+  - `hello_verify_burst` (default 8);
+  - `hello_dedupe_entries` (default 64).
+- `Stats`: `hellos_sent`, `hellos_received`, `hellos_duplicate`,
+  `hellos_dropped_not_for_us`, `hellos_dropped_rate`. Bad MACs count in
+  `packets_dropped_unauthenticated`. `packets_dropped_version` keeps its
+  name and now counts unknown kinds.
+- `ContactStatus::confirmed: bool`.
+- Storage schema 3 → 4 (`reliability.md` §4).
+- C ABI: `avl_engine_handle_packet` gains a public-key output and returns
+  a new `AVL_STATUS_HELLO` for verified Hellos, plus an
+  `AVL_EVENT_KIND_CONTACT_REQUEST` event. `UdpHost` keeps candidate
+  addresses for pending requests. The CLI prints requests and gains
+  `/accept`.
+- The desktop app (`avianlink-desktop`) breaks on the `handle_packet`
+  return type and the new event. It must be told.
+
+**Tests and done criteria.**
+- Wire: round-trip and proptests for Hello encoding. The fuzz targets'
+  harness gains a "valid Hello" mode.
+- Engine:
+  - each receive step's drop counter;
+  - replays don't move addresses or duplicate requests;
+  - the verification bucket bounds X25519 operations;
+  - requests survive restore;
+  - migration from schema 3.
+- New simulator scenarios:
+  - `introduction`: Bob doesn't know Alice and auto-accepts; on
+    `disaster_cellular` and `lora_like`;
+  - `relay_restart`: one peer loses all state mid-run and auto-accepts.
+
+  Done when both deliver 100%, and the time to first delivery after
+  acceptance stays within about one RTT plus the link's pacing.

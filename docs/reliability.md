@@ -94,6 +94,47 @@ hour. A dead one is probed less and less often, so a week costs a few
 hundred packets. After `deep_backoff_after_ms` (default 1 h) of silence,
 probes shrink from data to a bare SYNC frame (§7) asking for a reply.
 
+**Introduction (unconfirmed contacts).** A contact is *confirmed* once
+any authenticated data packet from it has been accepted. That proves it
+knows our key. The flag is persisted. Until then the peer may be dropping
+everything we send, because it may not know us (`security.md` §2.1). So an
+unconfirmed contact starts **in backoff** rather than in normal mode:
+- each probe round sends **a Hello (`wire-format.md` §2.5) and then one
+  probe packet** (data, or a SYNC if nothing is queued), as two separate
+  datagrams, Hello first;
+- probe rounds follow the backoff schedule above: grace probes at the RTO,
+  then doubling, then the long-silence rule;
+- the first fresh authenticated packet from the peer confirms the contact
+  and ends backoff, so the outbox then drains at the link's pace.
+
+This bounds what an introduction costs while the peer is deciding: per
+round, 47 bytes plus one packet, instead of a whole outbox that the peer
+can only drop. On a LoRa duty cycle that difference is most of the budget.
+Data packets that arrive before the peer accepts are dropped and resent
+later, like any loss; nothing is buffered on the receiving side
+(D-044).
+
+**Hellos in backoff.** With `HelloMode::UnconfirmedAndBackoff` (the
+default), a *confirmed* contact in backoff also gets a Hello before each
+probe once the `backoff_grace` probes have passed. This covers a peer that
+lost its state, typically a relay or gateway restarting empty: it has
+forgotten our key and is silently dropping our packets. The Hello lets it
+relearn us within one probe interval. If the peer did keep its state, the
+Hello costs 47 bytes and draws an immediate SYNC in reply, which ends the
+backoff. `HelloMode::Unconfirmed` sends Hellos only during introduction,
+and `HelloMode::Off` never sends them. Hellos count against the link
+budget like any other packet, and they never bypass the pacer.
+
+**Accepting a request.** `add_contact` queues an immediate SYNC asking for
+a reply to the new contact, whether the key came from a contact request or
+from out of band. If the peer has been probing us, that one packet reaches
+it, confirms us, and ends its backoff. Its outbox then flows within about
+one RTT, instead of waiting for its next probe, which could be up to
+`max_probe_interval_ms` away after a long approval. A key that sent us a
+verified Hello is already known to have our key, so a contact added from a
+request starts confirmed if the request is still in the recent-requests
+set.
+
 **Hints.** `Engine::nudge(now)` tells the engine that connectivity may have
 changed, for example the OS reports a new network or the app comes to the
 foreground. Every contact in backoff then probes at once. Without a hint,
@@ -110,12 +151,17 @@ leaves the engine exactly as it was.
 | Key | Value | Written when |
 |-----|-------|--------------|
 | `"v"` | schema version | `Engine::new` |
-| `"c" ‖ conv` | peer key, next seq, Lamport, counter reservation | `add_contact`, `send_text`, receive (Lamport), counter reservation |
+| `"c" ‖ conv` | peer key, next seq, Lamport, counter reservation, confirmed flag | `add_contact`, `send_text`, receive (Lamport, first confirmation), counter reservation |
 | `"o" ‖ conv ‖ seq(be64)` | queue time, encoded record | `send_text`; removed on delivery |
 | `"i" ‖ conv` | receive window: `cum` + bitmap | each newly received message |
 | `"e" ‖ n(be64)` | a pending event | when the event is queued; removed when the host polls it |
 
-Not persisted, because it is rebuilt or soft: RTT estimates, backoff,
+Storage schema 4 adds the confirmed flag and the `ContactRequest` event
+encoding. Schema 3 contacts migrate as confirmed, which keeps the behaviour
+they had before Hellos existed.
+
+Not persisted, because it is rebuilt or soft: the recent-requests set and
+the Hello verification bucket (both reset on restore), RTT estimates, backoff,
 fragment send times, partial reassemblies (the peer retransmits), and pacer
 state.
 
@@ -230,6 +276,10 @@ fraction of packets arrives. There is no handshake to complete.
 - in every SYNC-only backoff probe, with *reply wanted*;
 - in answer to a SYNC that asked for one, together with an ACK;
 - after `Engine::restore`, to announce the restored floor and next;
+- when a contact is added, with *reply wanted* (§3, "Accepting a
+  request");
+- in answer to a verified Hello from a known contact, with *reply wanted*,
+  at most once per RTO per contact (`wire-format.md` §2.5);
 - when a block of 64 sent seqs completes, so its digest reaches the peer.
 
 SYNC rides along with any packet that is going out anyway.

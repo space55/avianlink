@@ -1,7 +1,8 @@
 # avianlink wire format
 
-> **Status: v1 (Phase 5).** The version byte stays `0x01` until the first
-> release. Before then, peers are assumed to run the same build.
+> **Status: v1 (Phase 5; Hello added after Phase 7).** Byte 0 values stay
+> as listed here until the first release. Before then, peers are assumed to
+> run the same build.
 
 ## 1. Conventions
 
@@ -19,15 +20,30 @@
 
 ## 2. Packet
 
+**Byte 0 is the packet kind.** It selects the whole format of the packet,
+including the protocol version: a later, incompatible data format gets a
+new kind value, not a version field inside the old one. Receivers drop
+kinds they don't know (`packets_dropped_version`), so new kinds are safe to
+introduce.
+
+| Kind | Packet |
+|------|--------|
+| `0x00` | Never valid. |
+| `0x01` | v1 data packet (this section). |
+| `0x02` | v1 Hello (§2.5). |
+| other | Reserved. Drop. |
+
+A v1 data packet:
+
 ```
 packet  = header  ciphertext  aead_tag:[16]
-header  = version:u8  tag:[3]  counter:varint
+header  = kind:u8  tag:[3]  counter:varint
 ciphertext = ChaCha20-Poly1305(frame*)   (same length as the frames)
 ```
 
 | Field   | Size  | Meaning |
 |---------|-------|---------|
-| version | 1     | `0x01`. `0x00` is never valid. Other values: drop (`packets_dropped_version`). |
+| kind    | 1     | `0x01`. |
 | tag     | 3     | Routing tag of the (sender → recipient) direction (§2.2). |
 | counter | 1–5   | Per-direction packet counter, strictly increasing, never reused. It gives the AEAD nonce (§2.3). Fragment sizing assumes ≤ 5 bytes (counter < 2³⁵). |
 | frame*  | rest  | Zero or more frames (§3), encrypted. Zero frames is a valid keep-alive. |
@@ -39,7 +55,8 @@ valid packet is 21 bytes.
 ### 2.1 Processing order
 
 1. Length ≥ 21, else drop (`packets_dropped_malformed`).
-2. Version byte, else drop.
+2. Kind byte: `0x01` continues here, `0x02` goes to §2.5, anything else
+   is dropped.
 3. Look up the tag among known contacts. No match: drop
    (`packets_dropped_unauthenticated`).
 4. Parse the counter. For each candidate contact: skip it if the counter is
@@ -79,6 +96,60 @@ ChaCha20-Poly1305 (RFC 8439), with the encoded header as associated data
 and the concatenated frames as plaintext. See `security.md` §4 for why
 there is no separate checksum and the tag is not truncated.
 
+### 2.5 Hello
+
+A Hello introduces the sender to a recipient who may not know the sender's
+key. It is **not encrypted**, but it is authenticated: only the holder of
+the sender's (or the recipient's) secret key can produce it. It always
+travels as a datagram of its own, never combined with a data packet.
+
+```
+hello = kind:u8 = 0x02  hint:[2]  sender_key:[32]  mac:[12]      (47 bytes)
+hint  = H_2("avianlink-hello-hint-v1" ‖ PK_R)
+key   = hello_key(S→R) = HKDF-Expand(prk(S,R), "hello" ‖ PK_S ‖ PK_R, 32)
+mac   = HMAC-SHA256(hello_key(S→R), kind ‖ hint ‖ sender_key)[..12]
+```
+
+| Field | Size | Meaning |
+|-------|------|---------|
+| kind | 1 | `0x02`. |
+| hint | 2 | Identifies the recipient to triage with: the recipient itself, or a relay holding mail for it. About 1 in 65,536 other keys share it. |
+| sender_key | 32 | `PK_S`, the sender's public key, in the clear. |
+| mac | 12 | Truncated HMAC (`security.md` §2.1). The key binds both public keys, so the MAC also authenticates `PK_R`, which isn't sent. |
+
+47 bytes fits the smallest supported MTU (48). A Hello for a given pair is
+the same 47 bytes every time: it has no counter or nonce. That is what makes
+it safe to repeat and to replay (`security.md` §6). In v1 a Hello is exactly
+47 bytes; any other length is dropped (`packets_dropped_malformed`).
+Extensions get a new kind.
+
+**Receiving** (each step drops on failure; the counters are in `Stats`):
+
+1. Length is exactly 47 (`packets_dropped_malformed`).
+2. `hint` matches our own (`hellos_dropped_not_for_us`). This is the only
+   cost a stray Hello imposes.
+3. `sender_key` isn't our own key.
+4. **If `sender_key` is a contact:** verify `mac` with the cached
+   `hello_key`. That's one HMAC, with no Diffie-Hellman. On success the
+   peer is telling us it thinks we don't know it, or that it hasn't heard
+   from us, so we answer with an immediate SYNC asking for a reply, at
+   most once per RTO per contact (`reliability.md` §7). The Hello does not
+   count as a fresh packet: it doesn't end backoff or confirm anything,
+   because it can be a replay.
+5. **If `sender_key` already has a verified request outstanding** (a
+   bounded recent-requests set, which holds only verified keys): drop as a
+   duplicate (`hellos_duplicate`). No cryptography.
+6. Take a token from the Hello verification bucket (`Config`), else drop
+   (`hellos_dropped_rate`).
+7. Decode `sender_key` as a point, rejecting invalid and weak keys. Compute
+   the X25519 shared secret and `hello_key`, then verify `mac` in constant
+   time (`packets_dropped_unauthenticated`).
+8. Queue `Event::ContactRequest { public_key, link, received_at }` and add
+   the key to the recent-requests set. If the event queue is full, drop
+   without recording the key, so a later Hello can retry.
+
+**Sending:** `reliability.md` §3 says when.
+
 ## 3. Frames
 
 ```
@@ -89,7 +160,7 @@ Every frame is length-prefixed, so a receiver can skip frame types it doesn't
 know. **Zero bytes after the last frame are padding.** When every byte left at
 a frame boundary is zero, parsing ends successfully. FEC (§3.4) relies on
 this: a recovered packet keeps the zero padding of its coded symbol. A frame type whose meaning would be unsafe to ignore can never be
-added this way; it needs a new version byte.
+added this way; it needs a new kind byte (§2).
 
 | Type | Name    | Phase | Body |
 |------|---------|-------|------|
@@ -301,7 +372,7 @@ MessageId      = H_16("avianlink/v1/msg" || PK_s || PK_r || varint(seq) || recor
 
 ## 6. Header-overhead budget
 
-Fixed per-packet cost: version 1 + routing tag 3 + counter (typically 2,
+Fixed per-packet cost: kind 1 + routing tag 3 + counter (typically 2,
 5 in the worst case assumed for sizing) + AEAD tag 16 = **22 bytes
 typical**. Phase 1–2's placeholder check was 4 bytes, 12 fewer.
 
@@ -325,6 +396,8 @@ comparison. Generated by the `overhead_table` test in
 | 512 | 475 | 481 | 93% | 487 | 493 | 96% |
 | 1200 | 1163 | 1169 | 97% | 1175 | 1181 | 98% |
 <!-- overhead-table:end -->
+
+A Hello (§2.5) is always 47 bytes, whatever the MTU.
 
 At 48 bytes the AEAD tag costs a third of the packet. See
 `security.md` §4 for why it isn't truncated.
