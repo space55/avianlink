@@ -75,9 +75,15 @@ pub struct Report {
     /// Time from the end of the last scheduled outage until every message
     /// sent before then was delivered.
     pub converge_ms: Option<u64>,
-    /// `MessagesSkipped` / `SyncDiverged` events (bug: no scenario loses or
-    /// rolls back state).
+    /// `MessagesSkipped` / `SyncDiverged` events not explained by a wipe
+    /// (bug).
     pub sync_anomalies: u64,
+    /// Times a node lost all its state (`Scenario::wipe_at_ms`).
+    pub wipes: u64,
+    /// Messages delivered again by a wiped node, which forgot them (expected).
+    pub redelivered_after_wipe: u64,
+    /// Messages a wiped node was told it would never get (expected).
+    pub skipped_after_wipe: u64,
     /// Largest committed storage footprint of either node, in bytes.
     pub max_storage_bytes: usize,
     /// Per-direction channel counters (0: peer A → B).

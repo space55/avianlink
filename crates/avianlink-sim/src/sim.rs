@@ -131,6 +131,13 @@ pub struct Scenario {
     /// Whether hosts call `Engine::nudge` when a scheduled outage ends (as
     /// an OS reporting "network available" would).
     pub nudge_on_reconnect: bool,
+    /// Peer B starts without A's key and learns it from A's Hello (D-044).
+    pub introduce: bool,
+    /// Peer B loses all its state at this offset (ms) and restarts empty
+    /// with the same identity, like a relay rebuilt from scratch.
+    pub wipe_at_ms: Option<u64>,
+    /// Every message goes from A to B.
+    pub one_way: bool,
 }
 
 impl Scenario {
@@ -155,6 +162,9 @@ impl Scenario {
             adversary: None,
             fixed_outages: Vec::new(),
             nudge_on_reconnect: false,
+            introduce: false,
+            wipe_at_ms: None,
+            one_way: false,
         }
     }
 
@@ -226,8 +236,38 @@ impl Scenario {
         sc
     }
 
-    /// Scenario names accepted by [`Scenario::named`].
-    pub const NAMES: [&'static str; 10] = [
+    /// D-044: on `disaster_cellular`, B doesn't know A and accepts A's
+    /// contact request automatically when A's Hello gets through.
+    pub fn introduction(seed: u64) -> Self {
+        let mut sc = Self::new(Profile::DisasterCellular, seed);
+        sc.name = "introduction".to_string();
+        sc.introduce = true;
+        sc
+    }
+
+    /// [`Scenario::introduction`] on `lora_like`.
+    pub fn introduction_lora(seed: u64) -> Self {
+        let mut sc = Self::new(Profile::LoraLike, seed);
+        sc.name = "introduction_lora".to_string();
+        sc.introduce = true;
+        sc
+    }
+
+    /// D-044: a client (A) sending to a relay (B) on `edge_2g`. Four hours
+    /// in, the relay loses all state and comes back empty; it relearns A
+    /// from the Hellos A sends while in backoff, and accepts automatically.
+    pub fn relay_restart(seed: u64) -> Self {
+        let mut sc = Self::new(Profile::Edge2g, seed);
+        sc.name = "relay_restart".to_string();
+        sc.one_way = true;
+        sc.wipe_at_ms = Some(4 * 3_600_000);
+        sc
+    }
+
+    /// Scenario names run by `--profile everything`. [`Scenario::named`]
+    /// also accepts `relay_restart`, which is kept out of sweeps while it
+    /// exposes counter reuse after state loss (D-044, "Open problem").
+    pub const NAMES: [&'static str; 12] = [
         "clean",
         "geo_satellite",
         "edge_2g",
@@ -238,6 +278,8 @@ impl Scenario {
         "disaster_hostile",
         "bursty_loss",
         "week_offline",
+        "introduction",
+        "introduction_lora",
     ];
 
     /// A profile's default scenario, or one of the stress scenarios.
@@ -248,6 +290,9 @@ impl Scenario {
             "disaster_hostile" => Some(Self::disaster_hostile(seed)),
             "bursty_loss" => Some(Self::bursty_loss(seed)),
             "week_offline" => Some(Self::week_offline(seed)),
+            "introduction" => Some(Self::introduction(seed)),
+            "introduction_lora" => Some(Self::introduction_lora(seed)),
+            "relay_restart" => Some(Self::relay_restart(seed)),
             _ => Profile::from_name(name).map(|p| Self::new(p, seed)),
         }
     }
@@ -292,6 +337,10 @@ enum Ev {
     Nudge {
         node: usize,
     },
+    /// The node loses all state and restarts empty.
+    Wipe {
+        node: usize,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -317,6 +366,9 @@ struct Node {
     incarnation: u64,
     /// Counters of previous incarnations.
     retired: Stats,
+    /// Accepts contact requests automatically (a relay, or an app whose
+    /// user taps "accept").
+    accept_requests: bool,
 }
 
 struct Msg {
@@ -358,6 +410,9 @@ struct Sim<'a> {
     outage_wire_bytes: u64,
     outage_packets: u64,
     sync_anomalies: u64,
+    wipes: u64,
+    redelivered_after_wipe: u64,
+    skipped_after_wipe: u64,
 }
 
 fn stream(seed: u64, n: u64) -> ChaCha20Rng {
@@ -453,7 +508,12 @@ pub fn add_stats(a: &Stats, b: &Stats) -> Stats {
         loss_reports_sent,
         syncs_sent,
         syncs_received,
-        transmit_stalls
+        transmit_stalls,
+        hellos_sent,
+        hellos_received,
+        hellos_duplicate,
+        hellos_dropped_not_for_us,
+        hellos_dropped_rate
     )
 }
 
@@ -477,7 +537,10 @@ impl<'a> Sim<'a> {
                 engine
                     .add_link(LINK, sc.link.engine_link())
                     .expect("valid profile link");
-                let conv = engine.add_contact(keys[1 - i]).expect("fresh contact");
+                let conv = avianlink_core::hashes::conversation_id(&keys[i], &keys[1 - i]);
+                if !(i == 1 && sc.introduce) {
+                    engine.add_contact(keys[1 - i]).expect("fresh contact");
+                }
                 Node {
                     secret: secrets[i],
                     engine: Some(engine),
@@ -488,6 +551,7 @@ impl<'a> Sim<'a> {
                     crash_armed: false,
                     incarnation: 0,
                     retired: Stats::default(),
+                    accept_requests: i == 1 && (sc.introduce || sc.wipe_at_ms.is_some()),
                 }
             })
             .collect();
@@ -505,8 +569,9 @@ impl<'a> Sim<'a> {
                 } else {
                     300 + below(&mut wl, 901)
                 };
+                let from = below(&mut wl, 2) as usize;
                 Msg {
-                    from: below(&mut wl, 2) as usize,
+                    from: if sc.one_way { 0 } else { from },
                     text: random_text(&mut wl, len as usize),
                     scheduled_at: t,
                     sent_at: None,
@@ -548,7 +613,13 @@ impl<'a> Sim<'a> {
             outage_wire_bytes: 0,
             outage_packets: 0,
             sync_anomalies: 0,
+            wipes: 0,
+            redelivered_after_wipe: 0,
+            skipped_after_wipe: 0,
         };
+        if let Some(at) = sc.wipe_at_ms {
+            sim.schedule(SIM_EPOCH_MS + at, Ev::Wipe { node: 1 });
+        }
         for &(start, len) in &sc.fixed_outages {
             let end = SIM_EPOCH_MS + start + len;
             sim.outages.add_fixed(SIM_EPOCH_MS + start, end);
@@ -634,6 +705,10 @@ impl<'a> Sim<'a> {
                         self.outbox_full_retries += 1;
                         self.schedule(self.now + 1_000, Ev::Send { msg });
                     }
+                    // Not accepted the peer yet: the user waits.
+                    Err(Error::UnknownConversation) => {
+                        self.schedule(self.now + 1_000, Ev::Send { msg });
+                    }
                     Err(e) => panic!("send_text failed: {e}"),
                 }
                 Some(from)
@@ -664,7 +739,34 @@ impl<'a> Sim<'a> {
                 self.nodes[node].engine.as_mut()?.nudge(now);
                 Some(node)
             }
+            Ev::Wipe { node } => {
+                self.wipe(node);
+                Some(node)
+            }
         }
+    }
+
+    /// Replaces the node with an empty engine: same identity, no contacts,
+    /// nothing in storage.
+    fn wipe(&mut self, node: usize) {
+        let sc = self.sc;
+        let n = &mut self.nodes[node];
+        let Some(old) = n.engine.take() else {
+            return;
+        };
+        self.wipes += 1;
+        n.retired = add_stats(&n.retired, &old.stats());
+        n.incarnation += 1;
+        n.generation += 1;
+        n.wake = None;
+        let rng = stream(sc.seed, 100 + 2 * n.incarnation + node as u64);
+        let identity = Identity::from_secret_bytes(&n.secret);
+        let mut engine =
+            Engine::new(sc.config, identity, MemoryStorage::new(), rng).expect("fresh engine");
+        engine
+            .add_link(LINK, sc.link.engine_link())
+            .expect("valid profile link");
+        n.engine = Some(engine);
     }
 
     /// Kills the node mid-call: queued events, timers and anything not
@@ -744,8 +846,14 @@ impl<'a> Sim<'a> {
                 );
             }
         }
+        let mut accepted = false;
         for ev in events {
-            self.on_event(node, ev);
+            accepted |= self.on_event(node, ev);
+        }
+        if accepted {
+            // The new contact has an answer to send at once.
+            self.pump(node);
+            return;
         }
         let next = next.map(|t| {
             if t <= self.now {
@@ -809,21 +917,27 @@ impl<'a> Sim<'a> {
         }
     }
 
-    fn on_event(&mut self, node: usize, ev: Event) {
+    /// Returns whether a contact request was accepted.
+    fn on_event(&mut self, node: usize, ev: Event) -> bool {
         match ev {
             Event::MessageReceived(m) => {
                 let Some(&i) = self.by_id.get(&m.id) else {
                     self.integrity_violations += 1;
-                    return;
+                    return false;
                 };
                 let msg = &mut self.msgs[i];
                 if msg.from == node || msg.text != m.text {
                     self.integrity_violations += 1;
-                    return;
+                    return false;
                 }
                 if msg.delivered_at.is_some() {
-                    self.duplicate_deliveries += 1;
-                    return;
+                    // After a wipe the receiver has forgotten what it had.
+                    if self.wipes > 0 {
+                        self.redelivered_after_wipe += 1;
+                    } else {
+                        self.duplicate_deliveries += 1;
+                    }
+                    return false;
                 }
                 if m.missing_before > 0 {
                     self.out_of_order += 1;
@@ -831,26 +945,36 @@ impl<'a> Sim<'a> {
                 msg.delivered_at = Some(self.now);
                 self.delivered += 1;
             }
+            Event::MessagesSkipped { count, .. } if self.wipes > 0 => {
+                // Expected: the wiped node lost what it had received.
+                self.skipped_after_wipe += count;
+            }
             Event::MessagesSkipped { .. } | Event::SyncDiverged { .. } => {
-                // Only state loss or rollback cause these; no scenario has
-                // either, so any occurrence is a bug.
+                // Only state loss or rollback cause these; only `wipe` loses
+                // state, so any other occurrence is a bug.
                 self.sync_anomalies += 1;
+            }
+            Event::ContactRequest { public_key, .. } if self.nodes[node].accept_requests => {
+                if let Some(e) = self.nodes[node].engine.as_mut() {
+                    return e.add_contact(public_key).is_ok();
+                }
             }
             Event::MessageDelivered { id, .. } => {
                 let Some(&i) = self.by_id.get(&id) else {
                     self.integrity_violations += 1;
-                    return;
+                    return false;
                 };
                 let msg = &mut self.msgs[i];
                 if msg.from != node || msg.acked_at.is_some() {
                     self.integrity_violations += 1;
-                    return;
+                    return false;
                 }
                 msg.acked_at = Some(self.now);
                 self.acked += 1;
             }
             _ => {}
         }
+        false
     }
 
     fn report(mut self, wall_ms: f64) -> Report {
@@ -928,6 +1052,9 @@ impl<'a> Sim<'a> {
             outage_packets: self.outage_packets,
             converge_ms,
             sync_anomalies: self.sync_anomalies,
+            wipes: self.wipes,
+            redelivered_after_wipe: self.redelivered_after_wipe,
+            skipped_after_wipe: self.skipped_after_wipe,
             max_storage_bytes: self.max_storage_bytes,
             channels: [self.channels[0].stats, self.channels[1].stats],
             engines: [stats[0], stats[1]],

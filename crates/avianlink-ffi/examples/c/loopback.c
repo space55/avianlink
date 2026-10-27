@@ -55,9 +55,11 @@ static int deliver(Node *from, Node *to, uint64_t now) {
                                                 buf, sizeof buf, &len);
         if (st == AVL_STATUS_NONE) return n;
         CHECK(st);
-        st = avl_engine_handle_packet(to->engine, link, buf, len, now, NULL);
-        if (st != AVL_STATUS_OK) {
-            fprintf(stderr, "packet not authenticated\n");
+        /* OK: an authenticated packet. NONE: here, a Hello from a contact we
+           already know (it introduces the sender). */
+        st = avl_engine_handle_packet(to->engine, link, buf, len, now, NULL, NULL);
+        if (st != AVL_STATUS_OK && st != AVL_STATUS_NONE) {
+            fprintf(stderr, "unexpected status %d\n", (int)st);
             exit(1);
         }
         n++;

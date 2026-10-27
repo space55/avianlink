@@ -8,8 +8,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use avianlink_core::{
     format_fingerprint, AirtimeModel, Config, ConversationId, Engine, Error, Event, FecMode,
-    Identity, LinkBudget, LinkConfig, LinkId, MemoryStorage, PublicKey, Storage, Timestamp,
-    Transmit,
+    HelloMode, Identity, LinkBudget, LinkConfig, LinkId, MemoryStorage, PublicKey, Received,
+    Storage, Timestamp, Transmit,
 };
 use avianlink_udp::{os_rng, FileStorage};
 use rand_chacha::ChaCha20Rng;
@@ -22,6 +22,8 @@ pub enum AvlStatus {
     Ok = 0,
     /// Nothing to return (empty queue, nothing to send).
     None = 1,
+    /// `avl_engine_handle_packet`: a verified Hello from an unknown key.
+    Hello = 2,
     /// A required pointer was null, or a value was malformed.
     ErrInvalidArgument = -1,
     /// The output buffer is too small; the needed length was reported.
@@ -551,6 +553,18 @@ pub unsafe extern "C" fn avl_storage_free(storage: *mut AvlStorage) {
 // ---------------------------------------------------------------------
 // Configuration
 
+/// When Hellos are sent (mirrors `avianlink_core::HelloMode`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AvlHelloMode {
+    /// Never.
+    Off = 0,
+    /// Only while introducing ourselves to a contact.
+    Unconfirmed = 1,
+    /// Also to silent contacts after the grace probes (default).
+    UnconfirmedAndBackoff = 2,
+}
+
 /// FEC scheme (mirrors `avianlink_core::FecMode`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -599,6 +613,11 @@ pub struct AvlConfig {
     pub max_fec_rx_bytes: u32,
     pub max_fec_pending_repairs: u16,
     pub wall_clock: bool,
+    /// An `AvlHelloMode` value.
+    pub hello: u8,
+    pub hello_verify_per_minute: u16,
+    pub hello_verify_burst: u8,
+    pub hello_dedupe_entries: u16,
 }
 
 impl From<Config> for AvlConfig {
@@ -637,6 +656,14 @@ impl From<Config> for AvlConfig {
             max_fec_rx_bytes: c.max_fec_rx_bytes,
             max_fec_pending_repairs: c.max_fec_pending_repairs,
             wall_clock: c.wall_clock,
+            hello: match c.hello {
+                HelloMode::Off => AvlHelloMode::Off,
+                HelloMode::Unconfirmed => AvlHelloMode::Unconfirmed,
+                HelloMode::UnconfirmedAndBackoff => AvlHelloMode::UnconfirmedAndBackoff,
+            } as u8,
+            hello_verify_per_minute: c.hello_verify_per_minute,
+            hello_verify_burst: c.hello_verify_burst,
+            hello_dedupe_entries: c.hello_dedupe_entries,
         }
     }
 }
@@ -644,12 +671,18 @@ impl From<Config> for AvlConfig {
 impl TryFrom<AvlConfig> for Config {
     type Error = ();
 
-    /// Fails on an unknown `fec` value.
+    /// Fails on an unknown `fec` or `hello` value.
     fn try_from(c: AvlConfig) -> Result<Self, ()> {
         let fec = match c.fec {
             0 => FecMode::Off,
             1 => FecMode::Xor,
             2 => FecMode::ReedSolomon,
+            _ => return Err(()),
+        };
+        let hello = match c.hello {
+            0 => HelloMode::Off,
+            1 => HelloMode::Unconfirmed,
+            2 => HelloMode::UnconfirmedAndBackoff,
             _ => return Err(()),
         };
         Ok(Self {
@@ -682,6 +715,10 @@ impl TryFrom<AvlConfig> for Config {
             max_fec_rx_bytes: c.max_fec_rx_bytes,
             max_fec_pending_repairs: c.max_fec_pending_repairs,
             wall_clock: c.wall_clock,
+            hello,
+            hello_verify_per_minute: c.hello_verify_per_minute,
+            hello_verify_burst: c.hello_verify_burst,
+            hello_dedupe_entries: c.hello_dedupe_entries,
         })
     }
 }
@@ -1037,13 +1074,17 @@ pub unsafe extern "C" fn avl_engine_send_text(
     })
 }
 
-/// Feeds a received packet. Returns `AVL_STATUS_OK` and writes the sender's
-/// conversation if it authenticated (update that contact's address), or
-/// `AVL_STATUS_NONE` if it was dropped.
+/// Feeds a received packet. Returns:
+/// - `AVL_STATUS_OK`: an authenticated packet from a contact; its
+///   conversation is written. Update that contact's address to the source.
+/// - `AVL_STATUS_HELLO`: a verified Hello from an unknown key, written to
+///   `public_key_out`; an `AVL_EVENT_KIND_CONTACT_REQUEST` was queued. The
+///   source address is only a candidate (Hellos can be replayed).
+/// - `AVL_STATUS_NONE`: dropped, or nothing to act on.
 ///
 /// # Safety
 /// `engine` live; `bytes` `len` readable bytes; `conversation_out` null or
-/// 16 writable bytes.
+/// 16 writable bytes; `public_key_out` null or 32 writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn avl_engine_handle_packet(
     engine: *mut AvlEngine,
@@ -1052,6 +1093,7 @@ pub unsafe extern "C" fn avl_engine_handle_packet(
     len: usize,
     now_ms: u64,
     conversation_out: *mut u8,
+    public_key_out: *mut u8,
 ) -> AvlStatus {
     with_engine(engine, |e| {
         if bytes.is_null() && len > 0 {
@@ -1064,12 +1106,17 @@ pub unsafe extern "C" fn avl_engine_handle_packet(
             unsafe { std::slice::from_raw_parts(bytes, len) }
         };
         match e.engine.handle_packet(LinkId(link_id), data, ts(now_ms)) {
-            Some(conv) => {
+            Received::Contact(conv) => {
                 // SAFETY: caller guarantees 16 writable bytes or null.
                 unsafe { copy_out(&conv.0, conversation_out) };
                 AvlStatus::Ok
             }
-            None => AvlStatus::None,
+            Received::ContactRequest(key) => {
+                // SAFETY: caller guarantees 32 writable bytes or null.
+                unsafe { copy_out(&key.0, public_key_out) };
+                AvlStatus::Hello
+            }
+            Received::Ignored => AvlStatus::None,
         }
     })
 }
@@ -1184,6 +1231,9 @@ pub enum AvlEventKind {
     MessagesSkipped = 4,
     /// The peer's history differs for `first_seq..=last_seq`.
     SyncDiverged = 5,
+    /// A key we don't know asks to be added: `public_key`, `link`,
+    /// `received_at_ms`. Compare fingerprints, then `avl_engine_add_contact`.
+    ContactRequest = 6,
 }
 
 /// An event. `text` is borrowed (see `docs/ffi.md` §2).
@@ -1206,6 +1256,8 @@ pub struct AvlEvent {
     pub first_seq: u64,
     pub last_seq: u64,
     pub count: u64,
+    pub public_key: [u8; 32],
+    pub link: u16,
 }
 
 impl AvlEvent {
@@ -1225,6 +1277,8 @@ impl AvlEvent {
             first_seq: 0,
             last_seq: 0,
             count: 0,
+            public_key: [0; 32],
+            link: 0,
         }
     }
 }
@@ -1293,6 +1347,18 @@ pub unsafe extern "C" fn avl_engine_poll_event(
                     v.last_seq = last_seq;
                     v
                 }
+                Event::ContactRequest {
+                    public_key,
+                    link,
+                    received_at,
+                } => {
+                    let mut v =
+                        AvlEvent::blank(AvlEventKind::ContactRequest, ConversationId([0; 16]));
+                    v.public_key = public_key.0;
+                    v.link = link.0;
+                    v.received_at_ms = received_at.as_millis();
+                    v
+                }
                 // Event kinds newer than this ABI are skipped.
                 _ => continue,
             };
@@ -1319,6 +1385,8 @@ pub struct AvlContactStatus {
     pub loss_in_permille: i32,
     /// Loss the contact reports on ours, permille; -1 if unknown.
     pub loss_out_permille: i32,
+    /// The contact has shown it knows our key.
+    pub confirmed: bool,
 }
 
 /// Writes a contact's status.
@@ -1355,6 +1423,7 @@ pub unsafe extern "C" fn avl_engine_contact_status(
                 outbox_len: s.outbox_len,
                 loss_in_permille: perm(s.loss_in_permille),
                 loss_out_permille: perm(s.loss_out_permille),
+                confirmed: s.confirmed,
             }
         };
         AvlStatus::Ok

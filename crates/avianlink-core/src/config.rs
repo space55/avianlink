@@ -13,6 +13,19 @@ pub enum FecMode {
     ReedSolomon,
 }
 
+/// When the engine sends Hellos (`docs/reliability.md` §3, D-044).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelloMode {
+    /// Never. Both sides must add each other out of band.
+    Off,
+    /// Before each probe to a contact that has never answered us.
+    Unconfirmed,
+    /// As `Unconfirmed`, and also before each probe to a silent contact once
+    /// the grace probes have passed, so a peer that lost its state (a
+    /// restarted relay) relearns us (the default).
+    UnconfirmedAndBackoff,
+}
+
 /// Engine-wide limits and timers. Every queue and table in the engine is
 /// bounded by one of these; each field documents what happens at the limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +111,17 @@ pub struct Config {
     /// Whether `now` is Unix-epoch wall-clock time. If false, messages carry
     /// no timestamp.
     pub wall_clock: bool,
+    /// When to send Hellos.
+    pub hello: HelloMode,
+    /// Hellos from unknown keys verified per minute (each costs one X25519);
+    /// excess ones are dropped unverified. 0 ignores Hellos from unknown
+    /// keys entirely.
+    pub hello_verify_per_minute: u16,
+    /// Hellos from unknown keys that may be verified in a burst.
+    pub hello_verify_burst: u8,
+    /// Keys with a verified contact request outstanding, remembered to
+    /// drop repeats cheaply; the oldest is forgotten first.
+    pub hello_dedupe_entries: u16,
 }
 
 impl Default for Config {
@@ -132,6 +156,10 @@ impl Default for Config {
             max_fec_rx_bytes: 32 * 1024,
             max_fec_pending_repairs: 64,
             wall_clock: true,
+            hello: HelloMode::UnconfirmedAndBackoff,
+            hello_verify_per_minute: 60,
+            hello_verify_burst: 8,
+            hello_dedupe_entries: 64,
         }
     }
 }
@@ -162,6 +190,8 @@ impl Config {
             || self.counter_reservation == 0
             || self.fec_max_sources == 0
             || usize::from(self.fec_max_sources) > crate::fec::MAX_SOURCES
+            || self.hello_dedupe_entries == 0
+            || (self.hello_verify_per_minute > 0 && self.hello_verify_burst == 0)
         {
             return Err(Error::InvalidConfig);
         }

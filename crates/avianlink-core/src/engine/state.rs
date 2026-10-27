@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 
 use super::persist::{BlockDigest, ContactRecord, RecvDigest};
 use crate::crypto::PairKeys;
-use crate::wire::FragmentPlan;
+use crate::wire::{FragmentPlan, HELLO_LEN};
 use crate::{LinkId, MessageId, PublicKey, Timestamp};
 
 fn id8(id: &crate::MessageId) -> [u8; 8] {
@@ -376,6 +376,19 @@ pub(super) struct Contact {
     pub(super) recv_digests: Vec<RecvDigest>,
     /// Blocks already reported as diverged.
     pub(super) diverged: Vec<u64>,
+    /// An authenticated packet from the contact has been accepted, so it
+    /// knows our key (persisted; `reliability.md` §3).
+    pub(super) confirmed: bool,
+    /// Unconfirmed and Hellos are on: probe from the start, Hello first.
+    pub(super) introducing: bool,
+    /// Our Hello to this contact (the same bytes every time).
+    pub(super) hello: Option<[u8; HELLO_LEN]>,
+    /// The probe round (its `probe_due`) a Hello has already gone out for.
+    pub(super) hello_round: Option<Timestamp>,
+    /// When we last answered a Hello from this contact with a SYNC.
+    pub(super) hello_reply_at: Option<Timestamp>,
+    /// The next SYNC asks for a reply.
+    pub(super) sync_reply: bool,
 }
 
 impl Contact {
@@ -411,6 +424,12 @@ impl Contact {
             sent_digests: Vec::new(),
             recv_digests: Vec::new(),
             diverged: Vec::new(),
+            confirmed: false,
+            introducing: false,
+            hello: None,
+            hello_round: None,
+            hello_reply_at: None,
+            sync_reply: false,
         }
     }
 
@@ -422,6 +441,7 @@ impl Contact {
         c.tx_counter = r.counter_reserved;
         c.counter_reserved = r.counter_reserved;
         c.sent_digests = r.sent_digests.clone();
+        c.confirmed = r.confirmed;
         // Announce the restored floor and next.
         c.sync_due = true;
         c
@@ -434,6 +454,7 @@ impl Contact {
             lamport: self.lamport,
             counter_reserved: self.counter_reserved,
             sent_digests: self.sent_digests.clone(),
+            confirmed: self.confirmed,
         }
     }
 
@@ -487,12 +508,19 @@ impl Contact {
         self.outbox.keys().next().copied().unwrap_or(self.next_seq)
     }
 
-    /// When outgoing data is next due, if there is any.
+    /// Whether traffic goes out as one probe per interval: the peer looks
+    /// unreachable, or hasn't confirmed it knows us.
+    pub(super) fn probing(&self) -> bool {
+        self.backoff > 0 || self.introducing
+    }
+
+    /// When outgoing data is next due, if there is any. An introduction
+    /// probes even with nothing queued.
     pub(super) fn data_due(&self, t: Timers) -> Option<Timestamp> {
-        if self.outbox.is_empty() {
+        if self.outbox.is_empty() && !self.introducing {
             return None;
         }
-        if self.backoff > 0 {
+        if self.probing() {
             return Some(self.probe_due);
         }
         self.outbox.values().map(|m| m.next_due(t)).min()

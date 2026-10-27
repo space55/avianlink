@@ -10,6 +10,23 @@ use proptest::prelude::*;
 
 proptest! {
     #[test]
+    fn hello_round_trips(hint in any::<[u8; 2]>(), key in any::<[u8; 32]>(), mac in any::<[u8; 12]>()) {
+        let sender = avianlink_core::PublicKey(key);
+        let signed = wire::hello_signed(hint, &sender);
+        let bytes = wire::encode_hello(&signed, &mac);
+        prop_assert_eq!(bytes.len(), wire::HELLO_LEN);
+        let h = wire::parse_hello(&bytes).unwrap();
+        prop_assert_eq!((h.hint, h.sender, h.mac), (hint, sender, mac));
+        prop_assert_eq!(h.signed, &signed[..]);
+    }
+
+    #[test]
+    fn hello_parse_accepts_only_exact_kind_and_length(bytes in prop::collection::vec(any::<u8>(), 0..64)) {
+        let ok = wire::parse_hello(&bytes).is_ok();
+        prop_assert_eq!(ok, bytes.len() == wire::HELLO_LEN && bytes[0] == wire::HELLO_KIND);
+    }
+
+    #[test]
     fn varint_round_trips(v in any::<u64>()) {
         let mut out = Vec::new();
         put_varint(&mut out, v);

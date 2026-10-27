@@ -8,10 +8,12 @@ use alloc::vec::Vec;
 
 use super::state::Inbox;
 use crate::wire::{put_varint, DecodeError, Reader};
-use crate::{ConversationId, Event, MessageId, PublicKey, ReceivedMessage, Timestamp};
+use crate::{ConversationId, Event, LinkId, MessageId, PublicKey, ReceivedMessage, Timestamp};
 
-/// Bumped on incompatible layout changes.
-pub(super) const SCHEMA: u8 = 3;
+/// Bumped on incompatible layout changes. Schema 3 is read too: it lacks
+/// the confirmed flag (D-044).
+pub(super) const SCHEMA: u8 = 4;
+pub(super) const SCHEMA_V3: u8 = 3;
 
 pub(super) const KEY_VERSION: &[u8] = b"v";
 pub(super) const PREFIX_CONTACT: &[u8] = b"c";
@@ -76,6 +78,9 @@ pub(super) struct ContactRecord {
     pub(super) counter_reserved: u64,
     /// Digests of our most recent sent blocks.
     pub(super) sent_digests: Vec<BlockDigest>,
+    /// An authenticated packet from the contact has been accepted.
+    /// Absent in schema 3 records, which decode as confirmed.
+    pub(super) confirmed: bool,
 }
 
 impl ContactRecord {
@@ -85,6 +90,7 @@ impl ContactRecord {
         put_varint(&mut v, self.lamport);
         put_varint(&mut v, self.counter_reserved);
         put_digests(&mut v, &self.sent_digests);
+        v.push(u8::from(self.confirmed));
         v
     }
 
@@ -99,12 +105,14 @@ impl ContactRecord {
         for _ in 0..n.min(8) {
             sent_digests.push((r.varint()?, r.array()?));
         }
+        let confirmed = r.is_empty() || r.u8()? != 0;
         Ok(Self {
             key,
             next_seq,
             lamport,
             counter_reserved,
             sent_digests,
+            confirmed,
         })
     }
 }
@@ -201,6 +209,7 @@ const EVENT_RECEIVED: u8 = 1;
 const EVENT_DELIVERED: u8 = 2;
 const EVENT_SKIPPED: u8 = 3;
 const EVENT_DIVERGED: u8 = 4;
+const EVENT_CONTACT_REQUEST: u8 = 5;
 
 /// Encodes a durable event; `None` for transient ones (never persisted).
 pub(super) fn encode_event(ev: &Event) -> Option<Vec<u8>> {
@@ -250,6 +259,17 @@ pub(super) fn encode_event(ev: &Event) -> Option<Vec<u8>> {
             put_varint(&mut v, *first_seq);
             put_varint(&mut v, *last_seq);
         }
+        Event::ContactRequest {
+            public_key,
+            link,
+            received_at,
+        } => {
+            v.push(EVENT_CONTACT_REQUEST);
+            v.extend_from_slice(&[0; 32]);
+            v.extend_from_slice(&public_key.0);
+            put_varint(&mut v, u64::from(link.0));
+            put_varint(&mut v, received_at.as_millis());
+        }
         Event::MessageTransmitted { .. } => return None,
     }
     Some(v)
@@ -295,6 +315,11 @@ pub(super) fn decode_event(v: &[u8]) -> Result<Event, DecodeError> {
             first_seq: r.varint()?,
             last_seq: r.varint()?,
         }),
+        EVENT_CONTACT_REQUEST => Ok(Event::ContactRequest {
+            public_key: PublicKey(r.array()?),
+            link: LinkId(u16::try_from(r.varint()?).map_err(|_| DecodeError::TooLarge)?),
+            received_at: Timestamp::from_millis(r.varint()?),
+        }),
         _ => Err(DecodeError::TooLarge),
     }
 }
@@ -312,8 +337,13 @@ mod tests {
             lamport: 9,
             counter_reserved: 1 << 40,
             sent_digests: alloc::vec![(3, [5; 8]), (4, [6; 8])],
+            confirmed: false,
         };
-        assert_eq!(ContactRecord::decode(&c.encode()), Ok(c));
+        assert_eq!(ContactRecord::decode(&c.encode()), Ok(c.clone()));
+        // Schema 3 records have no flag and decode as confirmed.
+        let mut v3 = c.encode();
+        v3.pop();
+        assert!(ContactRecord::decode(&v3).unwrap().confirmed);
 
         let mut inbox = Inbox::default();
         for s in [0, 1, 2, 5, 9, 40] {
@@ -359,6 +389,11 @@ mod tests {
                 conversation: conv,
                 first_seq: 64,
                 last_seq: 127,
+            },
+            Event::ContactRequest {
+                public_key: PublicKey([8; 32]),
+                link: LinkId(3),
+                received_at: Timestamp::from_millis(9_000),
             },
         ] {
             assert_eq!(decode_event(&encode_event(&ev).unwrap()), Ok(ev));

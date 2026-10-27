@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use avianlink_core::{
     Config, ContactStatus, ConversationId, Engine, Error, Event, Identity, LinkConfig, LinkId,
-    LinkStats, PublicKey, Queued, Stats, Storage, Timestamp,
+    LinkStats, PublicKey, Queued, Received, Stats, Storage, Timestamp,
 };
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
@@ -22,6 +22,9 @@ pub const LINK: LinkId = LinkId(0);
 
 /// Longest the loop sleeps, so UI commands stay responsive.
 const MAX_WAIT_MS: u64 = 50;
+
+/// Candidate addresses remembered for pending contact requests.
+const MAX_CANDIDATES: usize = 64;
 
 /// Current wall-clock time in Unix milliseconds.
 pub fn now() -> Timestamp {
@@ -59,6 +62,12 @@ pub enum Command {
         /// Text.
         text: String,
     },
+    /// Accept a contact request (`Event::ContactRequest`): add the key,
+    /// reachable at the address its Hello came from.
+    Accept {
+        /// The requesting key.
+        key: PublicKey,
+    },
     /// Connectivity may have changed: probe unreachable contacts now.
     Nudge,
     /// Ask for a [`StatusReport`].
@@ -81,6 +90,15 @@ pub enum HostEvent {
     },
     /// A `Send` failed (nothing was queued).
     SendFailed(Error),
+    /// An `Accept` added the contact.
+    Accepted {
+        /// The accepted key.
+        key: PublicKey,
+        /// Its conversation.
+        conversation: ConversationId,
+    },
+    /// An `Accept` failed.
+    AcceptFailed(Error),
     /// Answer to [`Command::Status`].
     Status(Box<StatusReport>),
 }
@@ -135,6 +153,10 @@ pub struct UdpHost {
     engine: Engine<FileStorage, ChaCha20Rng>,
     socket: UdpSocket,
     peers: BTreeMap<ConversationId, SocketAddr>,
+    /// Where pending contact requests came from. Hellos can be replayed, so
+    /// these are only candidates until the contact's own packets confirm
+    /// them (`docs/security.md` §6).
+    candidates: BTreeMap<PublicKey, SocketAddr>,
 }
 
 impl UdpHost {
@@ -157,6 +179,7 @@ impl UdpHost {
             engine,
             socket,
             peers: BTreeMap::new(),
+            candidates: BTreeMap::new(),
         })
     }
 
@@ -173,6 +196,24 @@ impl UdpHost {
             None => self.engine.add_contact(key)?,
         };
         self.peers.insert(conv, addr);
+        Ok(conv)
+    }
+
+    /// Accepts a contact request from `key`. Its Hello's source address is
+    /// used until the contact's own packets say otherwise.
+    pub fn accept(&mut self, key: PublicKey) -> Result<ConversationId, Error> {
+        let existing = self
+            .engine
+            .contacts()
+            .find(|(_, k)| *k == key)
+            .map(|(c, _)| c);
+        let conv = match existing {
+            Some(c) => c,
+            None => self.engine.add_contact(key)?,
+        };
+        if let Some(addr) = self.candidates.remove(&key) {
+            self.peers.entry(conv).or_insert(addr);
+        }
         Ok(conv)
     }
 
@@ -209,12 +250,19 @@ impl UdpHost {
             self.socket
                 .set_read_timeout(Some(Duration::from_millis(wait)))?;
             match self.socket.recv_from(&mut buf) {
-                Ok((n, src)) => {
-                    if let Some(conv) = self.engine.handle_packet(LINK, &buf[..n], now()) {
-                        // Only authenticated packets move an address.
+                Ok((n, src)) => match self.engine.handle_packet(LINK, &buf[..n], now()) {
+                    // Only authenticated data packets move an address.
+                    Received::Contact(conv) => {
                         self.peers.insert(conv, src);
                     }
-                }
+                    Received::ContactRequest(key) => {
+                        if self.candidates.len() >= MAX_CANDIDATES {
+                            self.candidates.pop_first();
+                        }
+                        self.candidates.insert(key, src);
+                    }
+                    Received::Ignored => {}
+                },
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -234,6 +282,10 @@ impl UdpHost {
             Command::Send { to, text } => match self.engine.send_text(to, &text, now()) {
                 Ok(queued) => HostEvent::Queued { to, queued },
                 Err(e) => HostEvent::SendFailed(e),
+            },
+            Command::Accept { key } => match self.accept(key) {
+                Ok(conversation) => HostEvent::Accepted { key, conversation },
+                Err(e) => HostEvent::AcceptFailed(e),
             },
             Command::Nudge => {
                 self.engine.nudge(now());

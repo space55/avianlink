@@ -17,4 +17,4 @@ prefix_with_name = true
 [export]
 prefix = ""
 # Referenced only as integer fields (an out-of-range C enum would be UB in Rust).
-include = ["AvlFecMode", "AvlBudgetKind"]
+include = ["AvlFecMode", "AvlBudgetKind", "AvlHelloMode"]

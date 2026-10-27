@@ -11,11 +11,14 @@ use chacha20poly1305::aead::AeadInOut;
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, Tag};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use rand_core::CryptoRng;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::wire::{PairTag, AEAD_TAG_LEN, TAG_LEN};
+use crate::wire::{
+    encode_hello, hello_signed, Hello, PairTag, AEAD_TAG_LEN, HELLO_LEN, HELLO_MAC_LEN, TAG_LEN,
+};
 use crate::PublicKey;
 
 const PAIR_SALT: &[u8] = b"avianlink/v1/pair";
@@ -124,6 +127,9 @@ pub fn format_fingerprint(fp: &[u8; FINGERPRINT_LEN]) -> String {
 pub struct PairKeys {
     tx_key: Zeroizing<[u8; 32]>,
     rx_key: Zeroizing<[u8; 32]>,
+    /// Hello MAC keys (`security.md` §2.1, §3), one per direction.
+    hello_tx_key: Zeroizing<[u8; 32]>,
+    hello_rx_key: Zeroizing<[u8; 32]>,
     /// Tag on packets we send to the contact.
     pub tx_tag: PairTag,
     /// Tag on packets the contact sends to us.
@@ -159,18 +165,45 @@ impl PairKeys {
         };
         let mut tx_key = Zeroizing::new([0u8; 32]);
         let mut rx_key = Zeroizing::new([0u8; 32]);
+        let mut hello_tx_key = Zeroizing::new([0u8; 32]);
+        let mut hello_rx_key = Zeroizing::new([0u8; 32]);
         let mut tx_tag = [0u8; TAG_LEN];
         let mut rx_tag = [0u8; TAG_LEN];
         expand(b"key", &me, peer, tx_key.as_mut())?;
         expand(b"key", peer, &me, rx_key.as_mut())?;
+        expand(b"hello", &me, peer, hello_tx_key.as_mut())?;
+        expand(b"hello", peer, &me, hello_rx_key.as_mut())?;
         expand(b"tag", &me, peer, &mut tx_tag)?;
         expand(b"tag", peer, &me, &mut rx_tag)?;
         Some(Self {
             tx_key,
             rx_key,
+            hello_tx_key,
+            hello_rx_key,
             tx_tag,
             rx_tag,
         })
+    }
+
+    /// The Hello introducing `local` to `peer` (`wire-format.md` §2.5). The
+    /// same bytes every time.
+    pub fn hello(&self, local: &PublicKey, peer: &PublicKey) -> Option<[u8; HELLO_LEN]> {
+        let signed = hello_signed(crate::hash::hello_hint(peer), local);
+        let mut mac = <Hmac<Sha256>>::new_from_slice(self.hello_tx_key.as_ref()).ok()?;
+        mac.update(&signed);
+        let full = mac.finalize().into_bytes();
+        let mut tag = [0u8; HELLO_MAC_LEN];
+        tag.iter_mut().zip(full).for_each(|(o, b)| *o = b);
+        Some(encode_hello(&signed, &tag))
+    }
+
+    /// Whether `hello` was made by the contact for us. Constant time.
+    pub fn verify_hello(&self, hello: &Hello<'_>) -> bool {
+        let Ok(mut mac) = <Hmac<Sha256>>::new_from_slice(self.hello_rx_key.as_ref()) else {
+            return false;
+        };
+        mac.update(hello.signed);
+        mac.verify_truncated_left(&hello.mac).is_ok()
     }
 
     /// Encrypts `packet[header_len..]` in place and appends the AEAD tag.
@@ -254,6 +287,36 @@ mod tests {
         }
         assert!(ba.open(&pkt[..pkt.len() - 1], hl, 300).is_none());
         assert!(ba.open(&pkt[..10], hl, 300).is_none());
+    }
+
+    #[test]
+    fn hello_verifies_only_for_its_pair_and_direction() {
+        let (a, b) = ids();
+        let mut rng = ChaCha20Rng::seed_from_u64(9);
+        let c = Identity::generate(&mut rng);
+        let ab = PairKeys::derive(&a, &b.public_key()).unwrap();
+        let ba = PairKeys::derive(&b, &a.public_key()).unwrap();
+        let ca = PairKeys::derive(&c, &a.public_key()).unwrap();
+        let bytes = ab.hello(&a.public_key(), &b.public_key()).unwrap();
+        assert_eq!(bytes.len(), HELLO_LEN);
+        assert_eq!(
+            bytes,
+            ab.hello(&a.public_key(), &b.public_key()).unwrap(),
+            "deterministic"
+        );
+        let h = crate::wire::parse_hello(&bytes).unwrap();
+        assert_eq!(h.sender, a.public_key());
+        assert_eq!(h.hint, crate::hash::hello_hint(&b.public_key()));
+        assert!(ba.verify_hello(&h));
+        assert!(!ab.verify_hello(&h), "wrong direction");
+        assert!(!ca.verify_hello(&h), "made for b, not c");
+        for i in 0..bytes.len() {
+            let mut bad = bytes;
+            bad[i] ^= 1;
+            if let Ok(h) = crate::wire::parse_hello(&bad) {
+                assert!(!ba.verify_hello(&h), "bit flip at {i}");
+            }
+        }
     }
 
     #[test]

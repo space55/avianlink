@@ -35,6 +35,7 @@ const MTUS: [u16; 2] = [48, 1200];
 /// Runs every standalone parser over `data`.
 pub fn decode(data: &[u8]) {
     let _ = wire::peek_tag(data);
+    let _ = wire::parse_hello(data);
     let _ = wire::parse_header(data);
     let _ = wire::validate_frames(data);
     for f in wire::Frames::new(data) {
@@ -64,7 +65,9 @@ pub fn decode(data: &[u8]) {
 ///
 /// Script: repeated `[op] [len] [len bytes]`. `op & 3` selects raw packet /
 /// sealed frames from the peer / `send_text` / time advance; bit 2 picks the
-/// link; bits 3.. scale the time step.
+/// link; bits 3.. scale the time step. A raw packet of exactly one byte `b`
+/// is replaced by a genuine Hello: from the known peer if `b` is even, else
+/// from a stranger whose key derives from `b`.
 pub fn handle_packet(data: &[u8]) {
     let mut e: Engine<MemoryStorage, ChaCha20Rng> = Engine::new(
         Config::default(),
@@ -95,6 +98,19 @@ pub fn handle_packet(data: &[u8]) {
         now += u64::from(op >> 3) * 250;
         let t = Timestamp::from_millis(now);
         match op & 3 {
+            0 if chunk.len() == 1 => {
+                let b = chunk[0];
+                let from = if b % 2 == 0 {
+                    peer()
+                } else {
+                    Identity::from_secret_bytes(&[b; 32])
+                };
+                if let Some(hello) = PairKeys::derive(&from, &local_key())
+                    .and_then(|k| k.hello(&from.public_key(), &local_key()))
+                {
+                    e.handle_packet(link, &hello, t);
+                }
+            }
             0 => {
                 e.handle_packet(link, chunk, t);
             }

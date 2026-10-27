@@ -50,7 +50,9 @@ final class Node {
             let st = avl_engine_poll_transmit(engine, now, &link, nil, &buf, buf.count, &len)
             if st == AVL_STATUS_NONE { return }
             check(st, "poll_transmit")
-            check(avl_engine_handle_packet(other.engine, link, buf, len, now, nil), "handle_packet")
+            // OK, or NONE for a Hello from a contact `other` already knows.
+            let rx = avl_engine_handle_packet(other.engine, link, buf, len, now, nil, nil)
+            if rx != AVL_STATUS_OK && rx != AVL_STATUS_NONE { check(rx, "handle_packet") }
         }
     }
 

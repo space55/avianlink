@@ -7,7 +7,7 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 use rand_core::CryptoRng;
 
-use crate::config::{FecMode, MAX_SEQ};
+use crate::config::{FecMode, HelloMode, MAX_SEQ};
 use crate::crypto::{Identity, PairKeys};
 use crate::fec;
 use crate::hash;
@@ -18,7 +18,7 @@ use crate::wire::{
     frame_space, header_len, loss_frame_len, msg_frame_len, plan_fragments, put_ack_frame,
     put_frag_ack_frame, put_loss_frame, put_msg_frame, put_repair_frame, repair_frame_len,
     AckFrame, DecodeError, FragAckFrame, Frame, Frames, MsgFrame, PairTag, Record, SyncFrame,
-    AEAD_TAG_LEN, TIMESTAMP_EPOCH_UNIX_SECS,
+    AEAD_TAG_LEN, HELLO_HINT_LEN, HELLO_KIND, HELLO_LEN, TIMESTAMP_EPOCH_UNIX_SECS,
 };
 use crate::wire::{put_sync_frame, sync_frame_len};
 use crate::{
@@ -30,7 +30,7 @@ use persist::{
     contact_key, decode_event, decode_inbox, decode_outbox, decode_version, encode_event,
     encode_inbox, encode_outbox, event_key, inbox_key, outbox_key, parse_conv_key, parse_event_key,
     parse_outbox_key, version_record, ContactRecord, Op, KEY_VERSION, PREFIX_CONTACT, PREFIX_EVENT,
-    PREFIX_INBOX, PREFIX_OUTBOX, SCHEMA,
+    PREFIX_INBOX, PREFIX_OUTBOX, SCHEMA, SCHEMA_V3,
 };
 use state::{Contact, FragState, OutMsg, Planned, RepairOut, Replay, Timers};
 
@@ -44,6 +44,22 @@ pub struct Transmit {
     pub to: ConversationId,
     /// Encoded packet, no larger than the link's MTU.
     pub packet: Packet,
+}
+
+/// What [`Engine::handle_packet`] made of a packet, for hosts that track
+/// peer addresses (`docs/security.md` §6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Received {
+    /// Dropped, or nothing the host needs to act on. Never move an address.
+    Ignored,
+    /// An authenticated data packet from this contact, with a counter the
+    /// replay window accepted: its source address is the contact's current
+    /// one.
+    Contact(ConversationId),
+    /// A verified Hello from a key that isn't a contact; an
+    /// [`Event::ContactRequest`] was queued. Hellos can be replayed, so its
+    /// source address is only a candidate for the contact, if accepted.
+    ContactRequest(PublicKey),
 }
 
 /// A durably queued outgoing message, as returned by
@@ -117,6 +133,10 @@ pub struct ContactStatus {
     pub loss_in_permille: Option<u64>,
     /// Loss the contact reports on our packets, permille.
     pub loss_out_permille: Option<u64>,
+    /// Whether the contact has shown it knows our key (sent us an
+    /// authenticated packet). Until then the engine introduces us with
+    /// Hellos.
+    pub confirmed: bool,
 }
 
 /// Diagnostic counters. All counters saturate.
@@ -191,6 +211,17 @@ pub struct Stats {
     pub fec_recovered: u64,
     /// LOSS frames sent.
     pub loss_reports_sent: u64,
+    /// Hellos sent.
+    pub hellos_sent: u64,
+    /// Hellos verified (from contacts and from unknown keys).
+    pub hellos_received: u64,
+    /// Hellos from a key whose contact request is still outstanding.
+    pub hellos_duplicate: u64,
+    /// Hellos whose hint is not ours.
+    pub hellos_dropped_not_for_us: u64,
+    /// Hellos from unknown keys dropped unverified: the verification rate
+    /// cap was reached, or the event queue was full.
+    pub hellos_dropped_rate: u64,
 }
 
 fn bump(c: &mut u64) {
@@ -259,6 +290,14 @@ pub struct Engine<S, R> {
     outbox_len: usize,
     /// Round-robin cursor: the contact that sent most recently.
     last_served: Option<ConversationId>,
+    /// Our Hello hint: Hellos with another hint are not for us.
+    hint: [u8; HELLO_HINT_LEN],
+    /// Verification bucket for Hellos from unknown keys, in thousandths of
+    /// a token, and when it was last refilled.
+    hello_tokens: u64,
+    hello_refilled: Timestamp,
+    /// Keys with a verified contact request outstanding, oldest first.
+    recent_requests: VecDeque<PublicKey>,
 }
 
 impl<S: Storage, R: CryptoRng> Engine<S, R> {
@@ -300,7 +339,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             .map_err(|_| Error::Storage)?
             .ok_or(Error::CorruptStorage)?;
         let (schema, owner) = decode_version(&version).map_err(|_| Error::CorruptStorage)?;
-        if schema != SCHEMA {
+        if schema != SCHEMA && schema != SCHEMA_V3 {
             return Err(Error::CorruptStorage);
         }
         if owner != local {
@@ -360,7 +399,9 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
                 return Err(Error::CorruptStorage);
             }
             let keys = PairKeys::derive(&e.identity, &rec.key).ok_or(Error::CorruptStorage)?;
-            e.insert_contact(conv, Contact::from_record(&rec, keys));
+            let mut contact = Contact::from_record(&rec, keys);
+            e.prepare_contact(&mut contact);
+            e.insert_contact(conv, contact);
         }
         for (conv, seq, queued_at, record) in outbox {
             let contact = e.contacts.get_mut(&conv).ok_or(Error::CorruptStorage)?;
@@ -394,6 +435,13 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             e.next_event_key = e.next_event_key.max(n.saturating_add(1));
             e.events.push_back((Some(n), ev));
         }
+        if schema == SCHEMA_V3 {
+            // Schema 3 records read as confirmed; new writes carry the flag.
+            commit(
+                &mut e.storage,
+                alloc::vec![(KEY_VERSION.to_vec(), Some(version_record(&local)))],
+            )?;
+        }
         Ok(e)
     }
 
@@ -422,7 +470,17 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             now: Timestamp::ZERO,
             outbox_len: 0,
             last_served: None,
+            hint: hash::hello_hint(&local),
+            hello_tokens: u64::from(config.hello_verify_burst).saturating_mul(1000),
+            hello_refilled: Timestamp::ZERO,
+            recent_requests: VecDeque::new(),
         }
+    }
+
+    /// Sets the runtime Hello state of a new or restored contact.
+    fn prepare_contact(&self, contact: &mut Contact) {
+        contact.introducing = !contact.confirmed && self.config.hello != HelloMode::Off;
+        contact.hello = contact.keys.hello(&self.local, &contact.key);
     }
 
     fn insert_contact(&mut self, conv: ConversationId, contact: Contact) {
@@ -466,10 +524,14 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         self.links.remove(&id).map(|_| ()).ok_or(Error::UnknownLink)
     }
 
-    /// Adds a contact by public key (obtained out of band) and returns the
-    /// conversation with them. Persisted. Fails with
-    /// [`Error::InvalidContact`] for our own key, a duplicate, or a key that
-    /// is not a valid, non-weak Ed25519 point.
+    /// Adds a contact by public key (obtained out of band, or from an
+    /// [`Event::ContactRequest`]) and returns the conversation with them.
+    /// Persisted. Accepting a recent request sends a SYNC asking for a reply
+    /// at once, so the peer, which has been probing us, learns we are here;
+    /// any other new contact is introduced with Hellos (`reliability.md`
+    /// §3).
+    /// Fails with [`Error::InvalidContact`] for our own key, a duplicate, or
+    /// a key that is not a valid, non-weak Ed25519 point.
     pub fn add_contact(&mut self, key: PublicKey) -> Result<ConversationId, Error> {
         if key == self.local {
             return Err(Error::InvalidContact);
@@ -482,11 +544,23 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         if self.contacts.len() >= usize_of(self.config.max_contacts) {
             return Err(Error::TooManyContacts);
         }
-        let contact = Contact::new(key, keys);
+        let mut contact = Contact::new(key, keys);
+        // A verified Hello showed the key already knows ours.
+        let requested = self.recent_requests.iter().position(|k| *k == key);
+        contact.confirmed = requested.is_some();
         commit(
             &mut self.storage,
             alloc::vec![(contact_key(&conv), Some(contact.record().encode()))],
         )?;
+        if let Some(i) = requested {
+            self.recent_requests.remove(i);
+        }
+        self.prepare_contact(&mut contact);
+        if contact.confirmed {
+            contact.ack_due = Some(self.now);
+            contact.sync_due = true;
+            contact.sync_reply = true;
+        }
         self.insert_contact(conv, contact);
         Ok(conv)
     }
@@ -573,33 +647,136 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         Ok(Queued { id, seq, lamport })
     }
 
-    /// Feeds a packet received on `link`. Returns the conversation it
-    /// authenticated to: hosts on point-to-point transports use it to keep
-    /// the contact's address current (only authenticated packets may move
-    /// an address). Malformed, unauthenticated or replayed packets are
-    /// dropped, counted in [`Stats`], and return `None`; this never fails
-    /// or panics.
-    pub fn handle_packet(
-        &mut self,
-        link: LinkId,
-        bytes: &[u8],
-        now: Timestamp,
-    ) -> Option<ConversationId> {
+    /// Feeds a packet received on `link`. The result tells hosts on
+    /// point-to-point transports what to do with the packet's source
+    /// address (see [`Received`]). Malformed, unauthenticated or replayed
+    /// packets are dropped, counted in [`Stats`], and return
+    /// [`Received::Ignored`]; this never fails or panics.
+    pub fn handle_packet(&mut self, link: LinkId, bytes: &[u8], now: Timestamp) -> Received {
         self.observe(now);
         bump(&mut self.stats.packets_received);
         let Some(l) = self.links.get_mut(&link) else {
             bump(&mut self.stats.packets_dropped_unknown_link);
-            return None;
+            return Received::Ignored;
         };
         bump(&mut l.stats.packets_received);
         l.stats.bytes_received = l.stats.bytes_received.saturating_add(u64_of(bytes.len()));
-        let sender = self.process_packet(link, bytes);
-        if sender.is_none() {
+        let (received, dropped) = if bytes.first() == Some(&HELLO_KIND) {
+            self.process_hello(link, bytes)
+        } else {
+            let sender = self.process_packet(link, bytes);
+            (
+                sender.map_or(Received::Ignored, Received::Contact),
+                sender.is_none(),
+            )
+        };
+        if dropped {
             if let Some(l) = self.links.get_mut(&link) {
                 bump(&mut l.stats.packets_dropped);
             }
         }
-        sender
+        received
+    }
+
+    /// Handles a Hello (`wire-format.md` §2.5). Returns the result and
+    /// whether the packet was dropped.
+    fn process_hello(&mut self, link: LinkId, bytes: &[u8]) -> (Received, bool) {
+        const DROPPED: (Received, bool) = (Received::Ignored, true);
+        let Ok(hello) = wire::parse_hello(bytes) else {
+            bump(&mut self.stats.packets_dropped_malformed);
+            return DROPPED;
+        };
+        if hello.hint != self.hint {
+            bump(&mut self.stats.hellos_dropped_not_for_us);
+            return DROPPED;
+        }
+        if hello.sender == self.local {
+            bump(&mut self.stats.packets_dropped_unauthenticated);
+            return DROPPED;
+        }
+        let now = self.now;
+        let conv = hash::conversation_id(&self.local, &hello.sender);
+        if let Some(rto) = self.contacts.get(&conv).map(|c| self.timers(c).rto) {
+            let Some(c) = self.contacts.get_mut(&conv) else {
+                return DROPPED;
+            };
+            if !c.keys.verify_hello(&hello) {
+                bump(&mut self.stats.packets_dropped_unauthenticated);
+                return DROPPED;
+            }
+            bump(&mut self.stats.hellos_received);
+            // The peer thinks we don't know it, or hasn't heard from us:
+            // answer with a SYNC. A Hello can be a replay, so it doesn't
+            // count as fresh and the reply is rate-limited.
+            if c.hello_reply_at
+                .is_none_or(|t| now.saturating_millis_since(t) >= rto)
+            {
+                c.hello_reply_at = Some(now);
+                c.sync_due = true;
+                c.sync_reply = true;
+                c.ack_due = Some(c.ack_due.map_or(now, |t| t.min(now)));
+            }
+            return (Received::Ignored, false);
+        }
+        if self.recent_requests.contains(&hello.sender) {
+            bump(&mut self.stats.hellos_duplicate);
+            return (Received::Ignored, false);
+        }
+        if self.events.len() >= usize_of(self.config.max_pending_events) || !self.take_hello_token()
+        {
+            bump(&mut self.stats.hellos_dropped_rate);
+            return DROPPED;
+        }
+        let verified = PairKeys::derive(&self.identity, &hello.sender)
+            .is_some_and(|keys| keys.verify_hello(&hello));
+        if !verified {
+            bump(&mut self.stats.packets_dropped_unauthenticated);
+            return DROPPED;
+        }
+        let event = Event::ContactRequest {
+            public_key: hello.sender,
+            link,
+            received_at: now,
+        };
+        let n = self.next_event_key;
+        if commit(
+            &mut self.storage,
+            alloc::vec![(event_key(n), encode_event(&event))],
+        )
+        .is_err()
+        {
+            bump(&mut self.stats.storage_errors);
+            return DROPPED;
+        }
+        self.next_event_key = n.saturating_add(1);
+        self.events.push_back((Some(n), event));
+        while self.recent_requests.len() >= usize::from(self.config.hello_dedupe_entries) {
+            self.recent_requests.pop_front();
+        }
+        self.recent_requests.push_back(hello.sender);
+        bump(&mut self.stats.hellos_received);
+        (Received::ContactRequest(hello.sender), false)
+    }
+
+    /// Takes one Hello verification token, refilling the bucket first.
+    fn take_hello_token(&mut self) -> bool {
+        let per_minute = u64::from(self.config.hello_verify_per_minute);
+        if per_minute == 0 {
+            return false;
+        }
+        let cap = u64::from(self.config.hello_verify_burst).saturating_mul(1000);
+        let elapsed = self.now.saturating_millis_since(self.hello_refilled);
+        // per_minute tokens per 60 000 ms = per_minute / 60 thousandths per ms.
+        let refill = elapsed.saturating_mul(per_minute) / 60;
+        self.hello_tokens = self.hello_tokens.saturating_add(refill).min(cap);
+        self.hello_refilled = self.now;
+        match self.hello_tokens.checked_sub(1000) {
+            Some(left) => {
+                self.hello_tokens = left;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Authenticates and applies one packet. Returns the sender if accepted.
@@ -657,6 +834,22 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             contact.heard(self.now, counter);
             contact.arrivals.mark(counter);
             contact.rx_since_report = contact.rx_since_report.saturating_add(1);
+            if !contact.confirmed {
+                // The peer knows our key: introduction is over.
+                let mut rec = contact.record();
+                rec.confirmed = true;
+                if commit(
+                    &mut self.storage,
+                    alloc::vec![(contact_key(&conv), Some(rec.encode()))],
+                )
+                .is_ok()
+                {
+                    contact.confirmed = true;
+                    contact.introducing = false;
+                } else {
+                    bump(&mut self.stats.storage_errors);
+                }
+            }
         }
         // A repair packet carries only its REPAIR frame and is not a source.
         if let Some(Ok(Frame::Repair(r))) = Frames::new(&frames).next() {
@@ -1003,7 +1196,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         self.observe(now);
         let now = self.now;
         for c in self.contacts.values_mut() {
-            if c.backoff > 0 {
+            if c.probing() {
                 c.probe_due = now;
             }
         }
@@ -1056,11 +1249,20 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
     }
 
     fn timers(&self, contact: &Contact) -> Timers {
+        // A probe round may be a Hello plus the probe; both share the 10%.
+        let hello_len = if self.hello_probes(contact) {
+            u16::try_from(HELLO_LEN).unwrap_or(u16::MAX)
+        } else {
+            0
+        };
         let probe_floor = self
             .route_of(contact)
             .and_then(|l| self.links.get(&l))
             .map_or(0, |l| {
+                let hello =
+                    (hello_len > 0).then(|| Pacer::packet_cost_ms(&l.config.budget, hello_len));
                 Pacer::packet_cost_ms(&l.config.budget, l.config.mtu)
+                    .saturating_add(hello.unwrap_or(0))
                     .saturating_mul(u64::from(PROBE_BUDGET_INVERSE_SHARE))
             });
         Timers {
@@ -1081,6 +1283,14 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
                 self.now.saturating_millis_since(t) >= self.config.deep_backoff_after_ms
             }),
         }
+    }
+
+    /// Whether `contact`'s probe rounds start with a Hello
+    /// (`reliability.md` §3).
+    fn hello_probes(&self, contact: &Contact) -> bool {
+        contact.introducing
+            || (self.config.hello == HelloMode::UnconfirmedAndBackoff
+                && contact.backoff >= u32::from(self.config.backoff_grace))
     }
 
     /// The link traffic to `contact` goes out on.
@@ -1203,6 +1413,15 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         if link.pacer.ready_at(now, mtu) > now {
             return None;
         }
+        if pass == Pass::Data
+            && contact.probing()
+            && contact.hello_round != Some(contact.probe_due)
+            && self.hello_probes(contact)
+        {
+            if let Some(hello) = contact.hello {
+                return self.send_hello(conv, link_id, hello, timers);
+            }
+        }
         // Repairs only use spare budget: if sending one would leave no room
         // for an MTU-sized packet right after, the link is busy with data and
         // redundancy would only delay it. Such repairs are dropped; the
@@ -1304,6 +1523,39 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             link: link_id,
             to: conv,
             packet: Packet::from_vec(bytes),
+        })
+    }
+
+    /// Sends the Hello that opens `conv`'s current probe round; the probe
+    /// itself follows on the next call. In deep backoff the Hello is the
+    /// whole round: a peer that knows us answers it with a SYNC, and one
+    /// that doesn't learns us from it, so a SYNC probe would add nothing.
+    fn send_hello(
+        &mut self,
+        conv: ConversationId,
+        link_id: LinkId,
+        hello: [u8; HELLO_LEN],
+        timers: Timers,
+    ) -> Option<Transmit> {
+        let now = self.now;
+        let contact = self.contacts.get_mut(&conv)?;
+        contact.hello_round = Some(contact.probe_due);
+        if timers.deep {
+            contact.probe_due = now.saturating_add_millis(contact.probe_interval(timers));
+            contact.deepen_backoff(now);
+            bump(&mut self.stats.probes_sent);
+        }
+        let link = self.links.get_mut(&link_id)?;
+        link.pacer.consume(now, HELLO_LEN);
+        bump(&mut link.stats.packets_sent);
+        link.stats.bytes_sent = link.stats.bytes_sent.saturating_add(u64_of(HELLO_LEN));
+        bump(&mut self.stats.packets_sent);
+        bump(&mut self.stats.hellos_sent);
+        self.stats.bytes_sent = self.stats.bytes_sent.saturating_add(u64_of(HELLO_LEN));
+        Some(Transmit {
+            link: link_id,
+            to: conv,
+            packet: Packet::from_vec(hello.to_vec()),
         })
     }
 
@@ -1454,6 +1706,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             outbox_len: c.outbox.len(),
             loss_in_permille: c.arrivals.loss_permille(),
             loss_out_permille: c.peer_loss,
+            confirmed: c.confirmed,
         })
     }
 
@@ -1648,6 +1901,7 @@ fn build_packet<R: CryptoRng>(
         .fec_cap
         .map_or(hard, |cap| hard.min(hlen.saturating_add(cap)));
     let mut wrote = false;
+    let mut synced = false;
 
     if contact.ack_due.is_some() {
         let room = limit.saturating_sub(out.len());
@@ -1666,23 +1920,30 @@ fn build_packet<R: CryptoRng>(
             wrote = true;
             if contact.sync_due {
                 let (floor, next) = (contact.floor(), contact.next_seq);
+                let flags = if contact.sync_reply {
+                    wire::SYNC_REPLY_WANTED
+                } else {
+                    0
+                };
                 let mut digests = contact.sync_digests();
                 // Drop the oldest digests until the frame fits.
                 while !digests.is_empty()
                     && out
                         .len()
-                        .saturating_add(sync_frame_len(0, floor, next, &digests))
+                        .saturating_add(sync_frame_len(flags, floor, next, &digests))
                         > limit
                 {
                     digests.remove(0);
                 }
                 if out
                     .len()
-                    .saturating_add(sync_frame_len(0, floor, next, &digests))
+                    .saturating_add(sync_frame_len(flags, floor, next, &digests))
                     <= limit
                 {
-                    put_sync_frame(&mut out, 0, floor, next, &digests);
+                    put_sync_frame(&mut out, flags, floor, next, &digests);
                     contact.sync_due = false;
+                    contact.sync_reply = false;
+                    synced = true;
                     bump(&mut stats.syncs_sent);
                 }
             }
@@ -1731,6 +1992,27 @@ fn build_packet<R: CryptoRng>(
 
     if ctx.data && !contact.outbox.is_empty() {
         wrote |= write_data(contact, ctx, &mut out, limit, hard, rng, stats, announced);
+    } else if ctx.data && contact.introducing {
+        // An introduction with nothing queued: the probe is a SYNC asking
+        // for a reply, behind this round's Hello.
+        let (floor, next) = (contact.floor(), contact.next_seq);
+        let flags = wire::SYNC_REPLY_WANTED;
+        if !synced
+            && out
+                .len()
+                .saturating_add(sync_frame_len(flags, floor, next, &[]))
+                <= limit
+        {
+            put_sync_frame(&mut out, flags, floor, next, &[]);
+            bump(&mut stats.syncs_sent);
+            synced = true;
+        }
+        if synced {
+            wrote = true;
+            bump(&mut stats.probes_sent);
+        }
+        contact.probe_due = now.saturating_add_millis(contact.probe_interval(ctx.timers));
+        contact.deepen_backoff(now);
     }
 
     if !wrote {
@@ -1795,7 +2077,7 @@ fn write_data<R: CryptoRng>(
 
     // A retransmission timer that fires with nothing heard from the peer
     // since that send means the peer is unreachable: switch to probing.
-    let mut probe = contact.backoff > 0;
+    let mut probe = contact.probing();
     if !probe {
         let heard = contact.last_fresh;
         probe = contact.outbox.values().any(|m| {

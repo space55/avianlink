@@ -26,6 +26,11 @@ pub fn conversation_id(a: &PublicKey, b: &PublicKey) -> ConversationId {
     ConversationId(truncate(digest(b"avianlink/v1/conv", &[&lo.0, &hi.0])))
 }
 
+/// The 2-byte recipient hint carried by a Hello (`wire-format.md` §2.5).
+pub fn hello_hint(recipient: &PublicKey) -> [u8; crate::wire::HELLO_HINT_LEN] {
+    truncate(digest(b"avianlink-hello-hint-v1", &[&recipient.0]))
+}
+
 /// Content-addressed ID of message `seq` with encoded `record`.
 pub fn message_id(sender: &PublicKey, recipient: &PublicKey, seq: u64, record: &[u8]) -> MessageId {
     let mut seq_buf = alloc::vec::Vec::with_capacity(10);

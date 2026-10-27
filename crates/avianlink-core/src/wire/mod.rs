@@ -3,6 +3,7 @@
 //! Public for fuzzing, property tests and tooling. Not a stable API.
 
 mod frame;
+mod hello;
 mod packet;
 mod reader;
 mod record;
@@ -17,6 +18,10 @@ pub use frame::{
     repair_frame_len, sync_frame_len, validate_frames, AckFrame, FragAckFrame, Frame, Frames,
     MsgFrame, Part, RepairFrame, SyncFrame, FRAME_ACK, FRAME_FRAG_ACK, FRAME_LOSS, FRAME_MSG,
     FRAME_PADDING, FRAME_REPAIR, FRAME_SYNC, MAX_SYNC_DIGESTS, SYNC_BLOCK, SYNC_REPLY_WANTED,
+};
+pub use hello::{
+    encode_hello, hello_signed, parse_hello, Hello, HELLO_HINT_LEN, HELLO_KIND, HELLO_LEN,
+    HELLO_MAC_LEN, HELLO_SIGNED_LEN,
 };
 pub use packet::{
     begin_packet, header_len, parse_header, peek_tag, PairTag, AEAD_TAG_LEN, MAX_HEADER_LEN,
@@ -43,7 +48,7 @@ pub enum DecodeError {
     TooLarge,
     /// Packet is shorter than [`MIN_PACKET_LEN`].
     TooShort,
-    /// Unknown version byte.
+    /// Unknown packet kind (byte 0; `wire-format.md` §2).
     UnknownVersion(u8),
     /// Text is not valid UTF-8.
     InvalidUtf8,

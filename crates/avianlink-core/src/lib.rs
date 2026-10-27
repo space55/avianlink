@@ -54,8 +54,10 @@ mod time;
 mod types;
 pub mod wire;
 
-pub use config::{Config, FecMode};
-pub use engine::{ContactStatus, Engine, LinkStats, OutgoingStatus, Queued, Stats, Transmit};
+pub use config::{Config, FecMode, HelloMode};
+pub use engine::{
+    ContactStatus, Engine, LinkStats, OutgoingStatus, Queued, Received, Stats, Transmit,
+};
 pub use error::Error;
 pub use event::{Event, ReceivedMessage};
 pub use link::{AirtimeModel, LinkBudget, LinkConfig, LinkId, MIN_MTU};
@@ -67,5 +69,5 @@ pub use crypto::{format_fingerprint, Identity, FINGERPRINT_LEN};
 
 /// Hash helpers, exposed for tests and tooling. Not a stable API.
 pub mod hashes {
-    pub use crate::hash::{conversation_id, message_id};
+    pub use crate::hash::{conversation_id, hello_hint, message_id};
 }

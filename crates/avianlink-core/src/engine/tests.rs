@@ -43,8 +43,17 @@ fn engine_with(cfg: Config, key: u8, peer: u8, mtu: u16) -> (E, ConversationId) 
     (e, conv)
 }
 
+/// Tests of the core mechanics run without Hellos; `hello_*` tests cover
+/// them (D-044).
+fn base() -> Config {
+    Config {
+        hello: crate::HelloMode::Off,
+        ..Config::default()
+    }
+}
+
 fn engine(key: u8, peer: u8, mtu: u16) -> (E, ConversationId) {
-    engine_with(Config::default(), key, peer, mtu)
+    engine_with(base(), key, peer, mtu)
 }
 
 /// Simulates a crash: rebuild from what storage had committed.
@@ -363,9 +372,10 @@ fn storage_failure_changes_nothing() {
     let q = a.send_text(conv, "x", t(0)).unwrap();
     assert_eq!(q.seq, 0, "failed send consumed no seq");
 
-    // Fail while B persists the received message: no event, no ACK.
+    // Fail while B persists the received message: no event, no ACK. (The
+    // first two writes record that A is confirmed.)
     let pkts = drain_tx(&mut a, t(0));
-    b.storage.fail_after(Some(0));
+    b.storage.fail_after(Some(2));
     deliver(&mut b, &pkts, t(1));
     assert!(drain_events(&mut b).is_empty());
     assert_eq!(b.stats().storage_errors, 1);
@@ -441,7 +451,7 @@ fn garbage_and_tampering_are_counted_not_fatal() {
     b.handle_packet(L, &[0xff; 300], t(0));
     b.handle_packet(L, &[], t(0));
     let mut v2 = pkt.clone();
-    v2[0] = 2;
+    v2[0] = 3; // 2 is a Hello
     b.handle_packet(L, &v2, t(0));
     b.handle_packet(LinkId(9), &pkt, t(0));
     let s = b.stats();
@@ -1089,10 +1099,336 @@ fn sync_reveals_tail_loss() {
 fn handle_packet_reports_the_authenticated_sender() {
     let (_, mut b, pkt) = one_packet();
     let conv_b = b.contacts().next().unwrap().0;
-    assert_eq!(b.handle_packet(L, &pkt, t(1)), Some(conv_b));
-    assert_eq!(b.handle_packet(L, &pkt, t(2)), None, "replay");
-    assert_eq!(b.handle_packet(L, &[0u8; 40], t(3)), None, "garbage");
+    assert_eq!(b.handle_packet(L, &pkt, t(1)), Received::Contact(conv_b));
+    assert_eq!(b.handle_packet(L, &pkt, t(2)), Received::Ignored, "replay");
+    assert_eq!(
+        b.handle_packet(L, &[0u8; 40], t(3)),
+        Received::Ignored,
+        "garbage"
+    );
     let mut bad = pkt.clone();
     *bad.last_mut().unwrap() ^= 1;
-    assert_eq!(b.handle_packet(L, &bad, t(4)), None, "forged");
+    assert_eq!(b.handle_packet(L, &bad, t(4)), Received::Ignored, "forged");
+}
+
+// ---------------------------------------------------------------------
+// Hello (D-044)
+
+/// An engine with Hellos on (the default) and no contacts.
+fn bare(key: u8) -> E {
+    let mut e = Engine::new(Config::default(), id(key), MemoryStorage::new(), rng(key)).unwrap();
+    e.add_link(L, link(64)).unwrap();
+    e
+}
+
+fn is_hello(p: &[u8]) -> bool {
+    p.first() == Some(&wire::HELLO_KIND)
+}
+
+fn requests(evs: &[Event]) -> Vec<PublicKey> {
+    evs.iter()
+        .filter_map(|e| match e {
+            Event::ContactRequest { public_key, .. } => Some(*public_key),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn hello_introduces_an_unknown_sender() {
+    let mut a = bare(A);
+    let ab = a.add_contact(pk(B)).unwrap();
+    let mut b = bare(B);
+    assert!(!a.contact_status(ab).unwrap().confirmed);
+    a.send_text(ab, "hi, you don't know me yet", t(0)).unwrap();
+
+    // One probe round: the Hello first, then one data packet.
+    let round = drain_tx(&mut a, t(0));
+    assert_eq!(round.len(), 2, "Hello plus one probe");
+    assert!(is_hello(&round[0]) && round[0].len() == wire::HELLO_LEN);
+    assert!(!is_hello(&round[1]));
+    assert_eq!(a.stats().hellos_sent, 1);
+
+    assert_eq!(
+        b.handle_packet(L, &round[0], t(10)),
+        Received::ContactRequest(pk(A))
+    );
+    assert_eq!(b.handle_packet(L, &round[1], t(10)), Received::Ignored);
+    assert_eq!(
+        b.stats().packets_dropped_unauthenticated,
+        1,
+        "data before acceptance"
+    );
+    let evs = drain_events(&mut b);
+    assert_eq!(requests(&evs), [pk(A)]);
+    assert!(matches!(
+        evs[0],
+        Event::ContactRequest { link: L, received_at, .. } if received_at == t(10)
+    ));
+
+    // Acceptance: the contact starts confirmed and answers at once.
+    let ba = b.add_contact(pk(A)).unwrap();
+    assert!(b.contact_status(ba).unwrap().confirmed);
+    let answer = drain_tx(&mut b, t(20));
+    assert_eq!(answer.len(), 1);
+    assert!(!is_hello(&answer[0]), "no Hello back: A knows B");
+    assert_eq!(a.handle_packet(L, &answer[0], t(30)), Received::Contact(ab));
+    let st = a.contact_status(ab).unwrap();
+    assert!(st.confirmed && !st.unreachable);
+
+    // A's message now flows; no more Hellos.
+    let mut now = 30;
+    for _ in 0..20 {
+        deliver(&mut b, &drain_tx(&mut a, t(now)), t(now));
+        deliver(&mut a, &drain_tx(&mut b, t(now)), t(now));
+        now += 500;
+    }
+    assert_eq!(
+        received(&drain_events(&mut b)),
+        [(0, String::from("hi, you don't know me yet"))]
+    );
+    assert_eq!(a.outbox_len(), 0);
+    assert_eq!(a.stats().hellos_sent, 1);
+}
+
+#[test]
+fn introduction_with_nothing_queued_confirms_and_goes_quiet() {
+    // Both added each other out of band; neither has anything to say.
+    let mut a = bare(A);
+    let ab = a.add_contact(pk(B)).unwrap();
+    let mut b = bare(B);
+    let ba = b.add_contact(pk(A)).unwrap();
+    let from_a = drain_tx(&mut a, t(0));
+    assert_eq!(from_a.len(), 2);
+    assert!(is_hello(&from_a[0]));
+    deliver(&mut b, &from_a, t(5));
+    assert!(
+        drain_events(&mut b).is_empty(),
+        "a known key raises no request"
+    );
+    assert!(b.contact_status(ba).unwrap().confirmed);
+    for now in [5, 10, 15] {
+        deliver(&mut a, &drain_tx(&mut b, t(now)), t(now));
+        deliver(&mut b, &drain_tx(&mut a, t(now)), t(now));
+    }
+    assert!(a.contact_status(ab).unwrap().confirmed);
+    assert!(b.contact_status(ba).unwrap().confirmed);
+    // Quiet afterwards.
+    let later = t(1_000_000);
+    assert!(drain_tx(&mut a, later).is_empty() && drain_tx(&mut b, later).is_empty());
+    assert_eq!(a.next_timeout(), None);
+    assert_eq!(b.next_timeout(), None);
+}
+
+#[test]
+fn hello_from_a_known_contact_draws_one_sync_per_rto() {
+    let mut a = bare(A);
+    a.add_contact(pk(B)).unwrap();
+    let hello = drain_tx(&mut a, t(0)).remove(0);
+    let (mut b, _) = engine_with(Config::default(), B, A, 64);
+    drain_tx(&mut b, t(0)); // b's own introduction round
+    assert_eq!(b.handle_packet(L, &hello, t(100)), Received::Ignored);
+    assert_eq!(b.stats().hellos_received, 1);
+    assert_eq!(b.link_stats(L).unwrap().packets_dropped, 0);
+    let reply = drain_tx(&mut b, t(100));
+    assert_eq!(reply.len(), 1, "an ACK + SYNC asking for a reply");
+    // A replay within the RTO is verified but not answered again.
+    b.handle_packet(L, &hello, t(200));
+    assert!(drain_tx(&mut b, t(200)).is_empty());
+    assert_eq!(b.stats().hellos_received, 2);
+    // A Hello never confirms (it can be replayed).
+    assert!(
+        !b.contact_status(hash::conversation_id(&pk(A), &pk(B)))
+            .unwrap()
+            .confirmed
+    );
+}
+
+#[test]
+fn replayed_hellos_raise_one_request() {
+    let mut a = bare(A);
+    a.add_contact(pk(B)).unwrap();
+    let hello = drain_tx(&mut a, t(0)).remove(0);
+    let mut b = bare(B);
+    assert_eq!(
+        b.handle_packet(L, &hello, t(1)),
+        Received::ContactRequest(pk(A))
+    );
+    for i in 2..10 {
+        assert_eq!(b.handle_packet(L, &hello, t(i)), Received::Ignored);
+    }
+    assert_eq!(requests(&drain_events(&mut b)), [pk(A)]);
+    assert_eq!(b.stats().hellos_duplicate, 8);
+}
+
+#[test]
+fn hello_verification_is_rate_limited() {
+    let cfg = Config {
+        hello_verify_burst: 2,
+        hello_verify_per_minute: 60,
+        ..Config::default()
+    };
+    let mut b = Engine::new(cfg, id(B), MemoryStorage::new(), rng(B)).unwrap();
+    b.add_link(L, link(64)).unwrap();
+    let hellos: Vec<Vec<u8>> = (1..=5u8)
+        .map(|s| {
+            let mut x = bare(s);
+            x.add_contact(pk(B)).unwrap();
+            drain_tx(&mut x, t(0)).remove(0)
+        })
+        .collect();
+    let got: Vec<Received> = hellos.iter().map(|h| b.handle_packet(L, h, t(0))).collect();
+    assert_eq!(
+        got.iter()
+            .filter(|r| matches!(r, Received::ContactRequest(_)))
+            .count(),
+        2
+    );
+    assert_eq!(b.stats().hellos_dropped_rate, 3);
+    // One token per second refills.
+    assert!(matches!(
+        b.handle_packet(L, &hellos[2], t(1_000)),
+        Received::ContactRequest(_)
+    ));
+    assert_eq!(b.handle_packet(L, &hellos[3], t(1_000)), Received::Ignored);
+    // A rate of 0 ignores unknown keys entirely.
+    let off = Config {
+        hello_verify_per_minute: 0,
+        ..Config::default()
+    };
+    let mut c = Engine::new(off, id(B), MemoryStorage::new(), rng(B)).unwrap();
+    c.add_link(L, link(64)).unwrap();
+    assert_eq!(c.handle_packet(L, &hellos[0], t(0)), Received::Ignored);
+    assert_eq!(c.stats().hellos_dropped_rate, 1);
+}
+
+#[test]
+fn bad_hellos_are_dropped_and_counted() {
+    let mut a = bare(A);
+    a.add_contact(pk(B)).unwrap();
+    let hello = drain_tx(&mut a, t(0)).remove(0);
+    let mut b = bare(B);
+    let mut c = bare(0xcc);
+    // Meant for B, not C.
+    assert_eq!(c.handle_packet(L, &hello, t(0)), Received::Ignored);
+    assert_eq!(c.stats().hellos_dropped_not_for_us, 1);
+    // Wrong lengths.
+    b.handle_packet(L, &hello[..46], t(0));
+    let mut long = hello.clone();
+    long.push(0);
+    b.handle_packet(L, &long, t(0));
+    assert_eq!(b.stats().packets_dropped_malformed, 2);
+    // A forged MAC, and a key swapped in (MAC no longer matches).
+    let mut forged = hello.clone();
+    forged[46] ^= 1;
+    assert_eq!(b.handle_packet(L, &forged, t(0)), Received::Ignored);
+    let mut swapped = hello.clone();
+    swapped[3..35].copy_from_slice(&pk(0xcc).0);
+    assert_eq!(b.handle_packet(L, &swapped, t(0)), Received::Ignored);
+    // B's own key.
+    let mut own = hello.clone();
+    own[3..35].copy_from_slice(&pk(B).0);
+    b.handle_packet(L, &own, t(0));
+    assert_eq!(b.stats().packets_dropped_unauthenticated, 3);
+    assert!(drain_events(&mut b).is_empty() && drain_events(&mut c).is_empty());
+    // The genuine one still works afterwards.
+    assert_eq!(
+        b.handle_packet(L, &hello, t(0)),
+        Received::ContactRequest(pk(A))
+    );
+}
+
+#[test]
+fn contact_requests_survive_restore() {
+    let mut a = bare(A);
+    a.add_contact(pk(B)).unwrap();
+    let hello = drain_tx(&mut a, t(0)).remove(0);
+    let mut b = bare(B);
+    b.handle_packet(L, &hello, t(7));
+    let mut r = crash_and_restore(&b, 64);
+    assert_eq!(requests(&drain_events(&mut r)), [pk(A)]);
+    // The recent-requests set is not persisted: accepting after a restart
+    // starts unconfirmed and introduces itself instead.
+    let ra = r.add_contact(pk(A)).unwrap();
+    assert!(!r.contact_status(ra).unwrap().confirmed);
+    assert!(is_hello(&drain_tx(&mut r, t(8))[0]));
+}
+
+#[test]
+fn unconfirmed_contacts_stay_unconfirmed_across_restore() {
+    let mut a = bare(A);
+    let ab = a.add_contact(pk(B)).unwrap();
+    drain_tx(&mut a, t(0));
+    let mut r = crash_and_restore(&a, 64);
+    assert!(!r.contact_status(ab).unwrap().confirmed);
+    let round = drain_tx(&mut r, t(1));
+    assert!(is_hello(&round[0]), "introduction resumes");
+}
+
+#[test]
+fn schema_3_storage_migrates_as_confirmed() {
+    let (a, ab) = engine(A, B, 64);
+    let mut storage = a.storage().crash_snapshot();
+    // Rewrite as schema 3: version byte 3, contact record without the flag.
+    let mut contact = storage.load(&contact_key(&ab)).unwrap().unwrap();
+    contact.pop();
+    let mut version = version_record(&pk(A));
+    version[0] = 3;
+    storage.begin().unwrap();
+    storage.store(KEY_VERSION, &version).unwrap();
+    storage.store(&contact_key(&ab), &contact).unwrap();
+    storage.commit().unwrap();
+    let mut r = Engine::restore(Config::default(), id(A), storage, rng(A)).unwrap();
+    r.add_link(L, link(64)).unwrap();
+    assert!(r.contact_status(ab).unwrap().confirmed);
+    assert!(drain_tx(&mut r, t(0)).iter().all(|p| !is_hello(p)));
+    let v = r
+        .storage()
+        .crash_snapshot()
+        .load(KEY_VERSION)
+        .unwrap()
+        .unwrap();
+    assert_eq!(v[0], SCHEMA, "rewritten as the current schema");
+}
+
+#[test]
+fn hello_mode_off_sends_none() {
+    let (mut a, ab) = engine(A, B, 64);
+    a.send_text(ab, "x", t(0)).unwrap();
+    let mut now = 0;
+    for _ in 0..50 {
+        drain_tx(&mut a, t(now));
+        now += 30_000;
+    }
+    assert_eq!(a.stats().hellos_sent, 0);
+    assert!(a.stats().probes_sent > 0);
+}
+
+#[test]
+fn silent_confirmed_contact_gets_hellos_after_the_grace_probes() {
+    let (mut a, ab) = engine_with(Config::default(), A, B, 64);
+    let (mut b, _) = engine_with(Config::default(), B, A, 64);
+    // Introduce both ways, then B goes silent with a message outstanding.
+    for now in [0, 5, 10] {
+        deliver(&mut b, &drain_tx(&mut a, t(now)), t(now));
+        deliver(&mut a, &drain_tx(&mut b, t(now)), t(now));
+    }
+    assert!(a.contact_status(ab).unwrap().confirmed);
+    let before = a.stats().hellos_sent;
+    a.send_text(ab, "into the void", t(20)).unwrap();
+    let mut now = 20;
+    let mut probes_without_hello = 0;
+    while a.stats().hellos_sent == before {
+        let pkts = drain_tx(&mut a, t(now));
+        if !pkts.is_empty() && a.contact_status(ab).unwrap().unreachable {
+            probes_without_hello += 1;
+        }
+        now = a.next_timeout().unwrap().as_millis().max(now + 1);
+        assert!(now < 3_600_000, "no Hello within an hour");
+    }
+    assert_eq!(
+        probes_without_hello,
+        usize::from(Config::default().backoff_grace),
+        "the grace probes go without Hellos"
+    );
 }

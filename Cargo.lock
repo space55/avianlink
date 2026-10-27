@@ -35,6 +35,7 @@ dependencies = [
  "curve25519-dalek",
  "ed25519-dalek",
  "hkdf",
+ "hmac",
  "proptest",
  "rand_chacha",
  "rand_core",

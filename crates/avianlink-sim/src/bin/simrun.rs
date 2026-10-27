@@ -3,6 +3,7 @@
 //! ```text
 //! simrun [--profile NAME|all|everything] [--seed N] [--seeds K] [--messages N]
 //!        [--interval-ms N] [--verbose] [--csv] [--fec off|xor|rs]
+//!        [--hello off|unconfirmed|backoff]
 //!        [--mix SHORT,MEDIUM] [--fec-sources K] [--fec-flush MS] [--mtu BYTES]
 //!        [--deep-after MS] [--max-probe MS] [--nudge]
 //!        [--max-rto MS] [--min-rto MS] [--initial-rto MS] [--var-mult N] [--grace N]
@@ -13,7 +14,7 @@
 //! the profiles; `everything` adds the stress scenarios.
 //! ```
 
-use avianlink_core::FecMode;
+use avianlink_core::{FecMode, HelloMode};
 use avianlink_sim::{Report, Scenario};
 
 fn main() {
@@ -25,6 +26,7 @@ fn main() {
     let mut verbose = false;
     let mut csv = false;
     let mut fec = None;
+    let mut hello = None;
     let mut mix: Option<(f64, f64)> = None;
     let mut nudge = false;
     let mut tweak: Vec<(String, u64)> = Vec::new();
@@ -69,6 +71,14 @@ fn main() {
                     v => usage(&format!("unknown FEC mode {v}")),
                 })
             }
+            "--hello" => {
+                hello = Some(match val().as_str() {
+                    "off" => HelloMode::Off,
+                    "unconfirmed" => HelloMode::Unconfirmed,
+                    "backoff" => HelloMode::UnconfirmedAndBackoff,
+                    v => usage(&format!("unknown Hello mode {v}")),
+                })
+            }
             "--max-rto" | "--min-rto" | "--initial-rto" | "--var-mult" | "--grace"
             | "--fec-sources" | "--fec-flush" | "--mtu" | "--deep-after" | "--max-probe" => {
                 tweak.push((a.clone(), num(&val())))
@@ -91,6 +101,9 @@ fn main() {
             }
             if let Some(i) = interval {
                 sc.mean_interval_ms = i;
+            }
+            if let Some(h) = hello {
+                sc.config.hello = h;
             }
             if let Some(f) = fec {
                 sc.config.fec = f;

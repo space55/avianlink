@@ -4,7 +4,7 @@
 //! ```text
 //! avianlink init   DIR
 //! avianlink whoami DIR
-//! avianlink chat   DIR --bind HOST:PORT --peer KEY@HOST:PORT
+//! avianlink chat   DIR --bind HOST:PORT [--peer KEY@HOST:PORT]
 //!                  [--profile NAME | --mtu N [--rate BYTES_PER_S]]
 //! ```
 
@@ -12,11 +12,12 @@ use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use avianlink_core::{
-    format_fingerprint, Config, Event, LinkBudget, LinkConfig, MessageId, Timestamp,
+    format_fingerprint, Config, ConversationId, Event, LinkBudget, LinkConfig, MessageId,
+    PublicKey, Timestamp,
 };
 use avianlink_sim::Scenario;
 use avianlink_udp::{
@@ -27,10 +28,12 @@ use avianlink_udp::{
 const USAGE: &str = "usage:
   avianlink init   DIR
   avianlink whoami DIR
-  avianlink chat   DIR --bind HOST:PORT --peer KEY@HOST:PORT
+  avianlink chat   DIR --bind HOST:PORT [--peer KEY@HOST:PORT]
                    [--profile NAME | --mtu N [--rate BYTES_PER_S]]
 
-In chat, type a line to send it. Commands: /status, /nudge, /quit.";
+In chat, type a line to send it. Commands: /status, /nudge, /accept, /quit.
+Without --peer, wait for a contact request: compare its fingerprint with the
+sender out of band, then /accept it.";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -93,10 +96,14 @@ fn chat(dir: &str, opts: &[String]) -> Result<(), String> {
         }
     }
     let bind = bind.ok_or("--bind is required")?;
-    let peer = peer.ok_or("--peer is required")?;
-    let (key, addr) = peer.split_once('@').ok_or("--peer must be KEY@HOST:PORT")?;
-    let key = parse_public_key(key).ok_or("peer KEY must be 64 hex characters")?;
-    let addr = resolve(addr)?;
+    let peer = match peer {
+        Some(p) => {
+            let (key, addr) = p.split_once('@').ok_or("--peer must be KEY@HOST:PORT")?;
+            let key = parse_public_key(key).ok_or("peer KEY must be 64 hex characters")?;
+            Some((key, resolve(addr)?))
+        }
+        None => None,
+    };
     let link = match profile {
         Some(name) => {
             let sc = Scenario::named(&name, 0).ok_or(format!("unknown profile {name}"))?;
@@ -118,13 +125,25 @@ fn chat(dir: &str, opts: &[String]) -> Result<(), String> {
         engine: Config::default(),
     };
     let mut host = UdpHost::open(&dir, identity, config).map_err(|e| e.to_string())?;
-    let conv = host.add_peer(key, addr).map_err(|e| e.to_string())?;
-    println!(
-        "avianlink: {} on {} → peer {} at {addr}",
-        format_fingerprint(&me.fingerprint()),
-        host.local_addr().map_err(|e| e.to_string())?,
-        format_fingerprint(&key.fingerprint()),
-    );
+    let local = host.local_addr().map_err(|e| e.to_string())?;
+    // The conversation lines are sent to, and the latest contact request.
+    let conv: Arc<Mutex<Option<ConversationId>>> = Arc::new(Mutex::new(None));
+    let request: Arc<Mutex<Option<PublicKey>>> = Arc::new(Mutex::new(None));
+    match peer {
+        Some((key, addr)) => {
+            *conv.lock().unwrap() = Some(host.add_peer(key, addr).map_err(|e| e.to_string())?);
+            println!(
+                "avianlink: {} on {local} → peer {} at {addr}",
+                format_fingerprint(&me.fingerprint()),
+                format_fingerprint(&key.fingerprint()),
+            );
+        }
+        None => println!(
+            "avianlink: {} on {local}, waiting for a contact request (address {})",
+            format_fingerprint(&me.fingerprint()),
+            public_key_hex(&me),
+        ),
+    }
     println!(
         "link MTU {}, budget {:?}; {} undelivered from before",
         link.mtu,
@@ -138,6 +157,7 @@ fn chat(dir: &str, opts: &[String]) -> Result<(), String> {
 
     // stdin → commands, on its own thread.
     let tx = cmd_tx.clone();
+    let (to, pending) = (conv.clone(), request.clone());
     std::thread::spawn(move || {
         for line in io::stdin().lock().lines() {
             let Ok(line) = line else { break };
@@ -146,9 +166,19 @@ fn chat(dir: &str, opts: &[String]) -> Result<(), String> {
                 "/quit" => Command::Quit,
                 "/status" => Command::Status,
                 "/nudge" => Command::Nudge,
-                _ => Command::Send {
-                    to: conv,
-                    text: line,
+                "/accept" => match *pending.lock().unwrap() {
+                    Some(key) => Command::Accept { key },
+                    None => {
+                        println!("   no contact request to accept");
+                        continue;
+                    }
+                },
+                _ => match *to.lock().unwrap() {
+                    Some(to) => Command::Send { to, text: line },
+                    None => {
+                        println!("   no peer yet: wait for a contact request and /accept it");
+                        continue;
+                    }
                 },
             };
             let quit = matches!(cmd, Command::Quit);
@@ -180,6 +210,20 @@ fn chat(dir: &str, opts: &[String]) -> Result<(), String> {
                 format!("   queued   #{} (lamport {})", queued.seq, queued.lamport)
             }
             HostEvent::SendFailed(e) => format!("   not sent: {e}"),
+            HostEvent::Engine(Event::ContactRequest { public_key, .. }) => {
+                *request.lock().unwrap() = Some(public_key);
+                format!(
+                    "   ?? contact request from {} (address {}).\n      Compare the fingerprint with the sender, then /accept.",
+                    format_fingerprint(&public_key.fingerprint()),
+                    public_key_hex(&public_key),
+                )
+            }
+            HostEvent::Accepted { key, conversation } => {
+                *conv.lock().unwrap() = Some(conversation);
+                *request.lock().unwrap() = None;
+                format!("   accepted {}", format_fingerprint(&key.fingerprint()))
+            }
+            HostEvent::AcceptFailed(e) => format!("   not accepted: {e}"),
             HostEvent::Engine(Event::MessageTransmitted { id, .. }) => match ours.get(&id) {
                 Some((seq, t)) => format!("   sent     #{seq} after {}", ago(*t)),
                 None => continue,

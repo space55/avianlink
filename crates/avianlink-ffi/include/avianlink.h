@@ -52,6 +52,8 @@ typedef enum AvlStatus {
   AVL_STATUS_OK = 0,
   // Nothing to return (empty queue, nothing to send).
   AVL_STATUS_NONE = 1,
+  // `avl_engine_handle_packet`: a verified Hello from an unknown key.
+  AVL_STATUS_HELLO = 2,
   // A required pointer was null, or a value was malformed.
   AVL_STATUS_ERR_INVALID_ARGUMENT = -1,
   // The output buffer is too small; the needed length was reported.
@@ -78,6 +80,9 @@ typedef enum AvlEventKind {
   AVL_EVENT_KIND_MESSAGES_SKIPPED = 4,
   // The peer's history differs for `first_seq..=last_seq`.
   AVL_EVENT_KIND_SYNC_DIVERGED = 5,
+  // A key we don't know asks to be added: `public_key`, `link`,
+  // `received_at_ms`. Compare fingerprints, then `avl_engine_add_contact`.
+  AVL_EVENT_KIND_CONTACT_REQUEST = 6,
 } AvlEventKind;
 
 // FEC scheme (mirrors `avianlink_core::FecMode`).
@@ -99,6 +104,16 @@ typedef enum AvlBudgetKind {
   // `duty_permille` of `duty_window_ms`, with the airtime model.
   AVL_BUDGET_KIND_DUTY_CYCLE = 2,
 } AvlBudgetKind;
+
+// When Hellos are sent (mirrors `avianlink_core::HelloMode`).
+typedef enum AvlHelloMode {
+  // Never.
+  AVL_HELLO_MODE_OFF = 0,
+  // Only while introducing ourselves to a contact.
+  AVL_HELLO_MODE_UNCONFIRMED = 1,
+  // Also to silent contacts after the grace probes (default).
+  AVL_HELLO_MODE_UNCONFIRMED_AND_BACKOFF = 2,
+} AvlHelloMode;
 
 // An engine instance. Not thread-safe: use from one thread at a time.
 typedef struct AvlEngine AvlEngine;
@@ -176,6 +191,11 @@ typedef struct AvlConfig {
   uint32_t max_fec_rx_bytes;
   uint16_t max_fec_pending_repairs;
   bool wall_clock;
+  // An `AvlHelloMode` value.
+  uint8_t hello;
+  uint16_t hello_verify_per_minute;
+  uint8_t hello_verify_burst;
+  uint16_t hello_dedupe_entries;
 } AvlConfig;
 
 // A link's MTU, budget and cost (mirrors `avianlink_core::LinkConfig`).
@@ -225,6 +245,8 @@ typedef struct AvlEvent {
   uint64_t first_seq;
   uint64_t last_seq;
   uint64_t count;
+  uint8_t public_key[32];
+  uint16_t link;
 } AvlEvent;
 
 // A contact's reachability (`avl_engine_contact_status`).
@@ -240,6 +262,8 @@ typedef struct AvlContactStatus {
   int32_t loss_in_permille;
   // Loss the contact reports on ours, permille; -1 if unknown.
   int32_t loss_out_permille;
+  // The contact has shown it knows our key.
+  bool confirmed;
 } AvlContactStatus;
 
 #ifdef __cplusplus
@@ -364,19 +388,24 @@ enum AvlStatus avl_engine_send_text(struct AvlEngine *engine,
                                     uint64_t now_ms,
                                     struct AvlQueued *queued_out);
 
-// Feeds a received packet. Returns `AVL_STATUS_OK` and writes the sender's
-// conversation if it authenticated (update that contact's address), or
-// `AVL_STATUS_NONE` if it was dropped.
+// Feeds a received packet. Returns:
+// - `AVL_STATUS_OK`: an authenticated packet from a contact; its
+//   conversation is written. Update that contact's address to the source.
+// - `AVL_STATUS_HELLO`: a verified Hello from an unknown key, written to
+//   `public_key_out`; an `AVL_EVENT_KIND_CONTACT_REQUEST` was queued. The
+//   source address is only a candidate (Hellos can be replayed).
+// - `AVL_STATUS_NONE`: dropped, or nothing to act on.
 //
 // # Safety
 // `engine` live; `bytes` `len` readable bytes; `conversation_out` null or
-// 16 writable bytes.
+// 16 writable bytes; `public_key_out` null or 32 writable bytes.
 enum AvlStatus avl_engine_handle_packet(struct AvlEngine *engine,
                                         uint16_t link_id,
                                         const uint8_t *bytes,
                                         size_t len,
                                         uint64_t now_ms,
-                                        uint8_t *conversation_out);
+                                        uint8_t *conversation_out,
+                                        uint8_t *public_key_out);
 
 // Advances timers; call when `avl_engine_next_timeout` is reached.
 //

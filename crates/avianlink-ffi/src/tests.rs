@@ -107,9 +107,18 @@ fn deliver(from: &Node, to: &Node, now: u64) -> usize {
         assert_eq!(link, LINK);
         // SAFETY: live engine; `len` readable bytes.
         let st = unsafe {
-            avl_engine_handle_packet(to.engine, link, buf.as_ptr(), len, now, null_mut())
+            avl_engine_handle_packet(
+                to.engine,
+                link,
+                buf.as_ptr(),
+                len,
+                now,
+                null_mut(),
+                null_mut(),
+            )
         };
-        assert_eq!(st, AvlStatus::Ok);
+        // NONE: a Hello from a contact `to` already knows.
+        assert!(st == AvlStatus::Ok || st == AvlStatus::None, "{st:?}");
         n += 1;
     }
 }
@@ -306,11 +315,19 @@ fn null_and_invalid_arguments_are_rejected() {
         assert_eq!(avl_last_engine_error(), AvlEngineError::InvalidLinkConfig);
         // Garbage packets are dropped, not errors.
         assert_eq!(
-            avl_engine_handle_packet(a.engine, LINK, [1u8, 2, 3].as_ptr(), 3, 0, null_mut()),
+            avl_engine_handle_packet(
+                a.engine,
+                LINK,
+                [1u8, 2, 3].as_ptr(),
+                3,
+                0,
+                null_mut(),
+                null_mut()
+            ),
             AvlStatus::None
         );
         assert_eq!(
-            avl_engine_handle_packet(a.engine, LINK, null(), 0, 0, null_mut()),
+            avl_engine_handle_packet(a.engine, LINK, null(), 0, 0, null_mut(), null_mut()),
             AvlStatus::None
         );
     }
@@ -631,4 +648,61 @@ fn file_storage_survives_reopen() {
     assert!(unsafe { avl_engine_next_timeout(node.engine, &mut t) });
     drop(node);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn contact_request_from_an_unknown_key() {
+    let a = memory_node();
+    let b = memory_node();
+    add_contact(&a, &b.public); // b doesn't know a
+    let (mut link, mut len) = (0u16, 0usize);
+    let mut buf = [0u8; MTU as usize];
+    // SAFETY: live engine; sized buffers.
+    let st = unsafe {
+        avl_engine_poll_transmit(
+            a.engine,
+            0,
+            &mut link,
+            null_mut(),
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut len,
+        )
+    };
+    assert_eq!((st, len), (AvlStatus::Ok, avianlink_core::wire::HELLO_LEN));
+    let mut key = [0u8; 32];
+    // SAFETY: live engine; sized buffers.
+    let st = unsafe {
+        avl_engine_handle_packet(
+            b.engine,
+            link,
+            buf.as_ptr(),
+            len,
+            5,
+            null_mut(),
+            key.as_mut_ptr(),
+        )
+    };
+    assert_eq!(st, AvlStatus::Hello);
+    assert_eq!(key, a.public);
+    let mut ev = AvlEvent::blank(AvlEventKind::MessageDelivered, ConversationId([0; 16]));
+    // SAFETY: live engine; writable event.
+    assert_eq!(
+        unsafe { avl_engine_poll_event(b.engine, &mut ev) },
+        AvlStatus::Ok
+    );
+    assert_eq!(ev.kind, AvlEventKind::ContactRequest);
+    assert_eq!(
+        (ev.public_key, ev.link, ev.received_at_ms),
+        (a.public, link, 5)
+    );
+    // Accepting starts confirmed.
+    let conv = add_contact(&b, &a.public);
+    let mut st = AvlContactStatus::default();
+    // SAFETY: live engine; sized buffers.
+    assert_eq!(
+        unsafe { avl_engine_contact_status(b.engine, conv.as_ptr(), &mut st) },
+        AvlStatus::Ok
+    );
+    assert!(st.confirmed);
 }

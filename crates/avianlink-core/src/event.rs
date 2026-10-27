@@ -1,6 +1,6 @@
 use alloc::string::String;
 
-use crate::{ConversationId, MessageId, Timestamp};
+use crate::{ConversationId, LinkId, MessageId, PublicKey, Timestamp};
 
 /// Something the host should know about, drained with
 /// [`crate::Engine::poll_event`].
@@ -49,6 +49,19 @@ pub enum Event {
         conversation: ConversationId,
         /// The delivered message.
         id: MessageId,
+    },
+    /// A key we don't know introduced itself with a verified Hello
+    /// (`docs/security.md` §2.1). The sender holds the key's secret, but
+    /// nothing says who it is: compare fingerprints before trusting it.
+    /// [`crate::Engine::add_contact`] accepts it; ignoring the event
+    /// declines. Repeats are suppressed while the request is recent.
+    ContactRequest {
+        /// The key asking to be added.
+        public_key: PublicKey,
+        /// Link the Hello arrived on.
+        link: LinkId,
+        /// When it arrived.
+        received_at: Timestamp,
     },
 }
 

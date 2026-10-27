@@ -52,8 +52,11 @@ fn on_path_attacker_achieves_nothing() {
 /// this measures header overhead alone.
 #[test]
 fn regression_matches_documented_overhead() {
+    // Hellos (D-044) are off too: they postdate Phase 3 and are measured
+    // separately.
     let no_fec = |mut sc: Scenario| {
         sc.config.fec = FecMode::Off;
+        sc.config.hello = avianlink_core::HelloMode::Off;
         sc
     };
     const PAYLOAD: f64 = 100_305.0; // seed-1 workload, identical across phases

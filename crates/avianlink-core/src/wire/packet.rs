@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use super::{put_varint, varint_len, DecodeError, Reader};
 
-/// Current wire version (first byte of every packet).
+/// Packet kind of a v1 data packet (byte 0; `wire-format.md` §2).
 pub const VERSION: u8 = 0x01;
 /// Length of the routing tag.
 pub const TAG_LEN: usize = 3;
@@ -24,7 +24,7 @@ pub fn header_len(counter: u64) -> usize {
     (1 + TAG_LEN).saturating_add(varint_len(counter))
 }
 
-/// Checks length and version, and returns the routing tag. Cheap: no
+/// Checks length and kind, and returns the routing tag. Cheap: no
 /// cryptography.
 pub fn peek_tag(packet: &[u8]) -> Result<PairTag, DecodeError> {
     if packet.len() < MIN_PACKET_LEN {
@@ -51,7 +51,7 @@ pub fn parse_header(packet: &[u8]) -> Result<(PairTag, u64, usize), DecodeError>
     Ok((tag, counter, header))
 }
 
-/// Starts a packet: writes version, tag and counter into `out`. Frames are
+/// Starts a packet: writes kind, tag and counter into `out`. Frames are
 /// appended next, then sealed with `crypto::PairKeys::seal`.
 pub fn begin_packet(out: &mut Vec<u8>, tag: PairTag, counter: u64) {
     out.push(VERSION);
