@@ -147,6 +147,21 @@ nonce  = counter as 8 bytes little-endian ‖ 0x00000000
   (`reliability.md` §4). Restoring an *older* copy of storage (a backup)
   breaks this and can reuse nonces. Hosts must not roll storage back. §7
   lists a mitigation.
+- **Known issue: counters restart after state loss (found while testing
+  D-044; open).** Two more paths restart a pair's counter at 0 under the
+  same key, which reuses nonces just as a rollback does:
+  1. a node that loses its storage and comes back with the same identity
+     (a reinstall, or a relay rebuilt from scratch);
+  2. `remove_contact` followed by `add_contact` for the same key. The
+     contact record holding the counter reservation is deleted.
+
+  An eavesdropper holding packets from both incarnations can XOR their
+  plaintexts and recover the Poly1305 key for that nonce. The peer rejects
+  the new packets as replays until their counters pass the old ones, so
+  traffic also stalls. Until this is fixed, hosts must not remove and
+  re-add a contact, and must treat a node that lost its state as a new
+  identity. The fix needs a design decision (`decisions.md` D-044, "Open
+  problem").
 - **The header is associated data:** authenticated but not encrypted.
   Tampering with kind, tag or counter fails authentication.
 - **No pre-decryption check.** The 3-byte routing tag already discards

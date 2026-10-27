@@ -116,24 +116,29 @@ later, like any loss; nothing is buffered on the receiving side
 
 **Hellos in backoff.** With `HelloMode::UnconfirmedAndBackoff` (the
 default), a *confirmed* contact in backoff also gets a Hello before each
-probe once the `backoff_grace` probes have passed. This covers a peer that
-lost its state, typically a relay or gateway restarting empty: it has
-forgotten our key and is silently dropping our packets. The Hello lets it
+probe once the `backoff_grace` probes have passed. In deep backoff (after
+`deep_backoff_after_ms`) the Hello *is* the probe, replacing the bare SYNC:
+a peer that knows us answers a Hello with a SYNC anyway, and one that
+doesn't learns us from it. This covers a peer that has forgotten our key
+and is silently dropping our packets. (A peer that forgot us by *losing
+state* also lost its packet counters for us, which is unsafe today:
+`security.md` §4, "Known issue".) The Hello lets it
 relearn us within one probe interval. If the peer did keep its state, the
 Hello costs 47 bytes and draws an immediate SYNC in reply, which ends the
 backoff. `HelloMode::Unconfirmed` sends Hellos only during introduction,
 and `HelloMode::Off` never sends them. Hellos count against the link
 budget like any other packet, and they never bypass the pacer.
 
-**Accepting a request.** `add_contact` queues an immediate SYNC asking for
-a reply to the new contact, whether the key came from a contact request or
-from out of band. If the peer has been probing us, that one packet reaches
-it, confirms us, and ends its backoff. Its outbox then flows within about
-one RTT, instead of waiting for its next probe, which could be up to
-`max_probe_interval_ms` away after a long approval. A key that sent us a
-verified Hello is already known to have our key, so a contact added from a
-request starts confirmed if the request is still in the recent-requests
-set.
+**Accepting a request.** A key that sent us a verified Hello is known to
+have our key, so a contact added while its request is still in the
+recent-requests set starts *confirmed*: no introduction is needed. Instead,
+`add_contact` queues an immediate SYNC asking for a reply. The peer has
+been probing us, so that one packet reaches it, confirms us and ends its
+backoff. Its outbox then flows within about one RTT, instead of waiting for
+its next probe, which could be up to `max_probe_interval_ms` away after a
+long approval. Any other new contact starts unconfirmed, so its first probe
+round (Hello, then data or a SYNC asking for a reply) goes out at once
+anyway.
 
 **Hints.** `Engine::nudge(now)` tells the engine that connectivity may have
 changed, for example the OS reports a new network or the app comes to the
@@ -276,8 +281,10 @@ fraction of packets arrives. There is no handshake to complete.
 - in every SYNC-only backoff probe, with *reply wanted*;
 - in answer to a SYNC that asked for one, together with an ACK;
 - after `Engine::restore`, to announce the restored floor and next;
-- when a contact is added, with *reply wanted* (§3, "Accepting a
-  request");
+- when a contact is accepted from a recent request, with *reply wanted*
+  (§3, "Accepting a request");
+- as the probe of an introduction with nothing queued, with *reply
+  wanted*;
 - in answer to a verified Hello from a known contact, with *reply wanted*,
   at most once per RTO per contact (`wire-format.md` §2.5);
 - when a block of 64 sent seqs completes, so its digest reaches the peer.

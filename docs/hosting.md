@@ -50,10 +50,15 @@ One thread runs the loop:
 
 1. Receive from the socket, with a timeout of `min(next_timeout − now,
    50 ms)`. The 50 ms bound keeps commands from the UI responsive.
-2. Each datagram goes to `Engine::handle_packet`. If it authenticated, the
-   contact's address is updated to the datagram's source, so NAT rebinding
-   and roaming just work.
-3. Commands from the UI (send, nudge, status, quit) are applied.
+2. Each datagram goes to `Engine::handle_packet`:
+   - `Received::Contact(conv)`: an authenticated data packet. The contact's
+     address is updated to the datagram's source, so NAT rebinding and
+     roaming just work;
+   - `Received::ContactRequest(key)`: a verified Hello from an unknown key.
+     Its source is kept as a *candidate* address (at most 64), used only if
+     the request is accepted (`Command::Accept`). Hellos can be replayed,
+     so this never moves an existing contact's address.
+3. Commands from the UI (send, accept, nudge, status, quit) are applied.
 4. Pump: drain `poll_transmit`, sending each packet to its contact's
    address, then drain `poll_event` to the UI.
 
@@ -70,9 +75,13 @@ an address, so an attacker can't redirect traffic by spoofing a source.
 ```
 avianlink init   DIR                 # new identity; prints address and fingerprint
 avianlink whoami DIR
-avianlink chat   DIR --bind HOST:PORT --peer KEY@HOST:PORT
+avianlink chat   DIR --bind HOST:PORT [--peer KEY@HOST:PORT]
                  [--profile NAME | --mtu N [--rate BYTES_PER_S]]
 ```
+
+Without `--peer`, `chat` waits for a contact request: it prints the
+requester's fingerprint, and `/accept` adds it, reachable at the address
+its Hello came from.
 
 `--profile` sets the engine's link to the same MTU and budget as the named
 simulator profile. Use it with the matching netem script. In `chat`, each

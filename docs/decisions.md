@@ -731,8 +731,12 @@ every pair having swapped keys first. Specified in `wire-format.md` §2.5,
   replay can only re-raise a request or draw one SYNC. Consequently **a
   Hello never moves an address.**
 - **Unconfirmed contacts start in backoff,** sending a Hello plus one probe
-  packet per round until the peer answers. Accepting a request (any
-  `add_contact`) sends an immediate SYNC that ends the peer's backoff.
+  packet per round until the peer answers. Accepting a recent request
+  sends an immediate SYNC that ends the peer's backoff. (Implementation
+  note: the spec first sent that SYNC on every `add_contact`. That was
+  redundant, because an unconfirmed contact already probes at once, and
+  wasted with Hellos off. So it is now limited to contacts that start
+  confirmed.)
   **Rejected:** buffering unknown-tag packets at the receiver and replaying
   them after acceptance. It saves about one RTT, but the buffer is memory
   any attacker can fill.
@@ -788,3 +792,51 @@ every pair having swapped keys first. Specified in `wire-format.md` §2.5,
 
   Done when both deliver 100%, and the time to first delivery after
   acceptance stays within about one RTT plus the link's pacing.
+
+**Implementation results.** Simulator, 10 seeds per scenario. Wire bytes
+per payload byte, then median p50 and median p95 latency:
+
+| Scenario | Hellos off | `Unconfirmed` | `UnconfirmedAndBackoff` (default) |
+|---|---|---|---|
+| `edge_2g` | 2.03, 414 ms, 1.7 s | 2.02, 412 ms, 1.7 s | 2.07, 417 ms, 1.7 s |
+| `disaster_cellular` | 5.14, 7.8 s, 6.9 min | 5.11, 7.5 s, 6.9 min | 5.45, 5.5 s, 6.5 min |
+| `lora_like` | 5.06, 3.0 s, 10.5 min | 5.03, 3.0 s, 11.3 min | 5.08, 2.9 s, 7.1 min |
+| `bursty_loss` | 4.50, 1.1 s, 45.6 s | 4.52, 1.0 s, 44.6 s | 4.53, 982 ms, 20.2 s |
+| `harsh_64` | 8.76, 12.1 min, 1.1 h | 8.72, 11.6 min, 55.5 min | 9.53, 10.6 min, 1.0 h |
+| `week_offline` | 1.92, 2.6 d, 6.6 d | 1.94, 2.6 d, 6.6 d | 2.05, 2.6 d, 6.5 d |
+| `introduction` | n/a (can't deliver) | 5.12, 7.5 s, 6.7 min | 5.42, 5.8 s, 6.7 min |
+| `introduction_lora` | n/a | 5.03, 3.0 s, 9.3 min | 5.09, 3.0 s, 6.6 min |
+
+- Introductions cost about nothing: `Unconfirmed` is within about 1% of
+  Hellos off everywhere.
+- Hellos in backoff cost 0–9% more bytes (most on `harsh_64` and
+  `week_offline`, where Hellos replace ~35-byte SYNC probes during long
+  outages). But they shorten recovery: a
+  Hello to a known contact draws an immediate SYNC, so it acts as a cheap
+  probe that solicits a reply. Median p95 fell from 45.6 s to 20.2 s on
+  `bursty_loss` and from 10.5 to 7.1 min on `lora_like`.
+- **Change from the spec:** in deep backoff the Hello replaces the bare
+  SYNC probe instead of preceding it. A Hello plus a SYNC every round
+  pushed `week_offline` past its 128 KiB outage budget (12% more bytes than
+  Hellos off), and the SYNC added nothing. That brought it to 7%.
+- The Phase 3 overhead-regression test now runs with Hellos off, as it
+  already did with FEC, because it measures header overhead against Phase 2.
+
+**Open problem: counter reuse after state loss.** The `relay_restart`
+scenario (the relay is wiped mid-run and relearns its client from Hellos)
+delivers everything, but recovery takes about 1.8 days. The cause is not
+the Hello. The rebuilt relay restarts its packet counter for the client at
+0 under the same pair key. The client rejects those packets as replays
+until the counter passes the old high-water mark. Worse, every such packet
+reuses a nonce (`security.md` §4, "Known issue"). `remove_contact` then
+`add_contact` does the same. This predates D-044, but Hellos make losing
+and relearning a peer routine, so it needs fixing before relays rely on
+it. `relay_restart` is kept out of `Scenario::NAMES` (the default sweep)
+until then. Options, for the user to decide:
+1. Persist a counter tombstone per removed contact. That fixes path 2
+   only, and the storage grows with churn.
+2. Mix a per-incarnation random value into each direction's key, sent in
+   the Hello. It fixes both paths, but the Hello grows past the 48-byte
+   minimum MTU.
+3. The epoch extension (§7 of `security.md`), which also gives forward
+   secrecy per epoch. It's the principled fix and the largest change.

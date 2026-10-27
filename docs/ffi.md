@@ -32,6 +32,10 @@ Unix milliseconds (`uint64_t now_ms`).
 - **Return values.** Every fallible call returns `AvlStatus`:
   - `AVL_STATUS_OK`;
   - `AVL_STATUS_NONE`: nothing to return, such as an empty event queue;
+  - `AVL_STATUS_HELLO`: only from `avl_engine_handle_packet`. A verified
+    Hello from an unknown key; the key is written to `public_key_out` and
+    an `AVL_EVENT_KIND_CONTACT_REQUEST` is queued. Treat the packet's source
+    address as a candidate only (D-044);
   - `AVL_STATUS_ERR_*`: failure. `AVL_STATUS_ERR_ENGINE` comes with an
     `AvlEngineError` detail (`AVL_ENGINE_ERROR_*`) available from
     `avl_last_engine_error()`. That value is thread-local and holds for the
@@ -53,9 +57,9 @@ Unix milliseconds (`uint64_t now_ms`).
 - **Null pointers** for required arguments return
   `AVL_STATUS_ERR_INVALID_ARGUMENT`; they are never dereferenced. Invalid
   UTF-8 text is rejected the same way.
-- **Enumerations read from C** (`AvlConfig.fec`, `AvlLinkConfig.budget`) are
-  `uint8_t` fields taking `AVL_FEC_MODE_*` / `AVL_BUDGET_KIND_*` values, not
-  C enums: an out-of-range enum would be undefined behaviour on the Rust
+- **Enumerations read from C** (`AvlConfig.fec`, `AvlConfig.hello`,
+  `AvlLinkConfig.budget`) are `uint8_t` fields taking `AVL_FEC_MODE_*`,
+  `AVL_HELLO_MODE_*` and `AVL_BUDGET_KIND_*` values, not C enums: an out-of-range enum would be undefined behaviour on the Rust
   side, an out-of-range integer is just `AVL_ENGINE_ERROR_INVALID_CONFIG` /
   `_INVALID_LINK_CONFIG`. Enumerations Rust *returns* (`AvlStatus`,
   `AvlEngineError`, `AvlEventKind`) are C enums.

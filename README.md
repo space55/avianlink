@@ -112,8 +112,11 @@ The engine is built from these parts:
     loses and duplicates nothing.
 - **Cryptography** ([`docs/security.md`](docs/security.md)).
   - An identity is an Ed25519 keypair, also used for X25519.
-  - Contacts are added by public key, exchanged out of band (for example
-    with a QR code and a fingerprint check). There is no handshake.
+  - Contacts are added by public key. Only one side needs the other's key
+    in advance: the other learns it from a **Hello**, a 47-byte
+    unencrypted but authenticated contact request that the app or relay
+    decides whether to accept. Fingerprints are still checked out of band.
+    There is no handshake.
   - Per-direction keys and routing tags come from static-static
     Diffie-Hellman through HKDF-SHA256.
   - Every packet is independently decryptable with ChaCha20-Poly1305.
@@ -135,21 +138,26 @@ These numbers are from the deterministic simulator (`avianlink-sim`). Each
 scenario sends 1,000 messages averaging ~200 bytes between two peers, both
 ways. Times are from send to first delivery. Bytes and packets count
 everything on the wire: headers, retransmissions, ACKs, repairs and sync.
-Seed 1 is shown; **all 110 runs (11 scenarios × 10 seeds) delivered every
+Seed 1 is shown; **all 120 runs (12 scenarios × 10 seeds) delivered every
 message.**
 
 | Scenario | Conditions | p50 | p95 | wire bytes / payload byte | packets / message |
 |---|---|--:|--:|--:|--:|
-| `clean` | 1200 B MTU, 5 ms, no loss | 5 ms | 5 ms | 1.32 | 2.0 |
-| `geo_satellite` | 550 ms RTT, 8 kB/s, rain fades | 318 ms | 417 ms | 1.46 | 2.2 |
-| `edge_2g` | 512 B MTU, 4 kB/s, spiky delay, outages | 410 ms | 2.9 s | 2.15 | 3.2 |
-| `disaster_cellular` | 256 B, 1 kB/s, ~35% bursty loss, corruption, 3-min outages | 9.9 s | 7.8 min | 5.16 | 7.9 |
-| `lora_like` | 51 B MTU, 1% duty cycle, ~10% loss | 2.9 s | 8.6 min | 5.03 | 23.6 |
-| `bursty_loss` | `disaster_cellular` without outages | 954 ms | 31 s | 4.58 | 8.3 |
-| `harsh_64` | 64 B MTU, ~50% bursty loss, up 90 s / down 10 min | 12.6 min | 1.1 h | 8.65 | 30.8 |
-| `harsh_64_crashy` | `harsh_64`, both nodes crash every ~30 min | 10.6 min | 59 min | 9.23 | 32.5 |
-| `disaster_hostile` | `disaster_cellular` plus 20% replayed, 20% forged, 10% tampered packets | 13.5 s | 7.3 min | 5.85 | 9.2 |
-| `week_offline` | `edge_2g`, link down for 7 days, 1,000 messages over 9 days | 2.6 d | 6.6 d | 1.77 | 2.1 |
+| `clean` | 1200 B MTU, 5 ms, no loss | 5 ms | 5 ms | 1.33 | 2.0 |
+| `geo_satellite` | 550 ms RTT, 8 kB/s, rain fades | 318 ms | 422 ms | 1.48 | 2.2 |
+| `edge_2g` | 512 B MTU, 4 kB/s, spiky delay, outages | 417 ms | 3.1 s | 2.22 | 3.4 |
+| `disaster_cellular` | 256 B, 1 kB/s, ~35% bursty loss, corruption, 3-min outages | 5.7 s | 7.0 min | 5.66 | 9.7 |
+| `lora_like` | 51 B MTU, 1% duty cycle, ~10% loss | 2.8 s | 6.3 min | 5.04 | 23.7 |
+| `bursty_loss` | `disaster_cellular` without outages | 951 ms | 17.5 s | 4.56 | 8.6 |
+| `harsh_64` | 64 B MTU, ~50% bursty loss, up 90 s / down 10 min | 13.1 min | 1.1 h | 9.46 | 34.3 |
+| `harsh_64_crashy` | `harsh_64`, both nodes crash every ~30 min | 13.6 min | 1.2 h | 10.11 | 35.8 |
+| `disaster_hostile` | `disaster_cellular` plus 20% replayed, 20% forged, 10% tampered packets | 6.7 s | 7.1 min | 6.30 | 11.5 |
+| `week_offline` | `edge_2g`, link down for 7 days, 1,000 messages over 9 days | 2.6 d | 6.6 d | 2.05 | 2.4 |
+| `introduction` | `disaster_cellular`, but B starts without A's key and accepts A's contact request | 7.7 s | 7.0 min | 5.74 | 9.8 |
+| `introduction_lora` | the same on `lora_like` | 3.1 s | 6.5 min | 5.07 | 23.8 |
+
+Single-seed rows move noticeably between seeds. [`docs/decisions.md`](docs/decisions.md)
+D-044 has 10-seed medians, with and without Hellos.
 
 At small MTUs a 200-byte message needs several packets: 6–10 at a 64-byte
 MTU, 10 or more on LoRa. That, more than retransmission, is why packets per
@@ -202,7 +210,9 @@ avianlink chat /tmp/bob   --bind 127.0.0.1:7002 --peer <ALICE_ADDRESS>@127.0.0.1
 ```
 
 Every line you type is a message. `/status` shows RTT, measured loss and
-reachability, and `/nudge` probes immediately. Add `--profile lora_like`
+reachability, and `/nudge` probes immediately. Leave out `--peer` on one
+side to wait for a contact request instead: compare the fingerprint it
+prints with the sender, then type `/accept`. Add `--profile lora_like`
 (or any profile name) to give the engine that profile's MTU and budget.
 
 To make the link actually bad, run the chat through `udp-impair` or real
@@ -309,6 +319,11 @@ They're generated from the same definitions, and a test fails if they drift.
   The `disaster_hostile` scenario runs this continuously.
 - an attacker can only cause a bounded amount of work per packet.
 
+**Known issue:** a node that loses its state but keeps its identity, or
+removes and re-adds a contact, restarts that pair's packet counter and
+reuses nonces. Until that's fixed, treat such a node as a new identity
+(`docs/security.md` §4).
+
 **Not protected in v1:**
 - **No forward secrecy.** Keys come from the two long-term identities, so
   anyone who later steals either secret key can decrypt recorded traffic.
@@ -317,6 +332,8 @@ They're generated from the same definitions, and a test fails if they drift.
   static-static Diffie-Hellman.
 - Metadata is visible: packet sizes, timing, counters, and a per-direction
   routing tag that links a pair's packets together without naming them.
+  Hellos also show the sender's public key and 16 bits of a hash of the
+  recipient's key (`HelloMode::Off` turns them off).
 - Data at rest isn't encrypted by the engine.
 
 Verify fingerprints out of band when you add a contact.
