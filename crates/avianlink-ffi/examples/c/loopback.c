@@ -35,7 +35,7 @@ static void node_open(Node *n) {
 
     CHECK(avl_identity_generate(n->secret, n->public_key));
     CHECK(avl_storage_memory_new(&storage));
-    CHECK(avl_engine_open(n->secret, storage, NULL, &n->engine));
+    CHECK(avl_engine_open(n->secret, storage, NULL, true, &n->engine)); /* new identity: create */
     link.mtu = MTU;
     link.cost = 1;
     link.budget = AVL_BUDGET_KIND_UNLIMITED;

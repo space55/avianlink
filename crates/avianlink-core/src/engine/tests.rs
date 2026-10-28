@@ -402,7 +402,7 @@ fn new_and_restore_check_storage() {
     );
     assert_eq!(
         Engine::restore(Config::default(), id(A), MemoryStorage::new(), rng(A)).err(),
-        Some(Error::CorruptStorage)
+        Some(Error::StateMissing)
     );
 }
 
@@ -1430,5 +1430,107 @@ fn silent_confirmed_contact_gets_hellos_after_the_grace_probes() {
         probes_without_hello,
         usize::from(Config::default().backoff_grace),
         "the grace probes go without Hellos"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Tombstones (D-046)
+
+/// Runs both engines against each other until quiet.
+fn settle(a: &mut E, b: &mut E, now: &mut u64) {
+    for _ in 0..40 {
+        deliver(b, &drain_tx(a, t(*now)), t(*now));
+        deliver(a, &drain_tx(b, t(*now)), t(*now));
+        *now += 500;
+    }
+}
+
+#[test]
+fn readded_contact_resumes_instead_of_restarting() {
+    let (mut a, ab) = engine(A, B, 128);
+    let (mut b, _) = engine(B, A, 128);
+    let mut now = 0;
+    for i in 0..3 {
+        a.send_text(ab, &alloc::format!("before {i}"), t(now))
+            .unwrap();
+    }
+    settle(&mut a, &mut b, &mut now);
+    assert_eq!(received(&drain_events(&mut b)).len(), 3);
+    drain_events(&mut a);
+    let old_counter = a.contacts[&ab].tx_counter;
+
+    a.remove_contact(ab).unwrap();
+    assert_eq!(a.add_contact(pk(B)).unwrap(), ab);
+    assert!(
+        a.contacts[&ab].tx_counter > old_counter,
+        "no counter restart"
+    );
+    let q = a.send_text(ab, "after re-add", t(now)).unwrap();
+    assert_eq!(q.seq, 3, "seqs continue");
+    settle(&mut a, &mut b, &mut now);
+    // Delivered for real, not "acknowledged" by a stale ACK.
+    assert_eq!(
+        received(&drain_events(&mut b)),
+        [(3, String::from("after re-add"))]
+    );
+    assert!(drain_events(&mut a)
+        .iter()
+        .any(|e| matches!(e, Event::MessageDelivered { id, .. } if *id == q.id)));
+    assert_eq!(b.stats().packets_dropped_replay, 0);
+    // B's messages still flow to the re-added A, and old ones aren't
+    // redelivered.
+    b.send_text(ab, "hello again", t(now)).unwrap();
+    settle(&mut a, &mut b, &mut now);
+    assert_eq!(
+        received(&drain_events(&mut a)),
+        [(0, String::from("hello again"))]
+    );
+}
+
+#[test]
+fn abandoned_messages_are_skipped_not_waited_for() {
+    let (mut a, ab) = engine(A, B, 128);
+    let (mut b, _) = engine(B, A, 128);
+    let mut now = 0;
+    a.send_text(ab, "delivered", t(now)).unwrap();
+    settle(&mut a, &mut b, &mut now);
+    // Queued but never sent, then abandoned by the removal.
+    a.send_text(ab, "abandoned", t(now)).unwrap();
+    assert_eq!(a.remove_contact(ab).unwrap().len(), 1);
+    a.add_contact(pk(B)).unwrap();
+    a.send_text(ab, "fresh", t(now)).unwrap();
+    settle(&mut a, &mut b, &mut now);
+    let evs = drain_events(&mut b);
+    assert_eq!(
+        received(&evs),
+        [(0, String::from("delivered")), (2, String::from("fresh"))]
+    );
+    assert!(evs.iter().any(|e| matches!(
+        e,
+        Event::MessagesSkipped {
+            first_seq: 1,
+            count: 1,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn tombstones_survive_restore() {
+    let (mut a, ab) = engine(A, B, 128);
+    let (mut b, _) = engine(B, A, 128);
+    let mut now = 0;
+    a.send_text(ab, "one", t(now)).unwrap();
+    settle(&mut a, &mut b, &mut now);
+    a.remove_contact(ab).unwrap();
+    let mut r = crash_and_restore(&a, 128);
+    assert_eq!(r.contacts().count(), 0);
+    r.add_contact(pk(B)).unwrap();
+    let q = r.send_text(ab, "two", t(now)).unwrap();
+    assert_eq!(q.seq, 1);
+    settle(&mut r, &mut b, &mut now);
+    assert_eq!(
+        received(&drain_events(&mut b)),
+        [(0, String::from("one")), (1, String::from("two"))]
     );
 }

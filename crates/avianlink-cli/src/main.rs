@@ -21,8 +21,8 @@ use avianlink_core::{
 };
 use avianlink_sim::Scenario;
 use avianlink_udp::{
-    load_or_create_identity, now, parse_public_key, public_key_hex, Command, HostConfig, HostEvent,
-    UdpHost,
+    init_node, load_identity, now, parse_public_key, public_key_hex, Command, HostConfig,
+    HostError, HostEvent, UdpHost,
 };
 
 const USAGE: &str = "usage:
@@ -49,10 +49,17 @@ fn main() {
 }
 
 fn whoami(dir: &str, init: bool) -> Result<(), String> {
-    let (id, created) = load_or_create_identity(&PathBuf::from(dir)).map_err(|e| e.to_string())?;
-    if init && !created {
-        eprintln!("(identity already existed; not replaced)");
-    }
+    let dir = PathBuf::from(dir);
+    let existing = load_identity(&dir).map_err(|e| e.to_string())?;
+    let id = match (existing, init) {
+        (Some(id), true) => {
+            eprintln!("(identity already existed; not replaced)");
+            id
+        }
+        (Some(id), false) => id,
+        (None, true) => init_node(&dir).map_err(|e| e.to_string())?,
+        (None, false) => return Err(format!("no identity in {}; run init", dir.display())),
+    };
     let key = id.public_key();
     println!("address:     {}", public_key_hex(&key));
     println!("fingerprint: {}", format_fingerprint(&key.fingerprint()));
@@ -117,14 +124,24 @@ fn chat(dir: &str, opts: &[String]) -> Result<(), String> {
     };
 
     let dir = PathBuf::from(dir);
-    let (identity, _) = load_or_create_identity(&dir).map_err(|e| e.to_string())?;
+    let identity = load_identity(&dir)
+        .map_err(|e| e.to_string())?
+        .ok_or(format!("no identity in {}; run init first", dir.display()))?;
     let me = identity.public_key();
     let config = HostConfig {
         bind,
         link,
         engine: Config::default(),
     };
-    let mut host = UdpHost::open(&dir, identity, config).map_err(|e| e.to_string())?;
+    let mut host = UdpHost::open(&dir, identity, config).map_err(|e| match e {
+        HostError::Engine(avianlink_core::Error::StateMissing) => format!(
+            "{} has an identity but its state is gone. Reusing the identity would reuse \
+             encryption nonces, so run `avianlink init` in a new directory and re-share \
+             your address.",
+            dir.display()
+        ),
+        e => e.to_string(),
+    })?;
     let local = host.local_addr().map_err(|e| e.to_string())?;
     // The conversation lines are sent to, and the latest contact request.
     let conv: Arc<Mutex<Option<ConversationId>>> = Arc::new(Mutex::new(None));

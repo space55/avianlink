@@ -147,21 +147,23 @@ nonce  = counter as 8 bytes little-endian ‖ 0x00000000
   (`reliability.md` §4). Restoring an *older* copy of storage (a backup)
   breaks this and can reuse nonces. Hosts must not roll storage back. §7
   lists a mitigation.
-- **Known issue: counters restart after state loss (found while testing
-  D-044; open).** Two more paths restart a pair's counter at 0 under the
-  same key, which reuses nonces just as a rollback does:
-  1. a node that loses its storage and comes back with the same identity
-     (a reinstall, or a relay rebuilt from scratch);
-  2. `remove_contact` followed by `add_contact` for the same key. The
-     contact record holding the counter reservation is deleted.
+- **Counters across removal and state loss (D-046).** Two more paths
+  could restart a pair's counter at 0 under the same key, which would
+  reuse nonces just as a rollback does. They would also let the peer's old
+  ACKs "deliver" new messages that never arrived.
+  1. `remove_contact` followed by `add_contact` for the same key. **Fixed:**
+     removal leaves a tombstone (counter reservation, sequence numbers,
+     replay floor, receive position), and re-adding resumes from it.
+  2. A node that loses its storage and comes back with the same identity
+     (a reinstall that finds the old key in the keychain). The engine can't
+     detect this, because the storage that would say so is gone. **Rule:**
+     state is created only together with a new identity. `Engine::restore`
+     on empty storage fails with `Error::StateMissing`, and a host that
+     gets it must generate a new identity rather than call `Engine::new`
+     with the old one. `UdpHost` and the CLI enforce this. In the C ABI,
+     `avl_engine_open` takes an explicit `create` flag.
 
-  An eavesdropper holding packets from both incarnations can XOR their
-  plaintexts and recover the Poly1305 key for that nonce. The peer rejects
-  the new packets as replays until their counters pass the old ones, so
-  traffic also stalls. Until this is fixed, hosts must not remove and
-  re-add a contact, and must treat a node that lost its state as a new
-  identity. The fix needs a design decision (`decisions.md` D-044, "Open
-  problem").
+  Relays are not affected: they have no identity and no pair state.
 - **The header is associated data:** authenticated but not encrypted.
   Tampering with kind, tag or counter fails authentication.
 - **No pre-decryption check.** The 3-byte routing tag already discards

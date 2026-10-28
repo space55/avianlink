@@ -42,6 +42,8 @@ typedef enum AvlEngineError {
   AVL_ENGINE_ERROR_CORRUPT_STORAGE,
   // Stored state belongs to another identity.
   AVL_ENGINE_ERROR_IDENTITY_MISMATCH,
+  // Restoring from empty storage: the identity's state is lost.
+  AVL_ENGINE_ERROR_STATE_MISSING,
   // An error this ABI version does not know.
   AVL_ENGINE_ERROR_OTHER,
 } AvlEngineError;
@@ -329,8 +331,12 @@ void avl_storage_free(struct AvlStorage *storage);
 enum AvlStatus avl_config_default(struct AvlConfig *out);
 
 // Opens an engine for the identity with 32-byte `secret`, taking ownership
-// of `storage`: restores the state in it, or starts fresh if it is empty.
-// `config` may be null for defaults. On failure `storage` is freed.
+// of `storage`. `create`: start fresh state for a *new* identity (fails
+// with `AVL_ENGINE_ERROR_STORAGE_NOT_EMPTY` if `storage` holds an engine).
+// Otherwise restore it (fails with `AVL_ENGINE_ERROR_STATE_MISSING` if
+// `storage` is empty). An identity whose state is lost must not be reused:
+// generate a new one (`docs/ffi.md` §2). `config` may be null for defaults.
+// On failure `storage` is freed.
 //
 // # Safety
 // `secret` must point to 32 readable bytes; `storage` must be a live handle
@@ -338,6 +344,7 @@ enum AvlStatus avl_config_default(struct AvlConfig *out);
 enum AvlStatus avl_engine_open(const uint8_t *secret,
                                struct AvlStorage *storage,
                                const struct AvlConfig *config,
+                               bool create,
                                struct AvlEngine **out);
 
 // Frees an engine and its storage.

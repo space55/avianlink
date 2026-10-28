@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use avianlink_core::{
     Config, ContactStatus, ConversationId, Engine, Error, Event, Identity, LinkConfig, LinkId,
-    LinkStats, PublicKey, Queued, Received, Stats, Storage, Timestamp,
+    LinkStats, PublicKey, Queued, Received, Stats, Timestamp,
 };
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
@@ -50,6 +50,16 @@ pub struct HostConfig {
     pub link: LinkConfig,
     /// Engine configuration.
     pub engine: Config,
+}
+
+/// Creates a node in `dir`: a new identity and, together with it, the
+/// engine state it belongs to. Fails if `dir` already has an identity.
+pub fn init_node(dir: &Path) -> Result<Identity, HostError> {
+    let identity = crate::identity::create_identity(dir)?;
+    let storage = FileStorage::open(dir.join("state"))?;
+    let me = Identity::from_secret_bytes(&identity.secret_bytes());
+    Engine::new(Config::default(), me, storage, os_rng())?;
+    Ok(identity)
 }
 
 /// A request from the UI thread.
@@ -160,19 +170,14 @@ pub struct UdpHost {
 }
 
 impl UdpHost {
-    /// Opens the node stored in `dir` (restoring it if it exists) and binds
-    /// its socket.
+    /// Opens the node stored in `dir` (made by [`init_node`]) and binds its
+    /// socket. Fails with `Error::StateMissing` if the identity's state is
+    /// gone: reusing the identity would restart its packet counters and
+    /// reuse nonces, so such a node needs a new identity
+    /// (`docs/security.md` §4).
     pub fn open(dir: &Path, identity: Identity, config: HostConfig) -> Result<Self, HostError> {
-        let mut storage = FileStorage::open(dir.join("state"))?;
-        let fresh = storage
-            .load(b"v")
-            .map_err(|_| HostError::Io(io::Error::other("storage read failed")))?
-            .is_none();
-        let mut engine = if fresh {
-            Engine::new(config.engine, identity, storage, os_rng())?
-        } else {
-            Engine::restore(config.engine, identity, storage, os_rng())?
-        };
+        let storage = FileStorage::open(dir.join("state"))?;
+        let mut engine = Engine::restore(config.engine, identity, storage, os_rng())?;
         engine.add_link(LINK, config.link)?;
         let socket = UdpSocket::bind(config.bind)?;
         Ok(Self {

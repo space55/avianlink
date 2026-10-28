@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use avianlink_core::{Config, Event};
 use avianlink_sim::proxy::Proxy;
 use avianlink_sim::Scenario;
-use avianlink_udp::{load_or_create_identity, Command, HostConfig, HostEvent, UdpHost};
+use avianlink_udp::{init_node, Command, HostConfig, HostEvent, UdpHost};
 
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("avianlink-e2e-{name}-{}", std::process::id()));
@@ -33,8 +33,8 @@ fn exchange(scenario: &str, per_side: usize, limit: Duration) -> Duration {
     let (pa, pb) = proxy.local_addrs().unwrap();
 
     let (da, db) = (dir(&format!("{scenario}-a")), dir(&format!("{scenario}-b")));
-    let (ida, _) = load_or_create_identity(&da).unwrap();
-    let (idb, _) = load_or_create_identity(&db).unwrap();
+    let ida = init_node(&da).unwrap();
+    let idb = init_node(&db).unwrap();
     let (ka, kb) = (ida.public_key(), idb.public_key());
     let cfg = |_: ()| HostConfig {
         bind: localhost(),
@@ -116,4 +116,23 @@ fn chat_over_loopback_edge_2g() {
 fn chat_over_loopback_disaster_cellular() {
     let took = exchange("disaster_cellular", 10, Duration::from_secs(240));
     eprintln!("disaster_cellular: 20 messages exchanged in {took:?}");
+}
+
+/// A node whose state is gone refuses to start with its old identity
+/// (D-046): it would restart packet counters and reuse nonces.
+#[test]
+fn lost_state_refuses_the_old_identity() {
+    let d = dir("lost-state");
+    let id = init_node(&d).unwrap();
+    std::fs::remove_dir_all(d.join("state")).unwrap();
+    let cfg = HostConfig {
+        bind: localhost(),
+        link: Scenario::named("clean", 0).unwrap().link.engine_link(),
+        engine: Config::default(),
+    };
+    match UdpHost::open(&d, id, cfg) {
+        Err(avianlink_udp::HostError::Engine(avianlink_core::Error::StateMissing)) => {}
+        Err(e) => panic!("wrong error: {e}"),
+        Ok(_) => panic!("opened without state"),
+    }
 }

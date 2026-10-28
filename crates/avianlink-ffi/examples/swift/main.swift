@@ -20,7 +20,7 @@ final class Node {
         check(avl_identity_generate(&secret, &publicKey), "generate")
         var storage: OpaquePointer?
         check(avl_storage_memory_new(&storage), "storage")
-        check(avl_engine_open(secret, storage, nil, &engine), "open")
+        check(avl_engine_open(secret, storage, nil, true, &engine), "open") // new identity
         var link = AvlLinkConfig()
         link.mtu = 200
         link.cost = 1

@@ -73,11 +73,15 @@ an address, so an attacker can't redirect traffic by spoofing a source.
 ## 4. CLI
 
 ```
-avianlink init   DIR                 # new identity; prints address and fingerprint
+avianlink init   DIR                 # new identity and its state; prints address and fingerprint
 avianlink whoami DIR
 avianlink chat   DIR --bind HOST:PORT [--peer KEY@HOST:PORT]
                  [--profile NAME | --mtu N [--rate BYTES_PER_S]]
 ```
+
+`init` creates the identity and the engine state together. `chat`
+refuses to start if the identity is there but the state is gone (D-046):
+re-`init` in a new directory and re-share the address.
 
 Without `--peer`, `chat` waits for a contact request: it prints the
 requester's fingerprint, and `/accept` adds it, reachable at the address

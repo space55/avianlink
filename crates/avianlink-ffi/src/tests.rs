@@ -38,10 +38,14 @@ impl Drop for Node {
     }
 }
 
-fn open(secret: [u8; 32], storage: *mut AvlStorage) -> Result<*mut AvlEngine, AvlStatus> {
+fn open(
+    secret: [u8; 32],
+    storage: *mut AvlStorage,
+    create: bool,
+) -> Result<*mut AvlEngine, AvlStatus> {
     let mut engine = null_mut();
     // SAFETY: valid pointers; storage is a live handle.
-    let st = unsafe { avl_engine_open(secret.as_ptr(), storage, null(), &mut engine) };
+    let st = unsafe { avl_engine_open(secret.as_ptr(), storage, null(), create, &mut engine) };
     if st != AvlStatus::Ok {
         return Err(st);
     }
@@ -67,7 +71,7 @@ fn memory_node() -> Node {
         AvlStatus::Ok
     );
     Node {
-        engine: open(secret, storage).unwrap(),
+        engine: open(secret, storage, true).unwrap(),
         public,
         secret,
     }
@@ -278,7 +282,7 @@ fn null_and_invalid_arguments_are_rejected() {
             AvlStatus::ErrInvalidArgument
         );
         assert_eq!(
-            avl_engine_open(a.secret.as_ptr(), null_mut(), null(), null_mut()),
+            avl_engine_open(a.secret.as_ptr(), null_mut(), null(), true, null_mut()),
             AvlStatus::ErrInvalidArgument
         );
         assert!(!avl_engine_next_timeout(null_mut(), null_mut()));
@@ -350,7 +354,7 @@ fn invalid_config_fails_open_and_frees_storage() {
     unsafe {
         avl_storage_memory_new(&mut storage);
         assert_eq!(
-            avl_engine_open([1u8; 32].as_ptr(), storage, &cfg, &mut engine),
+            avl_engine_open([1u8; 32].as_ptr(), storage, &cfg, true, &mut engine),
             AvlStatus::ErrEngine
         );
     }
@@ -539,7 +543,7 @@ fn callback_storage_survives_reopen() {
     let conv;
     {
         let node = Node {
-            engine: open(secret, callback_storage(&mut d)).unwrap(),
+            engine: open(secret, callback_storage(&mut d), true).unwrap(),
             public: [0; 32],
             secret,
         };
@@ -550,7 +554,7 @@ fn callback_storage_survives_reopen() {
 
     d.released = false;
     let node = Node {
-        engine: open(secret, callback_storage(&mut d)).unwrap(),
+        engine: open(secret, callback_storage(&mut d), false).unwrap(),
         public: [0; 32],
         secret,
     };
@@ -583,6 +587,7 @@ fn callback_storage_survives_reopen() {
             [8u8; 32].as_ptr(),
             callback_storage(&mut d),
             null(),
+            false,
             &mut engine,
         )
     };
@@ -620,7 +625,7 @@ fn file_storage_survives_reopen() {
     let path = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
     let peer = memory_node();
     let secret = [3u8; 32];
-    let file_node = || {
+    let file_node = |create: bool| {
         let mut storage = null_mut();
         // SAFETY: C string; writable out.
         assert_eq!(
@@ -628,18 +633,18 @@ fn file_storage_survives_reopen() {
             AvlStatus::Ok
         );
         Node {
-            engine: open(secret, storage).unwrap(),
+            engine: open(secret, storage, create).unwrap(),
             public: [0; 32],
             secret,
         }
     };
     let conv = {
-        let node = file_node();
+        let node = file_node(true);
         let conv = add_contact(&node, &peer.public);
         send(&node, &conv, "durable", 0);
         conv
     };
-    let node = file_node();
+    let node = file_node(false);
     assert_eq!(add_contact(&node, &peer.public), conv);
     // SAFETY: live engine.
     assert_eq!(unsafe { avl_engine_outbox_len(node.engine) }, 1);
@@ -705,4 +710,29 @@ fn contact_request_from_an_unknown_key() {
         AvlStatus::Ok
     );
     assert!(st.confirmed);
+}
+
+#[test]
+fn open_is_explicit_about_creating() {
+    let secret = [4u8; 32];
+    let mut engine = null_mut();
+    let mut storage = null_mut();
+    // SAFETY: valid pointers; storage is consumed either way.
+    unsafe {
+        avl_storage_memory_new(&mut storage);
+        assert_eq!(
+            avl_engine_open(secret.as_ptr(), storage, null(), false, &mut engine),
+            AvlStatus::ErrEngine
+        );
+    }
+    assert_eq!(avl_last_engine_error(), AvlEngineError::StateMissing);
+    let mut d = Db::default();
+    let first = open(secret, callback_storage(&mut d), true).unwrap();
+    // SAFETY: live handle.
+    unsafe { avl_engine_free(first) };
+    assert_eq!(
+        open(secret, callback_storage(&mut d), true),
+        Err(AvlStatus::ErrEngine)
+    );
+    assert_eq!(avl_last_engine_error(), AvlEngineError::StorageNotEmpty);
 }

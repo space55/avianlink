@@ -319,10 +319,9 @@ They're generated from the same definitions, and a test fails if they drift.
   The `disaster_hostile` scenario runs this continuously.
 - an attacker can only cause a bounded amount of work per packet.
 
-**Known issue:** a node that loses its state but keeps its identity, or
-removes and re-adds a contact, restarts that pair's packet counter and
-reuses nonces. Until that's fixed, treat such a node as a new identity
-(`docs/security.md` §4).
+**Rule for hosts:** a node that has lost its stored state must start over
+with a new identity. Reusing the old one would reuse nonces. The engine
+reports this as `Error::StateMissing` (`docs/security.md` §4).
 
 **Not protected in v1:**
 - **No forward secrecy.** Keys come from the two long-term identities, so

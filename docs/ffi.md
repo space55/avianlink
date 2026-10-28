@@ -64,9 +64,15 @@ Unix milliseconds (`uint64_t now_ms`).
   `_INVALID_LINK_CONFIG`. Enumerations Rust *returns* (`AvlStatus`,
   `AvlEngineError`, `AvlEventKind`) are C enums.
 - **Sizes** are `size_t` (Swift: `Int`).
-- **Opening.** `avl_engine_open` restores the engine in the storage, or
-  creates one if the storage is empty. The storage handle is consumed even
-  on failure. Opening with a different identity than the one stored fails
+- **Opening.** `avl_engine_open(..., create, ...)` is explicit. With
+  `create`, it starts fresh state for a *new* identity, failing with
+  `AVL_ENGINE_ERROR_STORAGE_NOT_EMPTY` if the storage already holds an
+  engine. Without it, it restores, failing with
+  `AVL_ENGINE_ERROR_STATE_MISSING` if the storage is empty. An app that
+  finds its identity in the keychain but its database gone (iOS keeps
+  keychain items across reinstalls) must generate a **new** identity: reusing
+  the old one would reuse nonces (`security.md` §4). The storage handle is
+  consumed even on failure. Opening with a different identity than the one stored fails
   with `AVL_ENGINE_ERROR_IDENTITY_MISMATCH`. `avl_engine_add_contact`
   returns the existing conversation for a known key, so an app can re-add
   its contacts on every launch.

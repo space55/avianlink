@@ -822,7 +822,8 @@ per payload byte, then median p50 and median p95 latency:
 - The Phase 3 overhead-regression test now runs with Hellos off, as it
   already did with FEC, because it measures header overhead against Phase 2.
 
-**Open problem: counter reuse after state loss.** The `relay_restart`
+**Open problem: counter reuse after state loss** (resolved by D-046 and by
+identity-less relays; kept for the record). The `relay_restart`
 scenario (the relay is wiped mid-run and relearns its client from Hellos)
 delivers everything, but recovery takes about 1.8 days. The cause is not
 the Hello. The rebuilt relay restarts its packet counter for the client at
@@ -840,3 +841,45 @@ until then. Options, for the user to decide:
    minimum MTU.
 3. The epoch extension (§7 of `security.md`), which also gives forward
    secrecy per epoch. It's the principled fix and the largest change.
+
+## D-046: Tombstones for removed contacts; lost state means a new identity
+
+**Problem** (found while testing D-044). Removing and re-adding a contact,
+or losing storage but keeping the identity, restarted that pair's packet
+counter and message sequence numbers at 0 under the same key:
+- **nonces were reused;**
+- **messages were silently lost.** The peer's ACK for the old seqs
+  "acknowledged" the new seq 0 before it arrived. A test confirmed it: the
+  sender saw "delivered", and the peer never received the message;
+- **traffic stalled**, because the peer dropped the reused counters as
+  replays.
+
+**Decisions** (with the user):
+- **`remove_contact` leaves a tombstone** in storage, about 60 bytes per
+  key and never deleted: counter reservation, next seq, Lamport, confirmed
+  flag, replay floor, and the receive window's `cum`. `add_contact` of the
+  same key resumes from it, then announces its floor and next with a SYNC.
+  Messages abandoned by the removal are reported to the peer as skipped,
+  not waited for. **Rejected:** a cap on tombstones. An evicted tombstone
+  brings the bug back for that key; 60 bytes × 1 million removals is
+  60 MB, acceptable even for a large host.
+- **Lost state means a new identity.** The engine can't detect that its
+  own state was lost, so state is created only together with a new
+  identity:
+  - `Engine::restore` on empty storage returns the new `Error::StateMissing`
+    (it used to be `CorruptStorage`);
+  - `UdpHost::open` only restores, and the new `init_node` creates identity
+    and state together. `load_or_create_identity` is gone, because it made
+    the unsafe pairing easy;
+  - `avl_engine_open` takes an explicit `create` flag.
+
+  **Rejected:** an incarnation marker in the Hello. It doesn't fit the
+  48-byte minimum MTU, which the user requires. Key epochs (`security.md`
+  §7) could let a reinstall keep its identity later.
+- **Relays have no identity** (user decision, D-045), so none of this
+  applies to them.
+
+**Breaking:** `remove_contact` now keeps a tombstone instead of deleting
+everything; `Engine::restore` returns a new error;
+`avianlink_udp::load_or_create_identity` is replaced by `load_identity`
+and `init_node`; and `avl_engine_open` takes a new argument.

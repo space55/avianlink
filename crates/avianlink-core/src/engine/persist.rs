@@ -20,6 +20,7 @@ pub(super) const PREFIX_CONTACT: &[u8] = b"c";
 pub(super) const PREFIX_OUTBOX: &[u8] = b"o";
 pub(super) const PREFIX_INBOX: &[u8] = b"i";
 pub(super) const PREFIX_EVENT: &[u8] = b"e";
+pub(super) const PREFIX_TOMBSTONE: &[u8] = b"t";
 
 /// A pending write: `Some(value)` to store, `None` to remove.
 pub(super) type Op = (Vec<u8>, Option<Vec<u8>>);
@@ -40,6 +41,43 @@ pub(super) fn outbox_key(conv: &ConversationId, seq: u64) -> Vec<u8> {
 
 pub(super) fn inbox_key(conv: &ConversationId) -> Vec<u8> {
     key(PREFIX_INBOX, &[&conv.0])
+}
+
+pub(super) fn tombstone_key(conv: &ConversationId) -> Vec<u8> {
+    key(PREFIX_TOMBSTONE, &[&conv.0])
+}
+
+/// What survives `remove_contact` (D-046): everything that must never
+/// restart if the contact is added again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Tombstone {
+    /// Counter reservation, next seq, Lamport, confirmed flag.
+    pub(super) contact: ContactRecord,
+    /// Highest packet counter accepted from the peer (replay floor).
+    pub(super) replay_high: Option<u64>,
+    /// Everything below this seq was received from the peer.
+    pub(super) inbox_cum: u64,
+}
+
+impl Tombstone {
+    pub(super) fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::new();
+        put_varint(&mut v, self.replay_high.map_or(0, |h| h.saturating_add(1)));
+        put_varint(&mut v, self.inbox_cum);
+        v.extend_from_slice(&self.contact.encode());
+        v
+    }
+
+    pub(super) fn decode(v: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(v);
+        let replay_high = r.varint()?.checked_sub(1);
+        let inbox_cum = r.varint()?;
+        Ok(Self {
+            contact: ContactRecord::decode(r.rest())?,
+            replay_high,
+            inbox_cum,
+        })
+    }
 }
 
 pub(super) fn event_key(n: u64) -> Vec<u8> {
@@ -363,6 +401,12 @@ mod tests {
         assert_eq!(parse_outbox_key(&outbox_key(&conv, 77)), Some((conv, 77)));
         assert_eq!(parse_conv_key(PREFIX_INBOX, &inbox_key(&conv)), Some(conv));
         assert_eq!(parse_event_key(&event_key(5)), Some(5));
+        let t = Tombstone {
+            contact: c.clone(),
+            replay_high: Some(900),
+            inbox_cum: 41,
+        };
+        assert_eq!(Tombstone::decode(&t.encode()), Ok(t));
         assert_eq!(parse_outbox_key(b"o\x01"), None);
 
         for ev in [

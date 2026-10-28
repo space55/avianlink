@@ -10,31 +10,32 @@ use avianlink_core::{Identity, PublicKey};
 
 use crate::os_rng;
 
-/// Loads `dir/identity`, or creates it with a fresh identity. Returns the
-/// identity and whether it was created.
-pub fn load_or_create_identity(dir: &Path) -> io::Result<(Identity, bool)> {
-    fs::create_dir_all(dir)?;
-    let path = dir.join("identity");
-    match fs::read(&path) {
+/// Loads the identity in `dir`, if there is one.
+pub fn load_identity(dir: &Path) -> io::Result<Option<Identity>> {
+    match fs::read(dir.join("identity")) {
         Ok(bytes) => {
             let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "identity file must be 32 bytes")
             })?;
-            Ok((Identity::from_secret_bytes(&seed), false))
+            Ok(Some(Identity::from_secret_bytes(&seed)))
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let id = Identity::generate(&mut os_rng());
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)?;
-            f.write_all(id.secret_bytes().as_ref())?;
-            f.sync_all()?;
-            Ok((id, true))
-        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Writes a new identity to `dir` (mode 0600). Fails if one exists.
+pub(crate) fn create_identity(dir: &Path) -> io::Result<Identity> {
+    fs::create_dir_all(dir)?;
+    let id = Identity::generate(&mut os_rng());
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dir.join("identity"))?;
+    f.write_all(id.secret_bytes().as_ref())?;
+    f.sync_all()?;
+    Ok(id)
 }
 
 /// Lowercase hex of a public key (the address format of the CLI).
@@ -62,10 +63,10 @@ mod tests {
     fn identity_file_round_trips_and_is_private() {
         let d = std::env::temp_dir().join(format!("avianlink-id-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
-        let (a, created) = load_or_create_identity(&d).unwrap();
-        assert!(created);
-        let (b, created) = load_or_create_identity(&d).unwrap();
-        assert!(!created);
+        assert!(load_identity(&d).unwrap().is_none());
+        let a = create_identity(&d).unwrap();
+        assert!(create_identity(&d).is_err(), "never replaced");
+        let b = load_identity(&d).unwrap().unwrap();
         assert_eq!(a.public_key(), b.public_key());
         use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(d.join("identity"))

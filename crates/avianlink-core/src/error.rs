@@ -35,8 +35,13 @@ pub enum Error {
     /// `Engine::new` on storage that already holds an engine; use
     /// `Engine::restore`.
     StorageNotEmpty,
-    /// `Engine::restore` found missing or undecodable state.
+    /// `Engine::restore` found undecodable state.
     CorruptStorage,
+    /// `Engine::restore` on storage that holds no engine. If the identity
+    /// is not new, its state was lost: reusing the identity would restart
+    /// packet counters and reuse nonces, so the host must create a new
+    /// identity (`docs/security.md` §4).
+    StateMissing,
     /// `Engine::restore` with a different identity than the stored one.
     IdentityMismatch,
 }
@@ -58,6 +63,7 @@ impl fmt::Display for Error {
             Self::Storage => "storage failure",
             Self::StorageNotEmpty => "storage already holds an engine",
             Self::CorruptStorage => "stored engine state is corrupt",
+            Self::StateMissing => "storage holds no engine state",
             Self::IdentityMismatch => "stored engine belongs to another identity",
         };
         f.write_str(msg)

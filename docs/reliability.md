@@ -160,6 +160,7 @@ leaves the engine exactly as it was.
 | `"o" ‖ conv ‖ seq(be64)` | queue time, encoded record | `send_text`; removed on delivery |
 | `"i" ‖ conv` | receive window: `cum` + bitmap | each newly received message |
 | `"e" ‖ n(be64)` | a pending event | when the event is queued; removed when the host polls it |
+| `"t" ‖ conv` | tombstone of a removed contact: counter reservation, next seq, Lamport, confirmed, replay floor, receive `cum` (~60 B, kept for good) | `remove_contact`; consumed by `add_contact` of the same key (D-046) |
 
 Storage schema 4 adds the confirmed flag and the `ContactRequest` event
 encoding. Schema 3 contacts migrate as confirmed, which keeps the behaviour

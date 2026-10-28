@@ -72,6 +72,8 @@ pub enum AvlEngineError {
     CorruptStorage,
     /// Stored state belongs to another identity.
     IdentityMismatch,
+    /// Restoring from empty storage: the identity's state is lost.
+    StateMissing,
     /// An error this ABI version does not know.
     Other,
 }
@@ -94,6 +96,7 @@ impl From<Error> for AvlEngineError {
             Error::StorageNotEmpty => Self::StorageNotEmpty,
             Error::CorruptStorage => Self::CorruptStorage,
             Error::IdentityMismatch => Self::IdentityMismatch,
+            Error::StateMissing => Self::StateMissing,
             _ => Self::Other,
         }
     }
@@ -815,8 +818,12 @@ pub struct AvlEngine {
 }
 
 /// Opens an engine for the identity with 32-byte `secret`, taking ownership
-/// of `storage`: restores the state in it, or starts fresh if it is empty.
-/// `config` may be null for defaults. On failure `storage` is freed.
+/// of `storage`. `create`: start fresh state for a *new* identity (fails
+/// with `AVL_ENGINE_ERROR_STORAGE_NOT_EMPTY` if `storage` holds an engine).
+/// Otherwise restore it (fails with `AVL_ENGINE_ERROR_STATE_MISSING` if
+/// `storage` is empty). An identity whose state is lost must not be reused:
+/// generate a new one (`docs/ffi.md` §2). `config` may be null for defaults.
+/// On failure `storage` is freed.
 ///
 /// # Safety
 /// `secret` must point to 32 readable bytes; `storage` must be a live handle
@@ -826,6 +833,7 @@ pub unsafe extern "C" fn avl_engine_open(
     secret: *const u8,
     storage: *mut AvlStorage,
     config: *const AvlConfig,
+    create: bool,
     out: *mut *mut AvlEngine,
 ) -> AvlStatus {
     guard(|| {
@@ -833,7 +841,7 @@ pub unsafe extern "C" fn avl_engine_open(
             return AvlStatus::ErrInvalidArgument;
         }
         // SAFETY: caller hands over ownership of a live handle.
-        let mut storage = *unsafe { Box::from_raw(storage) };
+        let storage = *unsafe { Box::from_raw(storage) };
         if secret.is_null() || out.is_null() {
             return AvlStatus::ErrInvalidArgument;
         }
@@ -848,11 +856,7 @@ pub unsafe extern "C" fn avl_engine_open(
                 Err(()) => return engine_err(Error::InvalidConfig),
             }
         };
-        let fresh = match storage.load(b"v") {
-            Ok(v) => v.is_none(),
-            Err(()) => return engine_err(Error::Storage),
-        };
-        let opened = if fresh {
+        let opened = if create {
             Engine::new(config, identity, storage, os_rng())
         } else {
             Engine::restore(config, identity, storage, os_rng())

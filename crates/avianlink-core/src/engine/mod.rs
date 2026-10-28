@@ -29,8 +29,8 @@ use fec_rx::{FecRx, Window};
 use persist::{
     contact_key, decode_event, decode_inbox, decode_outbox, decode_version, encode_event,
     encode_inbox, encode_outbox, event_key, inbox_key, outbox_key, parse_conv_key, parse_event_key,
-    parse_outbox_key, version_record, ContactRecord, Op, KEY_VERSION, PREFIX_CONTACT, PREFIX_EVENT,
-    PREFIX_INBOX, PREFIX_OUTBOX, SCHEMA, SCHEMA_V3,
+    parse_outbox_key, tombstone_key, version_record, ContactRecord, Op, Tombstone, KEY_VERSION,
+    PREFIX_CONTACT, PREFIX_EVENT, PREFIX_INBOX, PREFIX_OUTBOX, SCHEMA, SCHEMA_V3,
 };
 use state::{Contact, FragState, OutMsg, Planned, RepairOut, Replay, Timers};
 
@@ -337,7 +337,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         let version = storage
             .load(KEY_VERSION)
             .map_err(|_| Error::Storage)?
-            .ok_or(Error::CorruptStorage)?;
+            .ok_or(Error::StateMissing)?;
         let (schema, owner) = decode_version(&version).map_err(|_| Error::CorruptStorage)?;
         if schema != SCHEMA && schema != SCHEMA_V3 {
             return Err(Error::CorruptStorage);
@@ -548,10 +548,42 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         // A verified Hello showed the key already knows ours.
         let requested = self.recent_requests.iter().position(|k| *k == key);
         contact.confirmed = requested.is_some();
-        commit(
-            &mut self.storage,
-            alloc::vec![(contact_key(&conv), Some(contact.record().encode()))],
-        )?;
+        let tkey = tombstone_key(&conv);
+        let tomb = match self.storage.load(&tkey).map_err(|_| Error::Storage)? {
+            Some(v) => Some(Tombstone::decode(&v).map_err(|_| Error::CorruptStorage)?),
+            None => None,
+        };
+        let mut ops = alloc::vec![];
+        if let Some(t) = &tomb {
+            // Re-added: resume counters, seqs and the receive position, so
+            // nothing restarts under the same key (D-046).
+            if t.contact.key != key {
+                return Err(Error::CorruptStorage);
+            }
+            contact.next_seq = t.contact.next_seq;
+            contact.lamport = t.contact.lamport;
+            contact.tx_counter = t.contact.counter_reserved;
+            contact.counter_reserved = t.contact.counter_reserved;
+            contact.sent_digests = t.contact.sent_digests.clone();
+            contact.confirmed |= t.contact.confirmed;
+            contact.replay = Replay::with_floor(t.replay_high);
+            contact.inbox.cum = t.inbox_cum;
+            // Our floor and next tell the peer what we abandoned.
+            contact.sync_due = true;
+            let window_bytes = usize_of(self.config.max_reorder_window / 8).saturating_add(1);
+            ops.push((
+                inbox_key(&conv),
+                Some(encode_inbox(
+                    &contact.inbox,
+                    window_bytes,
+                    t.replay_high,
+                    &[],
+                )),
+            ));
+            ops.push((tkey, None));
+        }
+        ops.push((contact_key(&conv), Some(contact.record().encode())));
+        commit(&mut self.storage, ops)?;
         if let Some(i) = requested {
             self.recent_requests.remove(i);
         }
@@ -1621,6 +1653,11 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
     /// Removes a contact: its outbox (undelivered messages are abandoned
     /// and their IDs returned), receive window and partial reassemblies, in
     /// one storage batch. Already-queued events are kept.
+    ///
+    /// A tombstone of about 60 bytes stays in storage for good: packet
+    /// counters, sequence numbers and the receive position. If the key is
+    /// added again, it resumes from there instead of restarting at 0, which
+    /// would reuse nonces and let stale ACKs "deliver" new messages (D-046).
     pub fn remove_contact(
         &mut self,
         conversation: ConversationId,
@@ -1634,8 +1671,14 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             .keys()
             .map(|&seq| (outbox_key(&conversation, seq), None))
             .collect();
+        let tomb = Tombstone {
+            contact: contact.record(),
+            replay_high: contact.replay.high(),
+            inbox_cum: contact.inbox.cum,
+        };
         ops.push((contact_key(&conversation), None));
         ops.push((inbox_key(&conversation), None));
+        ops.push((tombstone_key(&conversation), Some(tomb.encode())));
         commit(&mut self.storage, ops)?;
         let contact = self
             .contacts
