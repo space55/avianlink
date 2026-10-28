@@ -57,7 +57,8 @@ name = "avianlink-relay"
 version = "0.0.0"
 dependencies = [
  "avianlink-core",
- "avianlink-udp",
+ "rand_chacha",
+ "rand_core",
 ]
 
 [[package]]
@@ -65,6 +66,7 @@ name = "avianlink-sim"
 version = "0.0.0"
 dependencies = [
  "avianlink-core",
+ "avianlink-relay",
  "rand_chacha",
  "rand_core",
 ]
@@ -74,6 +76,7 @@ name = "avianlink-udp"
 version = "0.0.0"
 dependencies = [
  "avianlink-core",
+ "avianlink-relay",
  "avianlink-sim",
  "getrandom",
  "rand_chacha",
