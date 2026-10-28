@@ -35,7 +35,8 @@ const USAGE: &str = "usage:
                    (through a store-and-forward relay; peers need not be
                    online at the same time; MTU defaults to 48)
 
-In chat, type a line to send it. Commands: /status, /nudge, /accept, /quit.
+In chat, type a line to send it. Commands: /status, /nudge, /accept,
+/add KEY@HOST:PORT (or /add KEY through a relay), /quit.
 Without --peer, wait for a contact request: compare its fingerprint with the
 sender out of band, then /accept it.";
 
@@ -205,6 +206,21 @@ fn chat(dir: &str, opts: &[String]) -> Result<(), String> {
                 "/quit" => Command::Quit,
                 "/status" => Command::Status,
                 "/nudge" => Command::Nudge,
+                l if l.starts_with("/add ") => {
+                    let arg = l["/add ".len()..].trim();
+                    let (key, addr) = match arg.split_once('@') {
+                        Some((k, a)) => (k, resolve(a).ok()),
+                        // Through a relay, no address is needed.
+                        None => (arg, Some(SocketAddr::from(([0, 0, 0, 0], 0)))),
+                    };
+                    match (parse_public_key(key), addr) {
+                        (Some(key), Some(addr)) => Command::AddPeer { key, addr },
+                        _ => {
+                            println!("   usage: /add KEY@HOST:PORT (or /add KEY with --relay)");
+                            continue;
+                        }
+                    }
+                }
                 "/accept" => match *pending.lock().unwrap() {
                     Some(key) => Command::Accept { key },
                     None => {
@@ -270,6 +286,17 @@ fn chat(dir: &str, opts: &[String]) -> Result<(), String> {
                 format!("   accepted {}", format_fingerprint(&key.fingerprint()))
             }
             HostEvent::AcceptFailed(e) => format!("   not accepted: {e}"),
+            HostEvent::PeerAdded { key, conversation } => {
+                let mut c = conv.lock().unwrap();
+                if c.is_none() {
+                    *c = Some(conversation);
+                }
+                format!("   added {}", format_fingerprint(&key.fingerprint()))
+            }
+            HostEvent::PeerFailed { key, error } => format!(
+                "   could not add {}: {error}",
+                format_fingerprint(&key.fingerprint())
+            ),
             HostEvent::Engine(Event::MessageTransmitted { id, .. }) => match ours.get(&id) {
                 Some((seq, t)) => format!("   sent     #{seq} after {}", ago(*t)),
                 None => continue,
@@ -331,6 +358,8 @@ fn chat(dir: &str, opts: &[String]) -> Result<(), String> {
                 }
                 v
             }
+            // Events newer than this CLI.
+            _ => continue,
         };
         let _ = writeln!(o, "{line}");
     }

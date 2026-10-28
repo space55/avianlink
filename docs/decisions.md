@@ -972,3 +972,25 @@ its sender.
   fsyncs, every upload separately.
 - **The C ABI** exposes none of this yet (`ffi.md` §5).
 - **Forged replies** can cause delay, not loss (`relay.md` §5).
+
+## D-047: Adding peers to a running `UdpHost` (desktop AR-012)
+
+The desktop app adds contacts from a dialog while its host loop runs, and
+often speaks first, for example to a gateway whose key and address it was
+given out of band. `run` consumes the host, so `add_peer` was unreachable
+once the loop started.
+
+- **`Command::AddPeer { key, addr }`,** answered by
+  `HostEvent::PeerAdded { key, conversation }` or
+  `HostEvent::PeerFailed { key, error }`. It wraps the existing,
+  idempotent `add_peer`, so a known key just gets its address updated. The
+  answers carry `key`, so the UI can match them without request IDs, as
+  `Queued` carries `to`.
+- **`HostEvent` is now `#[non_exhaustive]`.** The new variants break every
+  exhaustive `match` once; this makes later additions not break hosts.
+- **Rejected,** as the request itself argues: `run(&mut self)`, which
+  would need a mutex in every packet's path, and a second control handle.
+- **The CLI gains `/add KEY@HOST:PORT`** (`/add KEY` through a relay).
+- **`RemovePeer`** was withdrawn by the app, because remove-then-re-add
+  reused nonces. D-046 has since made that safe with tombstones, so it can
+  be added if the app wants it.

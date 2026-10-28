@@ -83,6 +83,15 @@ pub enum Command {
         /// The requesting key.
         key: PublicKey,
     },
+    /// Add `key` as a contact reachable at `addr` (for example scanned
+    /// from a QR code), or update the address of one already known.
+    /// Answered by [`HostEvent::PeerAdded`] or [`HostEvent::PeerFailed`].
+    AddPeer {
+        /// The contact's key.
+        key: PublicKey,
+        /// Where to send to it (ignored through a relay).
+        addr: SocketAddr,
+    },
     /// Connectivity may have changed: probe unreachable contacts now.
     Nudge,
     /// Ask for a [`StatusReport`].
@@ -91,8 +100,10 @@ pub enum Command {
     Quit,
 }
 
-/// What the host reports to the UI.
+/// What the host reports to the UI. Non-exhaustive: match with a `_` arm,
+/// so new events don't break hosts.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum HostEvent {
     /// An engine event.
     Engine(Event),
@@ -114,6 +125,20 @@ pub enum HostEvent {
     },
     /// An `Accept` failed.
     AcceptFailed(Error),
+    /// Answer to [`Command::AddPeer`].
+    PeerAdded {
+        /// The key added (or whose address was updated).
+        key: PublicKey,
+        /// Its conversation.
+        conversation: ConversationId,
+    },
+    /// [`Command::AddPeer`] failed; nothing changed.
+    PeerFailed {
+        /// The key in the request.
+        key: PublicKey,
+        /// Why.
+        error: Error,
+    },
     /// Answer to [`Command::Status`].
     Status(Box<StatusReport>),
     /// Through a relay: everything owed (messages, ACKs, Hellos) is stored
@@ -337,6 +362,10 @@ impl UdpHost {
             Command::Accept { key } => match self.accept(key) {
                 Ok(conversation) => HostEvent::Accepted { key, conversation },
                 Err(e) => HostEvent::AcceptFailed(e),
+            },
+            Command::AddPeer { key, addr } => match self.add_peer(key, addr) {
+                Ok(conversation) => HostEvent::PeerAdded { key, conversation },
+                Err(error) => HostEvent::PeerFailed { key, error },
             },
             Command::Nudge => {
                 self.engine.nudge(now());

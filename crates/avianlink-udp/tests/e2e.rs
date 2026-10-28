@@ -268,3 +268,81 @@ fn settled_after(evs: &[HostEvent], f: fn(&Event) -> bool) -> bool {
     };
     evs[i..].iter().any(|e| matches!(e, HostEvent::Settled))
 }
+
+/// AR-012: contacts added to hosts that are already running, at an
+/// address, with no Hello received first.
+#[test]
+fn peers_added_while_the_hosts_run() {
+    let (da, db) = (dir("addpeer-a"), dir("addpeer-b"));
+    let (ida, idb) = (init_node(&da).unwrap(), init_node(&db).unwrap());
+    let (ka, kb) = (ida.public_key(), idb.public_key());
+    let cfg = || HostConfig {
+        bind: localhost(),
+        link: Scenario::named("clean", 0).unwrap().link.engine_link(),
+        engine: Config::default(),
+        relay: None,
+    };
+    let a = UdpHost::open(&da, ida, cfg()).unwrap();
+    let b = UdpHost::open(&db, idb, cfg()).unwrap();
+    let (aa, ba) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+    let (ca, ra) = mpsc::channel();
+    let (ea, a_events) = mpsc::channel();
+    let (cb, rb) = mpsc::channel();
+    let (eb, b_events) = mpsc::channel();
+    let ta = std::thread::spawn(move || a.run(ra, ea).unwrap());
+    let tb = std::thread::spawn(move || b.run(rb, eb).unwrap());
+
+    let wait_for = |rx: &mpsc::Receiver<HostEvent>, f: &dyn Fn(&HostEvent) -> bool| {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            if let Ok(ev) = rx.recv_timeout(Duration::from_millis(50)) {
+                if f(&ev) {
+                    return Some(ev);
+                }
+            }
+        }
+        None
+    };
+    // Adding our own key fails, and says which key it was about.
+    ca.send(Command::AddPeer { key: ka, addr: ba }).unwrap();
+    let failed = wait_for(&a_events, &|e| matches!(e, HostEvent::PeerFailed { .. }));
+    assert!(matches!(failed, Some(HostEvent::PeerFailed { key, .. }) if key == ka));
+
+    ca.send(Command::AddPeer { key: kb, addr: ba }).unwrap();
+    let Some(HostEvent::PeerAdded {
+        key,
+        conversation: ab,
+    }) = wait_for(&a_events, &|e| matches!(e, HostEvent::PeerAdded { .. }))
+    else {
+        panic!("no PeerAdded");
+    };
+    assert_eq!(key, kb);
+    // Adding again only updates the address: same conversation.
+    ca.send(Command::AddPeer { key: kb, addr: ba }).unwrap();
+    let again = wait_for(&a_events, &|e| matches!(e, HostEvent::PeerAdded { .. }));
+    assert!(matches!(again, Some(HostEvent::PeerAdded { conversation, .. }) if conversation == ab));
+
+    // A speaks first, to a peer that has never written to it.
+    cb.send(Command::AddPeer { key: ka, addr: aa }).unwrap();
+    ca.send(Command::Send {
+        to: ab,
+        text: "added at runtime".into(),
+    })
+    .unwrap();
+    let got = wait_for(
+        &b_events,
+        &|e| matches!(e, HostEvent::Engine(Event::MessageReceived(m)) if m.text == "added at runtime"),
+    );
+    assert!(got.is_some(), "B received A's message");
+    let delivered = wait_for(&a_events, &|e| {
+        matches!(e, HostEvent::Engine(Event::MessageDelivered { .. }))
+    });
+    assert!(delivered.is_some(), "A saw B's ACK");
+
+    ca.send(Command::Quit).unwrap();
+    cb.send(Command::Quit).unwrap();
+    ta.join().unwrap();
+    tb.join().unwrap();
+    let _ = std::fs::remove_dir_all(&da);
+    let _ = std::fs::remove_dir_all(&db);
+}

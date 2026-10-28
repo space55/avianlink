@@ -60,7 +60,14 @@ One thread runs the loop:
      Its source is kept as a *candidate* address (at most 64), used only if
      the request is accepted (`Command::Accept`). Hellos can be replayed,
      so this never moves an existing contact's address.
-3. Commands from the UI (send, accept, nudge, status, quit) are applied.
+3. Commands from the UI are applied:
+   - send;
+   - add a peer at an address, or update a known peer's address
+     (`AddPeer`, answered by `PeerAdded` or `PeerFailed`);
+   - accept a contact request;
+   - nudge, status and quit.
+
+   Contacts can be added at any time while the loop runs (AR-012).
 4. Pump: drain `poll_transmit`, sending each packet to its contact's
    address, then drain `poll_event` to the UI.
 
