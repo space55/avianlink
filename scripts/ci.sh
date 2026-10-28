@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 EMBEDDED_TARGETS=(thumbv7em-none-eabihf aarch64-apple-ios)
 # The library's crates, named explicitly so that local experiments added to
 # the workspace don't join the gate.
-LIB_PKGS=(-p avianlink-core -p avianlink-sim -p avianlink-udp -p avianlink-cli -p avianlink-ffi)
+LIB_PKGS=(-p avianlink-core -p avianlink-sim -p avianlink-udp -p avianlink-cli -p avianlink-ffi -p avianlink-relay)
 
 step() { printf '\n==> %s\n' "$*"; }
 

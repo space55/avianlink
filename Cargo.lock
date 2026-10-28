@@ -53,6 +53,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "avianlink-relay"
+version = "0.0.0"
+dependencies = [
+ "avianlink-core",
+ "avianlink-udp",
+]
+
+[[package]]
 name = "avianlink-sim"
 version = "0.0.0"
 dependencies = [

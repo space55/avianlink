@@ -7,6 +7,7 @@ members = [
     "crates/avianlink-udp",
     "crates/avianlink-cli",
     "crates/avianlink-ffi",
+    "crates/avianlink-relay",
 ]
 
 [workspace.package]
@@ -20,6 +21,7 @@ license = "MIT"
 avianlink-core = { path = "crates/avianlink-core" }
 avianlink-sim = { path = "crates/avianlink-sim" }
 avianlink-udp = { path = "crates/avianlink-udp" }
+avianlink-relay = { path = "crates/avianlink-relay" }
 rand_core = { version = "0.10.1", default-features = false }
 rand_chacha = { version = "0.10.0", default-features = false }
 sha2 = { version = "0.11.1", default-features = false }
