@@ -56,4 +56,7 @@ if [ "$(uname)" = Darwin ]; then
     cargo build -p avianlink-ffi --target aarch64-apple-ios --locked
 fi
 
+step "Wireshark dissector (skipped without tshark)"
+scripts/wireshark-check.sh
+
 step "ok"

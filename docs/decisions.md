@@ -972,6 +972,9 @@ its sender.
   fsyncs, every upload separately.
 - **The C ABI** exposes none of this yet (`ffi.md` §5).
 - **Forged replies** can cause delay, not loss (`relay.md` §5).
+- **A wasted fetch per session:** the client reads the previous epoch first,
+  even when it was never registered (`BAD_PROOF`; found with the
+  dissector, D-049).
 
 ## D-047: Adding peers to a running `UdpHost` (desktop AR-012)
 
@@ -1015,3 +1018,25 @@ identity.
 - **Rejected:** `UdpHost::create(dir, identity, config)`. It would also work,
   but couples creation with binding a socket; the app asked for the smaller
   change.
+
+## D-049: A Wireshark dissector in Lua
+
+- **Lua, not C.** Wireshark loads a Lua dissector from a plugins folder or
+  with `-X lua_script:`, without compiling anything.
+- **SHA-256 in pure Lua,** because Wireshark's Lua API has no hashing. It
+  verifies relay checksums, shows Hello senders' fingerprints, and computes
+  each stored packet's receipt hash, so one filter follows a packet through
+  upload, receipt, delivery and page. The fingerprints are checked against
+  the library's in `scripts/wireshark-check.sh`.
+- **Recognised by content.** Hellos (exact length) and relay messages
+  (verified checksum) are recognised anywhere. Data packets only in
+  conversations already identified, or on configured ports: a single
+  `0x01` byte is too weak a signal to claim arbitrary UDP.
+- **No decryption.** It would need the pair keys and an AEAD
+  implementation in Lua. Debugging the contents of frames is what the
+  simulator and tests are for.
+- **Observation from the first capture:** each relay session's first FETCH
+  is for the previous epoch's mailbox, which no one registered, and gets
+  `BAD_PROOF`. It is harmless, since the client treats it as empty, but it
+  costs a proof and a round trip per contact per session, and inflates the
+  relay's bad-proof count. Added to D-045's open items.

@@ -14,6 +14,7 @@
 | `udp-impair` (`avianlink-sim`) | Userspace impairment proxy. Applies a simulator profile to real UDP traffic between two hosts, for testing without netem. |
 | `netem-gen` (`avianlink-sim`) | Generates `scripts/netem/*.sh` from the simulator profiles, so the two can't drift. |
 | `avianlink-relay` (`avianlink-udp`) | The identity-less store-and-forward relay on UDP (`relay.md` §7). |
+| `tools/wireshark/avianlink.lua` | Wireshark/`tshark` dissector for every packet kind (see its README). |
 | `UdpHost` with `HostConfig::relay` | Everything goes through a relay; peers need not be online together (`relay.md`). |
 
 ## 2. `FileStorage`

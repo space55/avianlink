@@ -211,6 +211,9 @@ main open item.
 
 Other directories:
 - [`docs/`](docs) holds the specifications and the decision log.
+- [`tools/wireshark/`](tools/wireshark) holds a Wireshark dissector:
+  packet headers, Hellos with sender fingerprints, the full relay protocol,
+  and receipt hashes that tie each upload to the relay's receipt.
 - [`scripts/`](scripts) holds CI, fuzzing, netem profiles and the
   XCFramework and Swift builds.
 - [`fuzz/`](fuzz) holds the `cargo-fuzz` targets.
