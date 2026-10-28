@@ -736,3 +736,198 @@ fn open_is_explicit_about_creating() {
     );
     assert_eq!(avl_last_engine_error(), AvlEngineError::StorageNotEmpty);
 }
+
+// ---------------------------------------------------------------------
+// Relays through the C ABI (D-045)
+
+/// A node whose only link is a relay link.
+fn relay_node(seed: u8) -> Node {
+    let secret = [seed; 32];
+    let mut public = [0u8; 32];
+    // SAFETY: sized buffers.
+    unsafe { avl_identity_public_key(secret.as_ptr(), public.as_mut_ptr()) };
+    let mut storage = null_mut();
+    let mut engine = null_mut();
+    let link = AvlLinkConfig {
+        mtu: 48,
+        ..link_config()
+    };
+    // SAFETY: valid pointers; storage is consumed.
+    unsafe {
+        avl_storage_memory_new(&mut storage);
+        assert_eq!(
+            avl_engine_open(secret.as_ptr(), storage, null(), true, &mut engine),
+            AvlStatus::Ok
+        );
+        assert_eq!(avl_engine_add_relay_link(engine, 0, &link), AvlStatus::Ok);
+    }
+    Node {
+        engine,
+        public,
+        secret,
+    }
+}
+
+/// One online session of `node` (relay address `addr`), until it is safe
+/// to disconnect. Returns the event kinds seen.
+fn relay_session(
+    node: &Node,
+    addr: u8,
+    relay: &mut avianlink_relay::Relay<MemoryStorage, u8>,
+    now: &mut u64,
+) -> Vec<AvlEventKind> {
+    let mut kinds = Vec::new();
+    let mut buf = [0u8; 512];
+    // SAFETY: live engine with a relay link; sized buffers throughout.
+    unsafe {
+        assert_eq!(avl_relay_connect(node.engine, *now), AvlStatus::Ok);
+        for step in 0..200 {
+            avl_engine_handle_timeout(node.engine, *now);
+            let mut len = 0usize;
+            while avl_relay_poll_transmit(node.engine, *now, buf.as_mut_ptr(), buf.len(), &mut len)
+                == AvlStatus::Ok
+            {
+                relay.handle(addr, &buf[..len], Timestamp::from_millis(*now));
+            }
+            while let Some((to, bytes)) = relay.poll_transmit() {
+                assert_eq!(to, addr);
+                avl_relay_handle(
+                    node.engine,
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    *now,
+                    null_mut(),
+                    null_mut(),
+                );
+            }
+            loop {
+                let mut ev =
+                    AvlEvent::blank(AvlEventKind::MessageDelivered, ConversationId([0; 16]));
+                if avl_engine_poll_event(node.engine, &mut ev) != AvlStatus::Ok {
+                    break;
+                }
+                kinds.push(ev.kind);
+            }
+            *now += 250;
+            if step > 4 && avl_relay_safe_to_disconnect(node.engine) {
+                break;
+            }
+        }
+        assert!(
+            avl_relay_safe_to_disconnect(node.engine),
+            "settled and caught up"
+        );
+        assert_eq!(avl_relay_disconnect(node.engine), AvlStatus::Ok);
+    }
+    kinds
+}
+
+#[test]
+fn relay_turns_through_the_c_abi() {
+    let mut relay = avianlink_relay::Relay::open(Default::default(), MemoryStorage::new()).unwrap();
+    let a = relay_node(21);
+    let b = relay_node(22);
+    let ab = add_contact(&a, &b.public);
+    add_contact(&b, &a.public);
+    // 2026-10-28, for realistic mailbox epochs.
+    let mut now = 1_793_100_000_000u64;
+    send(&a, &ab, "through the relay, from C", now);
+    let a1 = relay_session(&a, 1, &mut relay, &mut now);
+    assert!(a1.contains(&AvlEventKind::MessageStored), "{a1:?}");
+    now += 3_600_000;
+    let b1 = relay_session(&b, 2, &mut relay, &mut now);
+    assert!(b1.contains(&AvlEventKind::MessageReceived), "{b1:?}");
+    now += 3_600_000;
+    let a2 = relay_session(&a, 1, &mut relay, &mut now);
+    assert!(a2.contains(&AvlEventKind::MessageDelivered), "{a2:?}");
+    // SAFETY: live engine.
+    assert_eq!(unsafe { avl_engine_outbox_len(a.engine) }, 0);
+}
+
+#[test]
+fn relay_packets_never_come_out_of_the_direct_queue() {
+    let a = relay_node(23);
+    let b = relay_node(24);
+    let ab = add_contact(&a, &b.public);
+    send(&a, &ab, "relay only", 1_793_100_000_000);
+    let (mut link, mut len) = (0u16, 0usize);
+    let mut buf = [0u8; 512];
+    // SAFETY: live engine; sized buffers.
+    unsafe {
+        avl_relay_connect(a.engine, 1_793_100_000_000);
+        assert_eq!(
+            avl_engine_poll_transmit(
+                a.engine,
+                1_793_100_000_000,
+                &mut link,
+                null_mut(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut len
+            ),
+            AvlStatus::None
+        );
+        assert_eq!(
+            avl_relay_poll_transmit(
+                a.engine,
+                1_793_100_000_000,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut len
+            ),
+            AvlStatus::Ok
+        );
+        // A too-small buffer keeps the datagram.
+        let mut tiny = [0u8; 4];
+        let st = avl_relay_poll_transmit(
+            a.engine,
+            1_793_100_000_000,
+            tiny.as_mut_ptr(),
+            tiny.len(),
+            &mut len,
+        );
+        assert_eq!(st, AvlStatus::ErrBufferTooSmall);
+        assert!(len > tiny.len());
+        assert_eq!(
+            avl_relay_poll_transmit(
+                a.engine,
+                1_793_100_000_000,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut len
+            ),
+            AvlStatus::Ok
+        );
+        let mut t = 0;
+        assert!(
+            avl_engine_next_timeout(a.engine, &mut t),
+            "the relay client has timers"
+        );
+    }
+}
+
+#[test]
+fn relay_calls_need_a_relay_link() {
+    let a = memory_node(); // direct link only
+    let mut len = 0usize;
+    let mut buf = [0u8; 64];
+    let link = link_config();
+    // SAFETY: live engines; sized buffers.
+    unsafe {
+        assert_eq!(
+            avl_relay_connect(a.engine, 0),
+            AvlStatus::ErrInvalidArgument
+        );
+        assert_eq!(
+            avl_relay_poll_transmit(a.engine, 0, buf.as_mut_ptr(), buf.len(), &mut len),
+            AvlStatus::ErrInvalidArgument
+        );
+        assert!(!avl_relay_safe_to_disconnect(a.engine));
+        let r = relay_node(25);
+        assert_eq!(
+            avl_engine_add_relay_link(r.engine, 9, &link),
+            AvlStatus::ErrInvalidArgument,
+            "one relay per engine"
+        );
+    }
+}

@@ -103,7 +103,47 @@ typedef struct AvlStorageCallbacks {
 } AvlStorageCallbacks;
 ```
 
-## 4. Apple packaging
+## 4. Relays
+
+A store-and-forward relay (`relay.md`) lets peers that are never online
+at the same time exchange messages. The C ABI includes the whole client
+side of it: the engine handle carries a relay client, so a C or Swift host
+only moves datagrams and keeps one timer.
+
+| Call | Use |
+|---|---|
+| `avl_engine_add_relay_link(e, link_id, &link)` | Register the relay link (one per engine) and start the client. MTU 48 unless every recipient has more. |
+| `avl_relay_connect(e, now)` | The device came online, or the network came back: register mailboxes, open upload sessions, fetch what's waiting. |
+| `avl_relay_poll_transmit(e, now, buf, cap, &len)` | Datagrams to send to the relay's address. Call until `AVL_STATUS_NONE`. |
+| `avl_relay_handle(e, bytes, len, now, conv_out, key_out)` | Every datagram from the relay. Results as `avl_engine_handle_packet`. |
+| `avl_relay_safe_to_disconnect(e)` | True once everything owed is stored at the relay and everything waiting has been read (`avl_relay_settled` and `avl_relay_caught_up` separately). |
+| `avl_relay_disconnect(e)` | Going offline. Nothing is lost; unstored or undelivered messages stay queued. |
+
+- **Timers are shared.** `avl_engine_next_timeout` and
+  `avl_engine_handle_timeout` also cover the relay client.
+- **Queues are separate.** `avl_engine_poll_transmit` returns only packets
+  for direct links; relay-link packets come from `avl_relay_poll_transmit`.
+- **New event:** `AVL_EVENT_KIND_MESSAGE_STORED` means a message is held by
+  the relay, so it's safe to leave. `AVL_EVENT_KIND_MESSAGE_DELIVERED` still
+  means only the recipient's acknowledgement.
+
+A session loop:
+
+```c
+avl_relay_connect(e, now());
+while (!avl_relay_safe_to_disconnect(e)) {
+    while (avl_relay_poll_transmit(e, now(), buf, sizeof buf, &len) == AVL_STATUS_OK)
+        send_to(relay_addr, buf, len);
+    if (receive_from(relay_addr, buf, sizeof buf, &len, timeout_until_next(e)))
+        avl_relay_handle(e, buf, len, now(), NULL, NULL);
+    else
+        avl_engine_handle_timeout(e, now());
+    /* drain avl_engine_poll_event(...) */
+}
+avl_relay_disconnect(e);
+```
+
+## 5. Apple packaging
 
 `scripts/build-xcframework.sh` builds `Avianlink.xcframework` with these
 slices:
@@ -131,11 +171,12 @@ the checked-in header matches `cbindgen`'s output.
 The static libraries are large (17 MB per architecture) because they carry
 all of Rust's `std`; the app's linker keeps only what is used.
 
-## 5. Not in v1
+## 6. Not in v1
 
 - Swift-friendly wrappers (classes, `Data`, `async`), which belong in a
   Swift package on top of this.
 - Kotlin/JNI.
 - Exposing the UDP host. Mobile hosts own their transports.
-- Relays (D-045): `add_relay_link`, `handle_receipt`, the mailbox calls,
-  `relay_settled`, and `RelayClient` itself are Rust-only for now.
+- Running a relay server (`avianlink-relay`): apps are clients.
+- The engine's raw relay calls (`mailbox_*`, `handle_receipt`,
+  `set_link_retention`), which the built-in client already drives.

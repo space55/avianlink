@@ -1040,3 +1040,18 @@ identity.
   `BAD_PROOF`. It is harmless, since the client treats it as empty, but it
   costs a proof and a round trip per contact per session, and inflates the
   relay's bad-proof count. Added to D-045's open items.
+
+## D-050: Relays in the C ABI
+
+- **The client lives inside the engine handle.** `avl_engine_add_relay_link`
+  creates a `RelayClient` with the link. The client needs `&mut Engine` on
+  every call, and a separate handle would make C juggle two objects that
+  must be used together.
+- **One timer.** `avl_engine_next_timeout` and `handle_timeout` include
+  the client's timers.
+- **Separate send queues.** Relay-link packets go to the client, and the
+  engine's other packets wait in a queue for `avl_engine_poll_transmit`.
+  So a host with direct links and a relay link drains each queue to its own
+  destination.
+- **Not exposed:** the relay server, and the raw mailbox and receipt calls
+  (`ffi.md` §6).

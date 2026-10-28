@@ -85,6 +85,9 @@ typedef enum AvlEventKind {
   // A key we don't know asks to be added: `public_key`, `link`,
   // `received_at_ms`. Compare fingerprints, then `avl_engine_add_contact`.
   AVL_EVENT_KIND_CONTACT_REQUEST = 6,
+  // Every fragment of one of our messages is stored at the relay:
+  // `conversation`, `id`. Not delivery (that is `MESSAGE_DELIVERED`).
+  AVL_EVENT_KIND_MESSAGE_STORED = 7,
 } AvlEventKind;
 
 // FEC scheme (mirrors `avianlink_core::FecMode`).
@@ -449,6 +452,83 @@ enum AvlStatus avl_engine_poll_transmit(struct AvlEngine *engine,
 // # Safety
 // `engine` null or live; `out` writable.
 bool avl_engine_next_timeout(struct AvlEngine *engine, uint64_t *out);
+
+// Registers a link to a store-and-forward relay and starts the relay
+// protocol on it (`docs/relay.md` §6–7). One relay per engine. The host
+// sends what `avl_relay_poll_transmit` returns to the relay's address and
+// feeds what arrives from it to `avl_relay_handle`. Its MTU should suit
+// the smallest link any recipient fetches over (48 when unsure).
+//
+// # Safety
+// `engine` live; `link` readable.
+enum AvlStatus avl_engine_add_relay_link(struct AvlEngine *engine,
+                                         uint16_t link_id,
+                                         const struct AvlLinkConfig *link);
+
+// The host came online (or the network came back): register mailboxes,
+// open upload sessions and fetch everything waiting at the relay.
+//
+// # Safety
+// `engine` live, with a relay link.
+enum AvlStatus avl_relay_connect(struct AvlEngine *engine, uint64_t now_ms);
+
+// The host is going offline. Nothing is lost: what isn't stored at the
+// relay or delivered stays queued. Check `avl_relay_safe_to_disconnect`
+// first.
+//
+// # Safety
+// `engine` live, with a relay link.
+enum AvlStatus avl_relay_disconnect(struct AvlEngine *engine);
+
+// Feeds a datagram that arrived from the relay. Relay messages are handled
+// inside; packets and Hellos it delivers go to the engine, with the same
+// results as `avl_engine_handle_packet` (`AVL_STATUS_OK` with the
+// conversation, `AVL_STATUS_HELLO` with the key, or `AVL_STATUS_NONE`).
+//
+// # Safety
+// `engine` live, with a relay link; `bytes` `len` readable bytes;
+// `conversation_out` null or 16 writable bytes; `public_key_out` null or
+// 32 writable bytes.
+enum AvlStatus avl_relay_handle(struct AvlEngine *engine,
+                                const uint8_t *bytes,
+                                size_t len,
+                                uint64_t now_ms,
+                                uint8_t *conversation_out,
+                                uint8_t *public_key_out);
+
+// Writes the next datagram to send to the relay into `buf`. Like
+// `avl_engine_poll_transmit`: `AVL_STATUS_NONE` when there is nothing,
+// `AVL_STATUS_ERR_BUFFER_TOO_SMALL` with the size needed (the datagram is
+// kept). Call until `AVL_STATUS_NONE`.
+//
+// # Safety
+// `engine` live, with a relay link; `buf` `cap` writable bytes; `len_out`
+// writable.
+enum AvlStatus avl_relay_poll_transmit(struct AvlEngine *engine,
+                                       uint64_t now_ms,
+                                       uint8_t *buf,
+                                       size_t cap,
+                                       size_t *len_out);
+
+// Everything owed to relay contacts (messages, ACKs, Hellos) is stored at
+// the relay.
+//
+// # Safety
+// `engine` null or live.
+bool avl_relay_settled(struct AvlEngine *engine);
+
+// Everything waiting at the relay has been read.
+//
+// # Safety
+// `engine` null or live.
+bool avl_relay_caught_up(struct AvlEngine *engine);
+
+// Settled and caught up: safe to go offline ("come online, collect,
+// reply, leave").
+//
+// # Safety
+// `engine` null or live.
+bool avl_relay_safe_to_disconnect(struct AvlEngine *engine);
 
 // Writes the next event. `AVL_STATUS_NONE` when there is none.
 //

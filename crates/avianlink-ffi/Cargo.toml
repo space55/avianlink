@@ -13,6 +13,7 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 avianlink-core = { workspace = true, features = ["std"] }
 avianlink-udp = { workspace = true }
+avianlink-relay = { workspace = true }
 rand_chacha = { workspace = true }
 
 [lints.rust]

@@ -11,8 +11,10 @@ use avianlink_core::{
     HelloMode, Identity, LinkBudget, LinkConfig, LinkId, MemoryStorage, PublicKey, Received,
     Storage, Timestamp, Transmit,
 };
+use avianlink_relay::RelayClient;
 use avianlink_udp::{os_rng, FileStorage};
 use rand_chacha::ChaCha20Rng;
+use std::collections::VecDeque;
 
 /// Result of every fallible call.
 #[repr(C)]
@@ -815,6 +817,29 @@ pub struct AvlEngine {
     pending_tx: Option<Transmit>,
     /// Backing store for the last event's text (NUL-terminated).
     event_text: Vec<u8>,
+    /// The relay protocol, once a relay link is added (`docs/relay.md`).
+    relay: Option<RelayClient>,
+    /// Direct-link packets drawn from the engine while serving the relay.
+    direct_tx: VecDeque<Transmit>,
+    /// A relay datagram that did not fit the caller's buffer.
+    pending_relay: Option<Vec<u8>>,
+}
+
+impl AvlEngine {
+    /// Moves the engine's packets to where they go: relay-link packets to
+    /// the relay client, the rest to `direct_tx`.
+    fn pump(&mut self, now: Timestamp) {
+        let Some(client) = self.relay.as_mut() else {
+            return;
+        };
+        while let Some(tx) = self.engine.poll_transmit(now) {
+            if tx.link == client.link() {
+                client.upload(&mut self.engine, tx, now);
+            } else {
+                self.direct_tx.push_back(tx);
+            }
+        }
+    }
 }
 
 /// Opens an engine for the identity with 32-byte `secret`, taking ownership
@@ -867,6 +892,9 @@ pub unsafe extern "C" fn avl_engine_open(
                     engine,
                     pending_tx: None,
                     event_text: Vec::new(),
+                    relay: None,
+                    direct_tx: VecDeque::new(),
+                    pending_relay: None,
                 },
                 out,
             ),
@@ -1109,19 +1137,9 @@ pub unsafe extern "C" fn avl_engine_handle_packet(
             // SAFETY: caller guarantees `len` readable bytes.
             unsafe { std::slice::from_raw_parts(bytes, len) }
         };
-        match e.engine.handle_packet(LinkId(link_id), data, ts(now_ms)) {
-            Received::Contact(conv) => {
-                // SAFETY: caller guarantees 16 writable bytes or null.
-                unsafe { copy_out(&conv.0, conversation_out) };
-                AvlStatus::Ok
-            }
-            Received::ContactRequest(key) => {
-                // SAFETY: caller guarantees 32 writable bytes or null.
-                unsafe { copy_out(&key.0, public_key_out) };
-                AvlStatus::Hello
-            }
-            Received::Ignored => AvlStatus::None,
-        }
+        let received = e.engine.handle_packet(LinkId(link_id), data, ts(now_ms));
+        // SAFETY: caller guarantees the output buffers (or null).
+        unsafe { received_status(received, conversation_out, public_key_out) }
     })
 }
 
@@ -1136,6 +1154,9 @@ pub unsafe extern "C" fn avl_engine_handle_timeout(
 ) -> AvlStatus {
     with_engine(engine, |e| {
         e.engine.handle_timeout(ts(now_ms));
+        if let Some(client) = e.relay.as_mut() {
+            client.handle_timeout(&mut e.engine, ts(now_ms));
+        }
         AvlStatus::Ok
     })
 }
@@ -1175,12 +1196,17 @@ pub unsafe extern "C" fn avl_engine_poll_transmit(
         if link_out.is_null() || len_out.is_null() || (buf.is_null() && cap > 0) {
             return AvlStatus::ErrInvalidArgument;
         }
-        let tx = match e.pending_tx.take() {
+        let next = if e.relay.is_some() {
+            // Relay-link packets go to the relay client instead
+            // (`avl_relay_poll_transmit`).
+            e.pump(ts(now_ms));
+            e.direct_tx.pop_front()
+        } else {
+            e.engine.poll_transmit(ts(now_ms))
+        };
+        let tx = match e.pending_tx.take().or(next) {
             Some(tx) => tx,
-            None => match e.engine.poll_transmit(ts(now_ms)) {
-                Some(tx) => tx,
-                None => return AvlStatus::None,
-            },
+            None => return AvlStatus::None,
         };
         let bytes = tx.packet.as_bytes();
         // SAFETY: caller guarantees writable `len_out`.
@@ -1209,7 +1235,12 @@ pub unsafe extern "C" fn avl_engine_poll_transmit(
 pub unsafe extern "C" fn avl_engine_next_timeout(engine: *mut AvlEngine, out: *mut u64) -> bool {
     let mut found = false;
     let _ = with_engine(engine, |e| {
-        if let (Some(t), false) = (e.engine.next_timeout(), out.is_null()) {
+        let relay = e.relay.as_ref().and_then(RelayClient::next_timeout);
+        let next = match (e.engine.next_timeout(), relay) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if let (Some(t), false) = (next, out.is_null()) {
             // SAFETY: caller guarantees a writable `out`.
             unsafe { *out = t.as_millis() };
             found = true;
@@ -1217,6 +1248,222 @@ pub unsafe extern "C" fn avl_engine_next_timeout(engine: *mut AvlEngine, out: *m
         AvlStatus::Ok
     });
     found
+}
+
+// ---------------------------------------------------------------------
+// Relays (`docs/relay.md`, `docs/ffi.md` §4)
+
+/// Registers a link to a store-and-forward relay and starts the relay
+/// protocol on it (`docs/relay.md` §6–7). One relay per engine. The host
+/// sends what `avl_relay_poll_transmit` returns to the relay's address and
+/// feeds what arrives from it to `avl_relay_handle`. Its MTU should suit
+/// the smallest link any recipient fetches over (48 when unsure).
+///
+/// # Safety
+/// `engine` live; `link` readable.
+#[no_mangle]
+pub unsafe extern "C" fn avl_engine_add_relay_link(
+    engine: *mut AvlEngine,
+    link_id: u16,
+    link: *const AvlLinkConfig,
+) -> AvlStatus {
+    with_engine(engine, |e| {
+        if link.is_null() || e.relay.is_some() {
+            return AvlStatus::ErrInvalidArgument;
+        }
+        // SAFETY: caller guarantees a readable struct.
+        let Ok(cfg) = LinkConfig::try_from(unsafe { *link }) else {
+            return engine_err(Error::InvalidLinkConfig);
+        };
+        match e.engine.add_relay_link(LinkId(link_id), cfg) {
+            Ok(()) => {
+                e.relay = Some(RelayClient::new(LinkId(link_id)));
+                AvlStatus::Ok
+            }
+            Err(err) => engine_err(err),
+        }
+    })
+}
+
+/// Runs `f` on an engine that has a relay link.
+fn with_relay(engine: *mut AvlEngine, f: impl FnOnce(&mut AvlEngine) -> AvlStatus) -> AvlStatus {
+    with_engine(engine, |e| {
+        if e.relay.is_none() {
+            return AvlStatus::ErrInvalidArgument;
+        }
+        f(e)
+    })
+}
+
+/// The host came online (or the network came back): register mailboxes,
+/// open upload sessions and fetch everything waiting at the relay.
+///
+/// # Safety
+/// `engine` live, with a relay link.
+#[no_mangle]
+pub unsafe extern "C" fn avl_relay_connect(engine: *mut AvlEngine, now_ms: u64) -> AvlStatus {
+    with_relay(engine, |e| {
+        if let Some(client) = e.relay.as_mut() {
+            client.connect(&mut e.engine, ts(now_ms));
+        }
+        AvlStatus::Ok
+    })
+}
+
+/// The host is going offline. Nothing is lost: what isn't stored at the
+/// relay or delivered stays queued. Check `avl_relay_safe_to_disconnect`
+/// first.
+///
+/// # Safety
+/// `engine` live, with a relay link.
+#[no_mangle]
+pub unsafe extern "C" fn avl_relay_disconnect(engine: *mut AvlEngine) -> AvlStatus {
+    with_relay(engine, |e| {
+        if let Some(client) = e.relay.as_mut() {
+            client.disconnect();
+        }
+        e.pending_relay = None;
+        AvlStatus::Ok
+    })
+}
+
+/// Feeds a datagram that arrived from the relay. Relay messages are handled
+/// inside; packets and Hellos it delivers go to the engine, with the same
+/// results as `avl_engine_handle_packet` (`AVL_STATUS_OK` with the
+/// conversation, `AVL_STATUS_HELLO` with the key, or `AVL_STATUS_NONE`).
+///
+/// # Safety
+/// `engine` live, with a relay link; `bytes` `len` readable bytes;
+/// `conversation_out` null or 16 writable bytes; `public_key_out` null or
+/// 32 writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn avl_relay_handle(
+    engine: *mut AvlEngine,
+    bytes: *const u8,
+    len: usize,
+    now_ms: u64,
+    conversation_out: *mut u8,
+    public_key_out: *mut u8,
+) -> AvlStatus {
+    with_relay(engine, |e| {
+        if bytes.is_null() && len > 0 {
+            return AvlStatus::ErrInvalidArgument;
+        }
+        let data = if len == 0 {
+            &[][..]
+        } else {
+            // SAFETY: caller guarantees `len` readable bytes.
+            unsafe { std::slice::from_raw_parts(bytes, len) }
+        };
+        let Some(client) = e.relay.as_mut() else {
+            return AvlStatus::ErrInvalidArgument;
+        };
+        let received = client.handle(&mut e.engine, data, ts(now_ms));
+        // SAFETY: caller guarantees the output buffers (or null).
+        unsafe { received_status(received, conversation_out, public_key_out) }
+    })
+}
+
+/// Writes the next datagram to send to the relay into `buf`. Like
+/// `avl_engine_poll_transmit`: `AVL_STATUS_NONE` when there is nothing,
+/// `AVL_STATUS_ERR_BUFFER_TOO_SMALL` with the size needed (the datagram is
+/// kept). Call until `AVL_STATUS_NONE`.
+///
+/// # Safety
+/// `engine` live, with a relay link; `buf` `cap` writable bytes; `len_out`
+/// writable.
+#[no_mangle]
+pub unsafe extern "C" fn avl_relay_poll_transmit(
+    engine: *mut AvlEngine,
+    now_ms: u64,
+    buf: *mut u8,
+    cap: usize,
+    len_out: *mut usize,
+) -> AvlStatus {
+    with_relay(engine, |e| {
+        if len_out.is_null() || (buf.is_null() && cap > 0) {
+            return AvlStatus::ErrInvalidArgument;
+        }
+        e.pump(ts(now_ms));
+        let next = e.relay.as_mut().and_then(RelayClient::poll_transmit);
+        let Some(bytes) = e.pending_relay.take().or(next) else {
+            return AvlStatus::None;
+        };
+        // SAFETY: caller guarantees writable `len_out`.
+        unsafe { *len_out = bytes.len() };
+        if bytes.len() > cap {
+            e.pending_relay = Some(bytes);
+            return AvlStatus::ErrBufferTooSmall;
+        }
+        // SAFETY: caller guarantees `cap` ≥ len writable bytes.
+        unsafe { copy_out(&bytes, buf) };
+        AvlStatus::Ok
+    })
+}
+
+/// Everything owed to relay contacts (messages, ACKs, Hellos) is stored at
+/// the relay.
+///
+/// # Safety
+/// `engine` null or live.
+#[no_mangle]
+pub unsafe extern "C" fn avl_relay_settled(engine: *mut AvlEngine) -> bool {
+    let mut v = false;
+    let _ = with_relay(engine, |e| {
+        v = e.engine.relay_settled();
+        AvlStatus::Ok
+    });
+    v
+}
+
+/// Everything waiting at the relay has been read.
+///
+/// # Safety
+/// `engine` null or live.
+#[no_mangle]
+pub unsafe extern "C" fn avl_relay_caught_up(engine: *mut AvlEngine) -> bool {
+    let mut v = false;
+    let _ = with_relay(engine, |e| {
+        v = e.relay.as_ref().is_some_and(RelayClient::caught_up);
+        AvlStatus::Ok
+    });
+    v
+}
+
+/// Settled and caught up: safe to go offline ("come online, collect,
+/// reply, leave").
+///
+/// # Safety
+/// `engine` null or live.
+#[no_mangle]
+pub unsafe extern "C" fn avl_relay_safe_to_disconnect(engine: *mut AvlEngine) -> bool {
+    // SAFETY: forwarded under the same contract.
+    unsafe { avl_relay_settled(engine) && avl_relay_caught_up(engine) }
+}
+
+/// Maps a `Received` to a status and its outputs.
+///
+/// # Safety
+/// `conversation_out` null or 16 writable bytes; `public_key_out` null or
+/// 32 writable bytes.
+unsafe fn received_status(
+    received: Received,
+    conversation_out: *mut u8,
+    public_key_out: *mut u8,
+) -> AvlStatus {
+    match received {
+        Received::Contact(conv) => {
+            // SAFETY: caller guarantees 16 writable bytes or null.
+            unsafe { copy_out(&conv.0, conversation_out) };
+            AvlStatus::Ok
+        }
+        Received::ContactRequest(key) => {
+            // SAFETY: caller guarantees 32 writable bytes or null.
+            unsafe { copy_out(&key.0, public_key_out) };
+            AvlStatus::Hello
+        }
+        Received::Ignored => AvlStatus::None,
+    }
 }
 
 /// Event kinds (`AvlEvent::kind`).
@@ -1238,6 +1485,9 @@ pub enum AvlEventKind {
     /// A key we don't know asks to be added: `public_key`, `link`,
     /// `received_at_ms`. Compare fingerprints, then `avl_engine_add_contact`.
     ContactRequest = 6,
+    /// Every fragment of one of our messages is stored at the relay:
+    /// `conversation`, `id`. Not delivery (that is `MESSAGE_DELIVERED`).
+    MessageStored = 7,
 }
 
 /// An event. `text` is borrowed (see `docs/ffi.md` §2).
@@ -1328,6 +1578,11 @@ pub unsafe extern "C" fn avl_engine_poll_event(
                 }
                 Event::MessageTransmitted { conversation, id } => {
                     let mut v = AvlEvent::blank(AvlEventKind::MessageTransmitted, conversation);
+                    v.id = id.0;
+                    v
+                }
+                Event::MessageStored { conversation, id } => {
+                    let mut v = AvlEvent::blank(AvlEventKind::MessageStored, conversation);
                     v.id = id.0;
                     v
                 }
