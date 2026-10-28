@@ -883,3 +883,49 @@ counter and message sequence numbers at 0 under the same key:
 everything; `Engine::restore` returns a new error;
 `avianlink_udp::load_or_create_identity` is replaced by `load_identity`
 and `init_node`; and `avl_engine_open` takes a new argument.
+
+## D-045: Identity-less relays with hash-chain mailboxes (proposal, after Phase 7)
+
+**Use case** (user): A and B are never online at the same time. A relay is
+the only path, and in a disaster everyone uses one relay at once.
+Specified in `relay.md`.
+
+**User requirements:**
+- relays have no identity;
+- relays are untrusted: delivery is confirmed only by B's end-to-end ACK;
+- traffic for a tag goes only to a client that has proven control of it;
+- colliding tags must not lock anyone out;
+- accepted packets are never dropped;
+- retention is set by the relay, at most 30 days;
+- Hellos are stored as open copies;
+- every message is ≤ 48 bytes.
+
+**Decisions:**
+- **The relay is a link,** with no keys and no pair state. A rebuilt relay
+  costs only buffered packets, which the endpoints resend.
+- **Mailboxes per (tag, anchors), filed by proven upload session.** Hash
+  chains from the pair secret: one-time 16-byte proofs, 4096 per
+  generation, a 64-step window for lost proofs, and REKEY.
+  **Rejected:**
+  - tag-only subscriptions: anyone could read anyone's traffic metadata
+    and copies;
+  - exclusive first-come registration: breaks colliding pairs, and the
+    user wants none refused;
+  - longer tags on every packet: +5 bytes per packet, −28% payload at
+    48 bytes;
+  - Ed25519-signed requests: 64-byte signatures don't fit 48 bytes.
+- **Whichever side first uses the relay registers both directions,** so a
+  tag is pinned before it is on the wire. This closes the
+  trust-on-first-use window, including for introductions.
+- **Receipts** (stored / FULL / NO_SESSION), sent only once the packet is
+  durable. They make hop reliability possible and tell "refused" from
+  "lost". They are never authenticated and never mean delivery.
+- **Space:** no eviction before expiry, except below a proved fetch
+  cursor, which shows the recipient has the packets. Otherwise refuse when
+  full, with a per-mailbox share.
+- **Engine store-and-forward mode** (`relay.md` §6):
+  - hop retransmission until receipted;
+  - end-to-end resend at half the advertised retention;
+  - no probes, backoff or FEC;
+  - hop-reliable ACKs;
+  - a transient `MessageStored` event.
