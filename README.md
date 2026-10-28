@@ -231,9 +231,19 @@ alias avianlink=target/release/avianlink
 avianlink init /tmp/alice      # prints alice's address and fingerprint
 avianlink init /tmp/bob
 
+# Through the default relay (relay.avianlink.dev:41000): the two need not
+# be online at the same time.
+avianlink chat /tmp/alice --peer <BOB_ADDRESS>
+avianlink chat /tmp/bob   --peer <ALICE_ADDRESS>
+
+# Or directly, peer to peer:
 avianlink chat /tmp/alice --bind 127.0.0.1:7001 --peer <BOB_ADDRESS>@127.0.0.1:7002
 avianlink chat /tmp/bob   --bind 127.0.0.1:7002 --peer <ALICE_ADDRESS>@127.0.0.1:7001
 ```
+
+`--bind` is optional and defaults to a random UDP port. `--relay HOST:PORT`
+picks another relay, including your own (`avianlink-relay`, port 41000 by
+default). A peer given with an address, or `--direct`, means no relay.
 
 Every line you type is a message. `/status` shows RTT, measured loss and
 reachability, and `/nudge` probes immediately. Leave out `--peer` on one

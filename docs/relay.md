@@ -287,14 +287,16 @@ over it follows these rules instead of `reliability.md` §3:
   socket with `FileStorage`:
 
   ```
-  avianlink-relay --bind 0.0.0.0:7400 --dir /var/lib/avianlink-relay \
+  avianlink-relay --dir /var/lib/avianlink-relay [--bind 0.0.0.0:41000] \
                   [--retention-days 7] [--mailbox-quota-kib 1024] [--total-quota-mib 1024]
   ```
 - **`UdpHost`** with `HostConfig::relay` sends and receives everything
   through the relay, and reports `HostEvent::Settled` ("safe to go
   offline").
-- **The CLI:** `avianlink chat DIR --bind HOST:PORT --relay HOST:PORT
-  [--peer KEY]`.
+- **The CLI:** `avianlink chat DIR [--peer KEY]` uses the default relay,
+  `relay.avianlink.dev:41000`; `--relay HOST:PORT` picks another, and
+  `--bind` defaults to a random port. Its DNS record must be DNS-only:
+  proxies such as Cloudflare's don't forward arbitrary UDP.
 
 ## 8. Results
 

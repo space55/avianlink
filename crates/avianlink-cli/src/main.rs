@@ -4,9 +4,10 @@
 //! ```text
 //! avianlink init   DIR
 //! avianlink whoami DIR
-//! avianlink chat   DIR --bind HOST:PORT [--peer KEY@HOST:PORT]
+//! avianlink chat   DIR [--peer KEY] [--relay HOST:PORT] [--bind HOST:PORT]
+//! avianlink chat   DIR --peer KEY@HOST:PORT [--bind HOST:PORT]
 //!                  [--profile NAME | --mtu N [--rate BYTES_PER_S]]
-//! avianlink chat   DIR --bind HOST:PORT --relay HOST:PORT [--peer KEY]
+//! avianlink chat   DIR --direct [--bind HOST:PORT] ...
 //! ```
 
 use std::collections::BTreeMap;
@@ -29,16 +30,23 @@ use avianlink_udp::{
 const USAGE: &str = "usage:
   avianlink init   DIR
   avianlink whoami DIR
-  avianlink chat   DIR --bind HOST:PORT [--peer KEY@HOST:PORT]
+  avianlink chat   DIR [--peer KEY] [--relay HOST:PORT] [--bind HOST:PORT]
+  avianlink chat   DIR --peer KEY@HOST:PORT [--bind HOST:PORT]
                    [--profile NAME | --mtu N [--rate BYTES_PER_S]]
-  avianlink chat   DIR --bind HOST:PORT --relay HOST:PORT [--peer KEY]
-                   (through a store-and-forward relay; peers need not be
-                   online at the same time; MTU defaults to 48)
+  avianlink chat   DIR --direct [--bind HOST:PORT] ...
+
+By default, chat goes through the relay at relay.avianlink.dev:41000, so
+peers need not be online at the same time (MTU 48). --peer KEY@HOST:PORT,
+or --direct, talks to peers directly instead. --bind defaults to a random
+UDP port.
 
 In chat, type a line to send it. Commands: /status, /nudge, /accept,
 /add KEY@HOST:PORT (or /add KEY through a relay), /quit.
 Without --peer, wait for a contact request: compare its fingerprint with the
 sender out of band, then /accept it.";
+
+/// The relay used unless `--relay` or direct mode says otherwise.
+const DEFAULT_RELAY: &str = "relay.avianlink.dev:41000";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -94,7 +102,7 @@ fn resolve(s: &str) -> Result<SocketAddr, String> {
 
 fn chat(dir: &str, opts: &[String]) -> Result<(), String> {
     let (mut bind, mut peer, mut profile, mut relay) = (None, None, None, None);
-    let (mut mtu, mut rate) = (None, None);
+    let (mut mtu, mut rate, mut direct) = (None, None, false);
     let mut it = opts.iter();
     while let Some(o) = it.next() {
         let mut val = || it.next().cloned().ok_or(format!("{o} needs a value"));
@@ -104,11 +112,22 @@ fn chat(dir: &str, opts: &[String]) -> Result<(), String> {
             "--profile" => profile = Some(val()?),
             "--mtu" => mtu = Some(val()?.parse().map_err(|_| "bad --mtu")?),
             "--relay" => relay = Some(resolve(&val()?)?),
+            "--direct" => direct = true,
             "--rate" => rate = Some(val()?.parse().map_err(|_| "bad --rate")?),
             _ => return Err(format!("unknown option {o}\n{USAGE}")),
         }
     }
-    let bind = bind.ok_or("--bind is required")?;
+    // A peer given with an address, or --direct, means talking directly;
+    // otherwise through --relay, or the default relay.
+    let peer_has_addr = peer.as_deref().is_some_and(|p| p.contains('@'));
+    if direct && relay.is_some() {
+        return Err("--direct and --relay contradict each other".into());
+    }
+    if relay.is_none() && !direct && !peer_has_addr {
+        relay = Some(resolve(DEFAULT_RELAY).map_err(|e| {
+            format!("{e}\n(the default relay; pass --relay HOST:PORT, or --direct)")
+        })?);
+    }
     let peer = match (peer, relay) {
         (Some(p), Some(_)) => {
             let key = parse_public_key(&p).ok_or("with --relay, --peer is just the 64-hex KEY")?;
@@ -120,6 +139,20 @@ fn chat(dir: &str, opts: &[String]) -> Result<(), String> {
             Some((key, Some(resolve(addr)?)))
         }
         (None, _) => None,
+    };
+    // A random port on all interfaces, in the family we will talk to.
+    let bind = match bind {
+        Some(b) => b,
+        None => {
+            let v6 = relay
+                .or_else(|| peer.and_then(|(_, a)| a))
+                .is_some_and(|a| a.is_ipv6());
+            if v6 {
+                SocketAddr::from(([0u16; 8], 0))
+            } else {
+                SocketAddr::from(([0u8; 4], 0))
+            }
+        }
     };
     // Through a relay, packets must suit whatever link the recipient
     // fetches over: the smallest MTU unless told otherwise.

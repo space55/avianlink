@@ -1,8 +1,8 @@
 //! `avianlink-relay`: the relay on a UDP socket with durable storage.
 //!
 //! ```text
-//! avianlink-relay --bind HOST:PORT --dir DIR [--retention-days N]
-//!                 [--mailbox-quota-kib N] [--total-quota-mib N]
+//! avianlink-relay --dir DIR [--bind HOST:PORT (default 0.0.0.0:41000)]
+//!                 [--retention-days N] [--mailbox-quota-kib N] [--total-quota-mib N]
 //! ```
 
 use std::net::{SocketAddr, UdpSocket};
@@ -12,8 +12,7 @@ use std::time::{Duration, Instant};
 use avianlink_relay::{Relay, RelayConfig, MAX_RETENTION_MS};
 use avianlink_udp::{now, FileStorage};
 
-const USAGE: &str =
-    "usage: avianlink-relay --bind HOST:PORT --dir DIR [--retention-days N (1-30, default 7)]
+const USAGE: &str = "usage: avianlink-relay --dir DIR [--bind HOST:PORT (default 0.0.0.0:41000)] [--retention-days N (1-30, default 7)]
                        [--mailbox-quota-kib N (default 1024)] [--total-quota-mib N (default 1024)]";
 
 fn main() {
@@ -44,7 +43,8 @@ fn run() -> Result<(), String> {
             _ => return Err(USAGE.to_string()),
         }
     }
-    let (bind, dir) = (bind.ok_or(USAGE)?, dir.ok_or(USAGE)?);
+    let bind = bind.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 41_000)));
+    let dir = dir.ok_or(USAGE)?;
     if config.retention_ms > MAX_RETENTION_MS {
         return Err("--retention-days is at most 30".into());
     }

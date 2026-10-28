@@ -85,13 +85,19 @@ an address, so an attacker can't redirect traffic by spoofing a source.
 ```
 avianlink init   DIR                 # new identity and its state; prints address and fingerprint
 avianlink whoami DIR
-avianlink chat   DIR --bind HOST:PORT [--peer KEY@HOST:PORT]
+avianlink chat   DIR [--peer KEY] [--relay HOST:PORT] [--bind HOST:PORT]
+avianlink chat   DIR --peer KEY@HOST:PORT [--bind HOST:PORT]
                  [--profile NAME | --mtu N [--rate BYTES_PER_S]]
-avianlink chat   DIR --bind HOST:PORT --relay HOST:PORT [--peer KEY]
+avianlink chat   DIR --direct [--bind HOST:PORT] ...
 ```
 
-With `--relay`, the peer is just a key, and the MTU defaults to 48 so
-recipients on any link can fetch. The CLI prints "stored on the relay"
+- **Mode:** by default, `chat` goes through the relay at
+  `relay.avianlink.dev:41000`. `--relay` picks another. A `--peer` given
+  with an address, or `--direct`, talks directly instead.
+- **`--bind`** defaults to a random UDP port on all interfaces, in the
+  address family of the relay or peer.
+- **Through a relay,** the peer is just a key, and the MTU defaults to 48
+  so recipients on any link can fetch. The CLI prints "stored on the relay"
 per message, and "safe to go offline" once everything owed is stored and
 everything waiting has been read.
 
