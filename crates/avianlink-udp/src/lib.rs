@@ -10,7 +10,8 @@ mod identity;
 mod storage;
 
 pub use host::{
-    init_node, now, os_rng, Command, HostConfig, HostError, HostEvent, StatusReport, UdpHost, LINK,
+    init_node, init_state, now, os_rng, Command, HostConfig, HostError, HostEvent, StatusReport,
+    UdpHost, LINK,
 };
 pub use identity::{load_identity, parse_public_key, public_key_hex};
 pub use storage::{FileStorage, FileStorageError};

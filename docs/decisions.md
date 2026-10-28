@@ -994,3 +994,24 @@ once the loop started.
 - **`RemovePeer`** was withdrawn by the app, because remove-then-re-add
   reused nonces. D-046 has since made that safe with tombstones, so it can
   be added if the app wants it.
+
+## D-048: `init_state` for identities the host keeps itself (desktop AR-013)
+
+The desktop app keeps its identity secret in the OS keychain (AR-011), but
+the only way to create a node's state was `init_node`, which also generates
+an identity and writes it to `dir/identity`. Its workaround hard-coded
+`"state"`, the private subdirectory name. If that name ever changed, the
+app would misread the result as "account lost" (DA-023) and offer a new
+identity.
+
+- **`avianlink_udp::init_state(dir, &identity)`** creates the engine state
+  for a given identity, failing with `StorageNotEmpty` if state exists.
+  `init_node` is now `create_identity` followed by `init_state`. The
+  subdirectory name is a private constant shared with `UdpHost::open`.
+- **Same rule as D-046.** Call it only for a new identity, when it is
+  created. Calling it for an identity that already had state elsewhere
+  would restart that identity's counters. The library can't check this,
+  just as `Engine::new` can't.
+- **Rejected:** `UdpHost::create(dir, identity, config)`. It would also work,
+  but couples creation with binding a socket; the app asked for the smaller
+  change.

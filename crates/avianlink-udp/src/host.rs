@@ -57,14 +57,30 @@ pub struct HostConfig {
     pub relay: Option<SocketAddr>,
 }
 
-/// Creates a node in `dir`: a new identity and, together with it, the
-/// engine state it belongs to. Fails if `dir` already has an identity.
+/// Where in a node's directory [`UdpHost::open`] keeps engine state.
+const STATE_DIR: &str = "state";
+
+/// Creates a node in `dir`: a new identity, written to `dir/identity`, and
+/// together with it the engine state it belongs to. Fails if `dir`
+/// already has an identity.
 pub fn init_node(dir: &Path) -> Result<Identity, HostError> {
     let identity = crate::identity::create_identity(dir)?;
-    let storage = FileStorage::open(dir.join("state"))?;
+    init_state(dir, &identity)?;
+    Ok(identity)
+}
+
+/// Creates the engine state in `dir` for `identity`, which the host keeps
+/// itself (for example in the OS keychain), so that [`UdpHost::open`] can
+/// open it. Call it only for a **new** identity, at the moment it is
+/// created: state for an identity that already had some would restart its
+/// packet counters (D-046). Fails with `Error::StorageNotEmpty` if `dir`
+/// already holds state.
+pub fn init_state(dir: &Path, identity: &Identity) -> Result<(), HostError> {
+    std::fs::create_dir_all(dir)?;
+    let storage = FileStorage::open(dir.join(STATE_DIR))?;
     let me = Identity::from_secret_bytes(&identity.secret_bytes());
     Engine::new(Config::default(), me, storage, os_rng())?;
-    Ok(identity)
+    Ok(())
 }
 
 /// A request from the UI thread.
@@ -212,7 +228,7 @@ impl UdpHost {
     /// reuse nonces, so such a node needs a new identity
     /// (`docs/security.md` §4).
     pub fn open(dir: &Path, identity: Identity, config: HostConfig) -> Result<Self, HostError> {
-        let storage = FileStorage::open(dir.join("state"))?;
+        let storage = FileStorage::open(dir.join(STATE_DIR))?;
         let mut engine = Engine::restore(config.engine, identity, storage, os_rng())?;
         match config.relay {
             Some(_) => engine.add_relay_link(LINK, config.link)?,

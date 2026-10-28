@@ -94,7 +94,11 @@ recipients on any link can fetch. The CLI prints "stored on the relay"
 per message, and "safe to go offline" once everything owed is stored and
 everything waiting has been read.
 
-`init` creates the identity and the engine state together. `chat`
+`init` creates the identity and the engine state together
+(`avianlink_udp::init_node`). A host that keeps the identity elsewhere, such
+as an app using the OS keychain, creates the state with
+`init_state(dir, &identity)` at the moment it creates the identity, then
+uses `UdpHost::open` as usual. `chat`
 refuses to start if the identity is there but the state is gone (D-046):
 re-`init` in a new directory and re-share the address.
 

@@ -346,3 +346,49 @@ fn peers_added_while_the_hosts_run() {
     let _ = std::fs::remove_dir_all(&da);
     let _ = std::fs::remove_dir_all(&db);
 }
+
+/// AR-013: state created for an identity the host keeps itself (the app's
+/// keychain), with no identity file.
+#[test]
+fn state_for_a_keychain_identity() {
+    let d = dir("keychain");
+    let id = avianlink_core::Identity::from_secret_bytes(&[42; 32]);
+    let key = id.public_key();
+    avianlink_udp::init_state(&d, &id).unwrap();
+    assert!(!d.join("identity").exists(), "no identity file written");
+    // Only once: a second call would mean state for an old identity.
+    match avianlink_udp::init_state(&d, &id) {
+        Err(avianlink_udp::HostError::Engine(avianlink_core::Error::StorageNotEmpty)) => {}
+        other => panic!("expected StorageNotEmpty, got {other:?}"),
+    }
+    let cfg = HostConfig {
+        bind: localhost(),
+        link: Scenario::named("clean", 0).unwrap().link.engine_link(),
+        engine: Config::default(),
+        relay: None,
+    };
+    let host = UdpHost::open(
+        &d,
+        avianlink_core::Identity::from_secret_bytes(&[42; 32]),
+        cfg,
+    )
+    .unwrap();
+    assert_eq!(host.engine().local_key(), key);
+    // Another identity can't open it.
+    let cfg = HostConfig {
+        bind: localhost(),
+        link: Scenario::named("clean", 0).unwrap().link.engine_link(),
+        engine: Config::default(),
+        relay: None,
+    };
+    match UdpHost::open(
+        &d,
+        avianlink_core::Identity::from_secret_bytes(&[7; 32]),
+        cfg,
+    ) {
+        Err(avianlink_udp::HostError::Engine(avianlink_core::Error::IdentityMismatch)) => {}
+        Err(e) => panic!("wrong error: {e}"),
+        Ok(_) => panic!("opened with the wrong identity"),
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
