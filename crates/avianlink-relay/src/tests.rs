@@ -51,6 +51,7 @@ impl Mb {
             tag: self.tag,
             proof: proof(&self.down, self.down_k).unwrap(),
             since,
+            release: since,
         })
     }
 }
@@ -193,6 +194,7 @@ fn proofs_are_one_time_and_tolerate_losses() {
         tag: TAG,
         proof: proof(&mb.up, 1).unwrap(),
         since: 0,
+        release: 0,
     });
     r.handle(EVE, &wrong, t(4));
     assert_eq!(last_cursor(&drain(&mut r)).0, RelayCode::BadProof);
@@ -306,6 +308,14 @@ fn fetches_are_paged() {
         page_packets: 4,
         ..RelayConfig::default()
     };
+    assert!(
+        !RelayConfig {
+            page_packets: 7,
+            ..RelayConfig::default()
+        }
+        .is_valid(),
+        "a REPLY lists at most 6 hashes"
+    );
     let mut r = relay(cfg);
     let mut mb = Mb::new(TAG, 1);
     r.handle(A, &mb.register(), t(0));
@@ -341,7 +351,7 @@ fn live_forwarding_during_a_lease() {
     r.handle(A, &packet(TAG, 1), t(1_000));
     let out = drain(&mut r);
     assert!(out.contains(&(B, packet(TAG, 1))), "forwarded live");
-    r.handle(A, &packet(TAG, 2), t(120_000));
+    r.handle(A, &packet(TAG, 2), t(700_000));
     let out = drain(&mut r);
     assert!(!out.iter().any(|(to, _)| *to == B), "lease over");
 }
@@ -397,7 +407,7 @@ fn everything_the_relay_sends_fits_48_bytes_except_stored_packets() {
     r.handle(A, &mb.register(), t(0));
     r.handle(A, &mb.open(), t(0));
     r.handle(A, &packet(TAG, 1), t(0));
-    r.handle(B, &mb.fetch(u64::MAX - 1), t(0));
+    r.handle(B, &mb.fetch(1 << 34), t(0));
     for (_, b) in drain(&mut r) {
         if wire::is_relay_kind(b[0]) {
             assert!(b.len() <= 48, "{} bytes", b.len());

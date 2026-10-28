@@ -43,6 +43,16 @@ pub enum Event {
         /// Last seq of the mismatched block.
         last_seq: u64,
     },
+    /// Every fragment of one of our messages is stored at a relay
+    /// (`docs/relay.md` §6): safe to go offline. Not delivery: only
+    /// [`Event::MessageDelivered`] means the peer has it. Best-effort, not
+    /// persisted.
+    MessageStored {
+        /// Conversation the message belongs to.
+        conversation: ConversationId,
+        /// The stored message.
+        id: MessageId,
+    },
     /// The peer acknowledged one of our messages.
     MessageDelivered {
         /// Conversation the message belongs to.

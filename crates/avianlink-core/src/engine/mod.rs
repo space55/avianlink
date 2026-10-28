@@ -11,6 +11,7 @@ use crate::config::{FecMode, HelloMode, MAX_SEQ};
 use crate::crypto::{Identity, PairKeys};
 use crate::fec;
 use crate::hash;
+use crate::mailbox;
 use crate::pacer::Pacer;
 use crate::reassembly::{Insert, Reassembly};
 use crate::wire::{
@@ -20,7 +21,10 @@ use crate::wire::{
     AckFrame, DecodeError, FragAckFrame, Frame, Frames, MsgFrame, PairTag, Record, SyncFrame,
     AEAD_TAG_LEN, HELLO_HINT_LEN, HELLO_KIND, HELLO_LEN, TIMESTAMP_EPOCH_UNIX_SECS,
 };
-use crate::wire::{put_sync_frame, sync_frame_len};
+use crate::wire::{
+    encode_relay, put_sync_frame, sync_frame_len, ChainRole, Proof, ReceiptHash, RelayCode,
+    RelayMsg, HELLO_HINT_LEN as HINT_LEN,
+};
 use crate::{
     Config, ConversationId, Error, Event, LinkConfig, LinkId, MessageId, Packet, PublicKey,
     ReceivedMessage, Storage, Timestamp,
@@ -32,7 +36,7 @@ use persist::{
     parse_outbox_key, tombstone_key, version_record, ContactRecord, Op, Tombstone, KEY_VERSION,
     PREFIX_CONTACT, PREFIX_EVENT, PREFIX_INBOX, PREFIX_OUTBOX, SCHEMA, SCHEMA_V3,
 };
-use state::{Contact, FragState, OutMsg, Planned, RepairOut, Replay, Timers};
+use state::{Contact, FragState, OutMsg, Planned, RelaySent, RepairOut, Replay, Timers};
 
 /// A packet the host should send.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,6 +96,8 @@ pub struct OutgoingStatus {
     pub fragments: u32,
     /// Fragments the peer reported holding (FRAG_ACK).
     pub fragments_held: u32,
+    /// On a relay: fragments the relay has receipted (`docs/relay.md` §6).
+    pub fragments_stored: u32,
 }
 
 /// Per-link counters ([`Engine::link_stats`]).
@@ -263,7 +269,12 @@ struct LinkState {
     config: LinkConfig,
     pacer: Pacer,
     stats: LinkStats,
+    /// A relay link (`docs/relay.md` §6): the relay's retention.
+    relay: Option<u64>,
 }
+
+/// Retention assumed for a relay until it advertises its own.
+const DEFAULT_RELAY_RETENTION_MS: u64 = 7 * 24 * 3_600_000;
 
 /// The sans-IO messaging engine.
 ///
@@ -417,6 +428,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
                     queued_at,
                     plan: None,
                     announced: false,
+                    stored_announced: false,
                 },
             );
             e.outbox_len = e.outbox_len.saturating_add(1);
@@ -513,9 +525,272 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
                 config: link,
                 pacer,
                 stats: LinkStats::default(),
+                relay: None,
             },
         );
         Ok(())
+    }
+
+    /// Registers a link to a store-and-forward relay (`docs/relay.md` §6).
+    /// Traffic routed over it relies on relay receipts
+    /// ([`Engine::handle_receipt`]) for the hop and on the peer's ACKs end
+    /// to end, with no probing. Its MTU must suit the smallest link any
+    /// recipient fetches over.
+    pub fn add_relay_link(&mut self, id: LinkId, link: LinkConfig) -> Result<(), Error> {
+        self.add_link(id, link)?;
+        if let Some(l) = self.links.get_mut(&id) {
+            l.relay = Some(DEFAULT_RELAY_RETENTION_MS);
+        }
+        Ok(())
+    }
+
+    /// Sets a relay link's retention, as the relay advertises it in every
+    /// REPLY. Stored fragments are resent every half of it.
+    pub fn set_link_retention(&mut self, id: LinkId, retention_ms: u64) -> Result<(), Error> {
+        match self.links.get_mut(&id) {
+            Some(LinkState { relay: Some(r), .. }) => {
+                *r = retention_ms.max(2);
+                Ok(())
+            }
+            Some(_) => Err(Error::InvalidLinkConfig),
+            None => Err(Error::UnknownLink),
+        }
+    }
+
+    /// Feeds a relay RECEIPT that arrived on `link`: which uploaded
+    /// packets the relay stored, or refused. Unknown hashes are ignored. A
+    /// receipt never means delivery.
+    pub fn handle_receipt(
+        &mut self,
+        link: LinkId,
+        code: RelayCode,
+        hashes: &[ReceiptHash],
+        now: Timestamp,
+    ) {
+        self.observe(now);
+        if self.links.get(&link).is_none_or(|l| l.relay.is_none()) {
+            return;
+        }
+        let now = self.now;
+        let max_rto = self.config.max_rto_ms;
+        let room = usize_of(self.config.max_pending_events).saturating_sub(self.events.len());
+        let mut stored_events = Vec::new();
+        for (&conv, c) in self.contacts.iter_mut() {
+            let mut i = 0;
+            while i < c.relay_log.len() {
+                let Some(entry) = c.relay_log.get(i) else {
+                    break;
+                };
+                if !hashes.contains(&entry.hash) {
+                    i = i.saturating_add(1);
+                    continue;
+                }
+                let Some(entry) = c.relay_log.remove(i) else {
+                    break;
+                };
+                match code {
+                    RelayCode::Ok => {
+                        c.rtt.sample(now.saturating_millis_since(entry.sent_at));
+                        for &(seq, index) in &entry.frags {
+                            if let Some(f) = c
+                                .outbox
+                                .get_mut(&seq)
+                                .and_then(|m| m.plan.as_mut())
+                                .and_then(|p| {
+                                    usize::try_from(index).ok().and_then(|i| p.frags.get_mut(i))
+                                })
+                            {
+                                f.stored_at = Some(now);
+                            }
+                        }
+                        if entry.ack && c.ack_sent_at.is_some_and(|t| t <= entry.sent_at) {
+                            c.ack_sent_at = None;
+                            c.ack_retry_at = None;
+                        }
+                        if entry.hello {
+                            c.hello_stored_at = Some(now);
+                        }
+                    }
+                    RelayCode::Full | RelayCode::NoSession | RelayCode::RateLimited => {
+                        // Refused: try again later (another relay, or once
+                        // there is room / a session).
+                        for &(seq, index) in &entry.frags {
+                            if let Some(f) = c
+                                .outbox
+                                .get_mut(&seq)
+                                .and_then(|m| m.plan.as_mut())
+                                .and_then(|p| {
+                                    usize::try_from(index).ok().and_then(|i| p.frags.get_mut(i))
+                                })
+                            {
+                                f.jitter_ms = max_rto;
+                            }
+                        }
+                        if entry.ack {
+                            c.ack_retry_at = Some(now.saturating_add_millis(max_rto));
+                        }
+                        if entry.hello {
+                            c.hello_sent_at = Some(now.saturating_add_millis(max_rto));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for m in c.outbox.values_mut() {
+                let all = m.plan.as_ref().is_some_and(|p| {
+                    !p.frags.is_empty() && p.frags.iter().all(|f| f.stored_at.is_some())
+                });
+                if all && !m.stored_announced {
+                    m.stored_announced = true;
+                    stored_events.push(Event::MessageStored {
+                        conversation: conv,
+                        id: m.id,
+                    });
+                }
+            }
+        }
+        self.events
+            .extend(stored_events.into_iter().take(room).map(|e| (None, e)));
+    }
+
+    /// The current relay mailbox epoch (`docs/relay.md` §2.1), from the
+    /// host's wall clock.
+    pub fn mailbox_epoch(&self) -> u64 {
+        mailbox::epoch(self.now.as_millis())
+    }
+
+    /// REGISTER messages for both directions of `conversation`'s
+    /// mailboxes at `epoch` (`docs/relay.md` §3): outgoing first, then
+    /// incoming. Whichever side uses the relay first sends both.
+    pub fn mailbox_register(
+        &self,
+        conversation: ConversationId,
+        epoch: u64,
+    ) -> Option<[Vec<u8>; 2]> {
+        let c = self.contacts.get(&conversation)?;
+        let (me, peer) = (self.local, c.key);
+        let anchor = |from: &PublicKey, to: &PublicKey, role| {
+            c.keys
+                .mailbox_seed(from, to, role, epoch)
+                .map(|s| mailbox::anchor(&s))
+        };
+        let out = RelayMsg::Register {
+            tag: c.keys.tx_tag,
+            up: anchor(&me, &peer, ChainRole::Up)?,
+            down: anchor(&me, &peer, ChainRole::Down)?,
+        };
+        let inc = RelayMsg::Register {
+            tag: c.keys.rx_tag,
+            up: anchor(&peer, &me, ChainRole::Up)?,
+            down: anchor(&peer, &me, ChainRole::Down)?,
+        };
+        Some([encode_relay(&out), encode_relay(&inc)])
+    }
+
+    /// The routing tags of `conversation`'s mailboxes: (outgoing,
+    /// incoming). Relay REPLYs name requests by these.
+    pub fn mailbox_tags(&self, conversation: ConversationId) -> Option<(PairTag, PairTag)> {
+        self.contacts
+            .get(&conversation)
+            .map(|c| (c.keys.tx_tag, c.keys.rx_tag))
+    }
+
+    /// An OPEN for `conversation`'s outgoing mailbox at the current epoch,
+    /// consuming (and persisting) one up-chain proof. Send it before
+    /// uploading, and again when a session lapses or a RECEIPT says
+    /// `NoSession`.
+    pub fn mailbox_open(&mut self, conversation: ConversationId) -> Result<Vec<u8>, Error> {
+        let epoch = self.mailbox_epoch();
+        let proof = self.next_proof(conversation, ChainRole::Up, epoch)?;
+        let tag = self
+            .contacts
+            .get(&conversation)
+            .map(|c| c.keys.tx_tag)
+            .ok_or(Error::UnknownConversation)?;
+        Ok(encode_relay(&RelayMsg::Open { tag, proof }))
+    }
+
+    /// A FETCH for `conversation`'s incoming mailbox at `epoch` (the
+    /// current one, or the previous while it still holds packets), from
+    /// relay sequence number `since`, consuming one down-chain proof.
+    /// `release` (≤ `since`) tells the relay every packet below it has
+    /// arrived, so it may delete them.
+    pub fn mailbox_fetch(
+        &mut self,
+        conversation: ConversationId,
+        epoch: u64,
+        since: u64,
+        release: u64,
+    ) -> Result<Vec<u8>, Error> {
+        let proof = self.next_proof(conversation, ChainRole::Down, epoch)?;
+        let tag = self
+            .contacts
+            .get(&conversation)
+            .map(|c| c.keys.rx_tag)
+            .ok_or(Error::UnknownConversation)?;
+        Ok(encode_relay(&RelayMsg::Fetch {
+            tag,
+            proof,
+            since,
+            release: release.min(since),
+        }))
+    }
+
+    /// A FETCH_HELLO for Hellos addressed to us (`docs/relay.md` §2.3).
+    pub fn hello_fetch(&self, since: u64) -> Vec<u8> {
+        encode_relay(&RelayMsg::FetchHello {
+            hint: self.hint,
+            since,
+        })
+    }
+
+    /// Our Hello hint.
+    pub fn hello_hint(&self) -> [u8; HINT_LEN] {
+        self.hint
+    }
+
+    /// The next proof of one of `conversation`'s chains, persisted before
+    /// it is returned so a proof is never reused.
+    fn next_proof(
+        &mut self,
+        conversation: ConversationId,
+        role: ChainRole,
+        epoch: u64,
+    ) -> Result<Proof, Error> {
+        let local = self.local;
+        let c = self
+            .contacts
+            .get(&conversation)
+            .ok_or(Error::UnknownConversation)?;
+        let (from, to) = match role {
+            ChainRole::Up => (local, c.key),
+            ChainRole::Down => (c.key, local),
+        };
+        let seed = c
+            .keys
+            .mailbox_seed(&from, &to, role, epoch)
+            .ok_or(Error::InvalidContact)?;
+        let used = c
+            .chain_used
+            .get(&(role, epoch))
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(Error::Exhausted)?;
+        let proof = mailbox::proof(&seed, used).ok_or(Error::Exhausted)?;
+        let mut rec = c.record();
+        rec.chain_used.insert((role, epoch), used);
+        // Keep the current and two previous epochs per role.
+        rec.chain_used
+            .retain(|&(r, e), _| r != role || e.saturating_add(2) >= epoch);
+        commit(
+            &mut self.storage,
+            alloc::vec![(contact_key(&conversation), Some(rec.encode()))],
+        )?;
+        if let Some(c) = self.contacts.get_mut(&conversation) {
+            c.chain_used = rec.chain_used;
+        }
+        Ok(proof)
     }
 
     /// Unregisters a link. Traffic routed over it moves to the cheapest
@@ -673,6 +948,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
                 queued_at: now,
                 plan: None,
                 announced: false,
+                stored_announced: false,
             },
         );
         self.outbox_len = self.outbox_len.saturating_add(1);
@@ -1055,10 +1331,16 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
     fn on_ack(&mut self, conv: ConversationId, ack: AckFrame<'_>) {
         let now = self.now;
         let room = usize_of(self.config.max_pending_events).saturating_sub(self.events.len());
+        // Through a relay an ACK's "round trip" is the peer's whole absence;
+        // receipts measure the hop instead.
+        let relay = self
+            .contacts
+            .get(&conv)
+            .is_some_and(|c| self.timers(c).relay);
         let Some(contact) = self.contacts.get_mut(&conv) else {
             return;
         };
-        if contact.rtt_sampled.is_none_or(|s| ack.largest > s) {
+        if !relay && contact.rtt_sampled.is_none_or(|s| ack.largest > s) {
             if let Some(sent) = contact.sent_at(ack.largest) {
                 let raw = now.saturating_millis_since(sent);
                 let rtt = if raw > ack.ack_delay {
@@ -1228,7 +1510,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         self.observe(now);
         let now = self.now;
         for c in self.contacts.values_mut() {
-            if c.probing() {
+            if c.backoff > 0 || c.introducing {
                 c.probe_due = now;
             }
         }
@@ -1297,7 +1579,13 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
                     .saturating_add(hello.unwrap_or(0))
                     .saturating_mul(u64::from(PROBE_BUDGET_INVERSE_SHARE))
             });
+        let relay = self
+            .route_of(contact)
+            .and_then(|l| self.links.get(&l))
+            .and_then(|l| l.relay);
         Timers {
+            relay: relay.is_some(),
+            resend: relay.map_or(0, |r| r / 2),
             rto: contact.rtt.rto(
                 self.config.initial_rto_ms,
                 self.config.min_rto_ms,
@@ -1323,6 +1611,19 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         contact.introducing
             || (self.config.hello == HelloMode::UnconfirmedAndBackoff
                 && contact.backoff >= u32::from(self.config.backoff_grace))
+    }
+
+    /// On a relay: when `contact`'s Hello is next due, while it is
+    /// unconfirmed (`relay.md` §6).
+    fn relay_hello_due(&self, contact: &Contact, t: Timers) -> Option<Timestamp> {
+        if !t.relay || !contact.introducing || contact.hello.is_none() {
+            return None;
+        }
+        Some(match (contact.hello_stored_at, contact.hello_sent_at) {
+            (Some(s), _) => s.saturating_add_millis(t.resend),
+            (None, Some(sent)) => sent.saturating_add_millis(t.rto),
+            (None, None) => Timestamp::ZERO,
+        })
     }
 
     /// The link traffic to `contact` goes out on.
@@ -1372,8 +1673,9 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         self.route_of(c)
             .and_then(|l| self.links.get(&l))
             .is_some_and(|l| {
-                Pacer::packet_cost_ms(&l.config.budget, l.config.mtu)
-                    <= self.config.fec_max_packet_cost_ms
+                l.relay.is_none()
+                    && Pacer::packet_cost_ms(&l.config.budget, l.config.mtu)
+                        <= self.config.fec_max_packet_cost_ms
             })
     }
 
@@ -1428,10 +1730,14 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         let contact = self.contacts.get(&conv)?;
         let timers = self.timers(contact);
         let fec = self.fec_on(contact);
+        let relay_hello = self.relay_hello_due(contact, timers);
         let due = match pass {
-            Pass::Data => contact.data_due(timers),
+            Pass::Data => match (contact.data_due(timers), relay_hello) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
             Pass::Repair => (fec && !contact.fec_tx.pending.is_empty()).then_some(now),
-            Pass::Ack => contact.ack_due,
+            Pass::Ack => contact.ack_due_at(timers),
         };
         if due.is_none_or(|t| t > now) {
             return None;
@@ -1446,12 +1752,24 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             return None;
         }
         if pass == Pass::Data
-            && contact.probing()
+            && contact.probing(timers)
             && contact.hello_round != Some(contact.probe_due)
             && self.hello_probes(contact)
         {
             if let Some(hello) = contact.hello {
                 return self.send_hello(conv, link_id, hello, timers);
+            }
+        }
+        if pass == Pass::Data && relay_hello.is_some_and(|t| t <= now) {
+            if let Some(hello) = contact.hello {
+                return self.send_relay_hello(conv, link_id, hello);
+            }
+        }
+        if timers.relay && contact.ack_retry_at.is_some_and(|t| t <= now) {
+            // The last ACK's upload was never receipted: send it again.
+            if let Some(c) = self.contacts.get_mut(&conv) {
+                c.ack_retry_at = None;
+                c.ack_due = Some(now);
             }
         }
         // Repairs only use spare budget: if sending one would leave no room
@@ -1496,6 +1814,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         let contact = self.contacts.get_mut(&conv)?;
         let counter = contact.tx_counter;
         let mut announced = Vec::new();
+        let mut log = BuildLog::default();
         let built = if pass == Pass::Repair {
             build_repair(contact, &ctx, &mut self.stats)
         } else {
@@ -1506,6 +1825,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
                 &mut self.rng,
                 &mut self.stats,
                 &mut announced,
+                &mut log,
             )
         };
         let Some(bytes) = built else {
@@ -1544,6 +1864,24 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
                 )
             }));
         contact.log_sent(counter, now, usize::from(self.config.max_sent_log));
+        if timers.relay {
+            // Track the upload until the relay receipts it.
+            if log.ack {
+                contact.ack_sent_at = Some(now);
+                contact.ack_retry_at = Some(now.saturating_add_millis(timers.rto));
+            }
+            push_relay_log(
+                contact,
+                RelaySent {
+                    hash: hash::receipt_hash(&bytes),
+                    sent_at: now,
+                    frags: log.frags,
+                    ack: log.ack,
+                    hello: false,
+                },
+                usize::from(self.config.max_sent_log),
+            );
+        }
         let link = self.links.get_mut(&link_id)?;
         link.pacer.consume(now, bytes.len());
         bump(&mut link.stats.packets_sent);
@@ -1577,6 +1915,45 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             contact.deepen_backoff(now);
             bump(&mut self.stats.probes_sent);
         }
+        let link = self.links.get_mut(&link_id)?;
+        link.pacer.consume(now, HELLO_LEN);
+        bump(&mut link.stats.packets_sent);
+        link.stats.bytes_sent = link.stats.bytes_sent.saturating_add(u64_of(HELLO_LEN));
+        bump(&mut self.stats.packets_sent);
+        bump(&mut self.stats.hellos_sent);
+        self.stats.bytes_sent = self.stats.bytes_sent.saturating_add(u64_of(HELLO_LEN));
+        Some(Transmit {
+            link: link_id,
+            to: conv,
+            packet: Packet::from_vec(hello.to_vec()),
+        })
+    }
+
+    /// Uploads `conv`'s Hello to a relay and tracks it until receipted.
+    fn send_relay_hello(
+        &mut self,
+        conv: ConversationId,
+        link_id: LinkId,
+        hello: [u8; HELLO_LEN],
+    ) -> Option<Transmit> {
+        let now = self.now;
+        let max_log = usize::from(self.config.max_sent_log);
+        let contact = self.contacts.get_mut(&conv)?;
+        contact.hello_sent_at = Some(now);
+        // A new copy is in flight; the old receipt no longer counts, or the
+        // Hello would stay due and be resent forever.
+        contact.hello_stored_at = None;
+        push_relay_log(
+            contact,
+            RelaySent {
+                hash: hash::receipt_hash(&hello),
+                sent_at: now,
+                frags: Vec::new(),
+                ack: false,
+                hello: true,
+            },
+            max_log,
+        );
         let link = self.links.get_mut(&link_id)?;
         link.pacer.consume(now, HELLO_LEN);
         bump(&mut link.stats.packets_sent);
@@ -1636,10 +2013,11 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
         self.contacts
             .values()
             .filter_map(|c| {
-                let work = match (c.next_work(self.timers(c)), self.fec_due(c)) {
-                    (Some(a), Some(b)) => a.min(b),
-                    (a, b) => a.or(b)?,
-                };
+                let t = self.timers(c);
+                let work = [c.next_work(t), self.fec_due(c), self.relay_hello_due(c, t)]
+                    .into_iter()
+                    .flatten()
+                    .min()?;
                 let link_id = c
                     .route
                     .filter(|l| self.links.contains_key(l))
@@ -1722,6 +2100,9 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
                         transmissions: frags.iter().map(|f| f.sends).max().unwrap_or(0),
                         fragments: count(frags.len()),
                         fragments_held: count(frags.iter().filter(|f| f.held_at.is_some()).count()),
+                        fragments_stored: count(
+                            frags.iter().filter(|f| f.stored_at.is_some()).count(),
+                        ),
                     }
                 })
                 .collect(),
@@ -1902,6 +2283,24 @@ fn build_repair(contact: &mut Contact, ctx: &BuildCtx, stats: &mut Stats) -> Opt
     Some(out)
 }
 
+/// What a built packet carried, for relay receipt tracking.
+#[derive(Default)]
+struct BuildLog {
+    /// (seq, fragment index) written.
+    frags: Vec<(u64, u64)>,
+    /// An ACK frame was written.
+    ack: bool,
+}
+
+/// Records a relay upload, dropping the oldest beyond `max` (those then
+/// fall back to plain retransmission).
+fn push_relay_log(contact: &mut Contact, entry: RelaySent, max: usize) {
+    while contact.relay_log.len() >= max {
+        contact.relay_log.pop_front();
+    }
+    contact.relay_log.push_back(entry);
+}
+
 struct BuildCtx {
     conv: ConversationId,
     mtu: usize,
@@ -1930,6 +2329,7 @@ fn build_packet<R: CryptoRng>(
     rng: &mut R,
     stats: &mut Stats,
     announced: &mut Vec<MessageId>,
+    log: &mut BuildLog,
 ) -> Option<Vec<u8>> {
     let now = ctx.now;
     let hard = ctx.mtu.saturating_sub(AEAD_TAG_LEN);
@@ -1959,6 +2359,7 @@ fn build_packet<R: CryptoRng>(
         if ack_frame_len(cum, largest, delay, bitmap.len()) <= room {
             put_ack_frame(&mut out, cum, largest, delay, &bitmap);
             contact.ack_due = None;
+            log.ack = true;
             bump(&mut stats.acks_sent);
             wrote = true;
             if contact.sync_due {
@@ -2034,7 +2435,9 @@ fn build_packet<R: CryptoRng>(
     }
 
     if ctx.data && !contact.outbox.is_empty() {
-        wrote |= write_data(contact, ctx, &mut out, limit, hard, rng, stats, announced);
+        wrote |= write_data(
+            contact, ctx, &mut out, limit, hard, rng, stats, announced, log,
+        );
     } else if ctx.data && contact.introducing {
         // An introduction with nothing queued: the probe is a SYNC asking
         // for a reply, behind this round's Hello.
@@ -2098,6 +2501,7 @@ fn write_data<R: CryptoRng>(
     rng: &mut R,
     stats: &mut Stats,
     announced: &mut Vec<MessageId>,
+    log: &mut BuildLog,
 ) -> bool {
     let now = ctx.now;
     let t = ctx.timers;
@@ -2120,8 +2524,8 @@ fn write_data<R: CryptoRng>(
 
     // A retransmission timer that fires with nothing heard from the peer
     // since that send means the peer is unreachable: switch to probing.
-    let mut probe = contact.probing();
-    if !probe {
+    let mut probe = contact.probing(t);
+    if !probe && !t.relay {
         let heard = contact.last_fresh;
         probe = contact.outbox.values().any(|m| {
             m.plan.as_ref().is_some_and(|p| {
@@ -2225,6 +2629,8 @@ fn write_data<R: CryptoRng>(
         frag.sends = frag.sends.saturating_add(1);
         frag.last_sent = Some(now);
         frag.held_at = None;
+        frag.stored_at = None;
+        log.frags.push((seq, index));
         frag.jitter_ms = rng
             .next_u64()
             .checked_rem((t.rto / 8).saturating_add(1))

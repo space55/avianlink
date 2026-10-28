@@ -10,11 +10,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+mod client;
+pub use client::{ClientStats, RelayClient};
+
 use avianlink_core::hashes::receipt_hash;
 use avianlink_core::mailbox;
 use avianlink_core::wire::{
     self, encode_relay, parse_relay, ChainRole, PairTag, Proof, Reader, ReceiptHash, RelayCode,
-    RelayMsg, HELLO_HINT_LEN, HELLO_KIND, RELAY_FETCH, RELAY_FETCH_HELLO, RELAY_OPEN,
+    RelayMsg, HELLO_HINT_LEN, HELLO_KIND, MAX_PAGE, RELAY_FETCH, RELAY_FETCH_HELLO, RELAY_OPEN,
     RELAY_REGISTER, VERSION,
 };
 use avianlink_core::{Storage, Timestamp};
@@ -34,7 +37,7 @@ pub struct RelayConfig {
     pub total_quota_bytes: u64,
     /// Most mailboxes.
     pub max_mailboxes: u32,
-    /// Packets per fetch page.
+    /// Packets per fetch page (at most [`MAX_PAGE`]).
     pub page_packets: u16,
     /// How long an upload session lasts after OPEN or the last upload.
     pub session_ms: u64,
@@ -53,9 +56,9 @@ impl Default for RelayConfig {
             mailbox_quota_bytes: 1 << 20,
             total_quota_bytes: 1 << 30,
             max_mailboxes: 1_000_000,
-            page_packets: 16,
+            page_packets: MAX_PAGE as u16,
             session_ms: 600_000,
-            lease_ms: 60_000,
+            lease_ms: 600_000,
             requests_per_minute: 120,
             max_tracked_addresses: 65_536,
         }
@@ -71,6 +74,7 @@ impl RelayConfig {
             && self.total_quota_bytes >= self.mailbox_quota_bytes
             && self.max_mailboxes > 0
             && self.page_packets > 0
+            && usize::from(self.page_packets) <= MAX_PAGE
             && self.requests_per_minute > 0
             && self.max_tracked_addresses > 0
     }
@@ -449,12 +453,25 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
     }
 
     fn reply(&mut self, to: A, request: u8, code: RelayCode, key: [u8; 3], cursor: u64) {
+        self.reply_page(to, request, code, key, cursor, Vec::new());
+    }
+
+    fn reply_page(
+        &mut self,
+        to: A,
+        request: u8,
+        code: RelayCode,
+        key: [u8; 3],
+        cursor: u64,
+        page: Vec<ReceiptHash>,
+    ) {
         let msg = RelayMsg::Reply {
             request,
             code,
             key,
             retention_s: self.config.retention_ms / 1000,
             cursor,
+            page,
         };
         self.send(to, &msg);
     }
@@ -659,12 +676,17 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
                     Err(code) => self.reply(from, RELAY_OPEN, code, tag, 0),
                 }
             }
-            RelayMsg::Fetch { tag, proof, since } => {
+            RelayMsg::Fetch {
+                tag,
+                proof,
+                since,
+                release,
+            } => {
                 if !self.allow(from) {
                     return self.reply(from, RELAY_FETCH, RelayCode::RateLimited, tag, since);
                 }
                 match self.prove(tag, ChainRole::Down, &proof) {
-                    Ok(id) => self.fetch(from, id, tag, since),
+                    Ok(id) => self.fetch(from, id, tag, since, release.min(since)),
                     Err(code) => self.reply(from, RELAY_FETCH, code, tag, since),
                 }
             }
@@ -772,12 +794,12 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
         Err(RelayCode::BadProof)
     }
 
-    fn fetch(&mut self, from: A, id: u64, tag: PairTag, since: u64) {
-        // The recipient proved it holds everything below `since`.
+    fn fetch(&mut self, from: A, id: u64, tag: PairTag, since: u64, release: u64) {
+        // The recipient proved it holds everything below `release`.
         let released: Vec<u64> = self
             .mailboxes
             .get(&id)
-            .map(|m| m.packets.range(..since).map(|(s, _)| *s).collect())
+            .map(|m| m.packets.range(..release).map(|(s, _)| *s).collect())
             .unwrap_or_default();
         if !released.is_empty() {
             let ops = released
@@ -801,22 +823,23 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
         let Some(m) = self.mailboxes.get(&id) else {
             return;
         };
-        let batch: Vec<(u64, Vec<u8>)> = m
+        let batch: Vec<(u64, Vec<u8>, ReceiptHash)> = m
             .packets
             .range(since..)
             .take(page)
-            .map(|(s, p)| (*s, p.bytes.clone()))
+            .map(|(s, p)| (*s, p.bytes.clone(), p.hash))
             .collect();
-        let cursor = batch.last().map_or(since, |(s, _)| s + 1);
+        let cursor = batch.last().map_or(since, |(s, _, _)| s + 1);
         let more = m.packets.range(cursor..).next().is_some();
-        for (_, bytes) in batch {
+        let page = page_hashes(&batch);
+        for (_, bytes, _) in batch {
             self.out.push_back((from, bytes));
             self.stats.delivered += 1;
         }
         let until = self.now.saturating_add_millis(self.config.lease_ms);
         self.leases.insert(id, (from, until));
         let code = if more { RelayCode::More } else { RelayCode::Ok };
-        self.reply(from, RELAY_FETCH, code, tag, cursor);
+        self.reply_page(from, RELAY_FETCH, code, tag, cursor, page);
     }
 
     fn fetch_hello(&mut self, from: A, hint: [u8; HELLO_HINT_LEN], since: u64) {
@@ -825,20 +848,21 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
         let Some(b) = self.hellos.get(&hint) else {
             return self.reply(from, RELAY_FETCH_HELLO, RelayCode::Ok, key3, since);
         };
-        let batch: Vec<(u64, Vec<u8>)> = b
+        let batch: Vec<(u64, Vec<u8>, ReceiptHash)> = b
             .packets
             .range(since..)
             .take(page)
-            .map(|(s, p)| (*s, p.bytes.clone()))
+            .map(|(s, p)| (*s, p.bytes.clone(), p.hash))
             .collect();
-        let cursor = batch.last().map_or(since, |(s, _)| s + 1);
+        let cursor = batch.last().map_or(since, |(s, _, _)| s + 1);
         let more = b.packets.range(cursor..).next().is_some();
-        for (_, bytes) in batch {
+        let page = page_hashes(&batch);
+        for (_, bytes, _) in batch {
             self.out.push_back((from, bytes));
             self.stats.delivered += 1;
         }
         let code = if more { RelayCode::More } else { RelayCode::Ok };
-        self.reply(from, RELAY_FETCH_HELLO, code, key3, cursor);
+        self.reply_page(from, RELAY_FETCH_HELLO, code, key3, cursor, page);
     }
 
     fn expire(&mut self) {
@@ -925,6 +949,13 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
         self.sessions.retain(|_, (_, until)| *until > now);
         self.leases.retain(|_, (_, until)| *until > now);
     }
+}
+
+/// The receipt hashes of a page's packets, in order. Pages are consecutive
+/// runs of stored packets, so the client can tell which sequence number
+/// each was.
+fn page_hashes(batch: &[(u64, Vec<u8>, ReceiptHash)]) -> Vec<ReceiptHash> {
+    batch.iter().map(|(_, _, h)| *h).collect()
 }
 
 #[cfg(test)]

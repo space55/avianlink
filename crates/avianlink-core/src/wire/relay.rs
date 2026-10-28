@@ -10,6 +10,9 @@ pub const PROOF_LEN: usize = 16;
 pub const RECEIPT_HASH_LEN: usize = 4;
 /// Most hashes in one RECEIPT (keeps it within 48 bytes).
 pub const MAX_RECEIPT_HASHES: usize = 10;
+/// Most packets in one fetch page: a REPLY lists their hashes, and stays
+/// within 48 bytes while retention < 2²⁸ s and the cursor < 2³⁵.
+pub const MAX_PAGE: usize = 6;
 
 /// REGISTER kind.
 pub const RELAY_REGISTER: u8 = 0x10;
@@ -112,8 +115,11 @@ pub enum RelayMsg {
         tag: PairTag,
         /// Down-chain proof.
         proof: Proof,
-        /// First relay sequence number wanted; everything below is held.
+        /// First relay sequence number wanted.
         since: u64,
+        /// Every packet below this has been received; the relay may delete
+        /// them (`relay.md` §4.3). At most `since`.
+        release: u64,
     },
     /// Fetch a page of Hellos for a hint.
     FetchHello {
@@ -132,8 +138,13 @@ pub enum RelayMsg {
         key: [u8; TAG_LEN],
         /// The relay's retention, in seconds.
         retention_s: u64,
-        /// For FETCH and FETCH_HELLO: the next `since`.
+        /// For FETCH and FETCH_HELLO: the sequence number after the page.
         cursor: u64,
+        /// For FETCH and FETCH_HELLO: the receipt hashes of the page's
+        /// packets in order, which had sequence numbers `cursor - n ..
+        /// cursor` (at most [`MAX_PAGE`]). The client learns exactly which
+        /// arrived.
+        page: Vec<ReceiptHash>,
     },
     /// Acknowledges uploaded packets by hash.
     Receipt {
@@ -165,11 +176,17 @@ pub fn encode_relay(msg: &RelayMsg) -> Vec<u8> {
             v.extend_from_slice(tag);
             v.extend_from_slice(proof);
         }
-        RelayMsg::Fetch { tag, proof, since } => {
+        RelayMsg::Fetch {
+            tag,
+            proof,
+            since,
+            release,
+        } => {
             v.push(RELAY_FETCH);
             v.extend_from_slice(tag);
             v.extend_from_slice(proof);
             put_varint(&mut v, *since);
+            put_varint(&mut v, *release);
         }
         RelayMsg::FetchHello { hint, since } => {
             v.push(RELAY_FETCH_HELLO);
@@ -182,13 +199,19 @@ pub fn encode_relay(msg: &RelayMsg) -> Vec<u8> {
             key,
             retention_s,
             cursor,
+            page,
         } => {
+            let n = page.len().min(MAX_PAGE);
             v.push(RELAY_REPLY);
             v.push(*request);
             v.push(code.to_u8());
             v.extend_from_slice(key);
             put_varint(&mut v, *retention_s);
             put_varint(&mut v, *cursor);
+            v.push(u8::try_from(n).unwrap_or(0));
+            for h in page.iter().take(n) {
+                v.extend_from_slice(h);
+            }
         }
         RelayMsg::Receipt { code, hashes } => {
             let n = hashes.len().min(MAX_RECEIPT_HASHES);
@@ -221,6 +244,7 @@ pub fn parse_relay(bytes: &[u8]) -> Result<RelayMsg, DecodeError> {
             tag: r.array()?,
             proof: r.array()?,
             since: r.varint()?,
+            release: r.varint()?,
         },
         RELAY_FETCH_HELLO => RelayMsg::FetchHello {
             hint: r.array()?,
@@ -232,6 +256,17 @@ pub fn parse_relay(bytes: &[u8]) -> Result<RelayMsg, DecodeError> {
             key: r.array()?,
             retention_s: r.varint()?,
             cursor: r.varint()?,
+            page: {
+                let n = usize::from(r.u8()?);
+                if n > MAX_PAGE {
+                    return Err(DecodeError::TooLarge);
+                }
+                let mut page = Vec::with_capacity(n);
+                for _ in 0..n {
+                    page.push(r.array()?);
+                }
+                page
+            },
         },
         RELAY_RECEIPT => {
             let code = RelayCode::from_u8(r.u8()?);

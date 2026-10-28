@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 
 use super::persist::{BlockDigest, ContactRecord, RecvDigest};
 use crate::crypto::PairKeys;
-use crate::wire::{FragmentPlan, HELLO_LEN};
+use crate::wire::{ChainRole, FragmentPlan, ReceiptHash, HELLO_LEN};
 use crate::{LinkId, MessageId, PublicKey, Timestamp};
 
 fn id8(id: &crate::MessageId) -> [u8; 8] {
@@ -30,6 +30,8 @@ pub(super) struct FragState {
     pub(super) jitter_ms: u64,
     /// When the peer reported holding it (FRAG_ACK); soft.
     pub(super) held_at: Option<Timestamp>,
+    /// When a relay receipted a packet carrying it (`relay.md` §6); soft.
+    pub(super) stored_at: Option<Timestamp>,
 }
 
 /// An undelivered outgoing message.
@@ -42,6 +44,8 @@ pub(super) struct OutMsg {
     pub(super) plan: Option<Planned>,
     /// `MessageTransmitted` already reported in this incarnation.
     pub(super) announced: bool,
+    /// `MessageStored` already reported in this incarnation.
+    pub(super) stored_announced: bool,
 }
 
 #[derive(Debug)]
@@ -68,11 +72,24 @@ pub(super) struct Timers {
     /// Whether the silence has reached `deep_backoff_after_ms`: probes then
     /// carry only a SYNC.
     pub(super) deep: bool,
+    /// Traffic goes through a relay (`relay.md` §6).
+    pub(super) relay: bool,
+    /// On a relay: how long a stored fragment waits before it is resent
+    /// (half the relay's retention).
+    pub(super) resend: u64,
 }
 
 impl OutMsg {
-    /// When fragment `f` is next due in normal (non-backoff) mode.
+    /// When fragment `f` is next due in normal (non-backoff) mode. On a
+    /// relay: at the RTO until receipted, then every `resend`.
     pub(super) fn frag_due(&self, f: &FragState, t: Timers) -> Timestamp {
+        if t.relay {
+            return match (f.held_at.max(f.stored_at), f.last_sent) {
+                (Some(kept), _) => kept.saturating_add_millis(t.resend),
+                (None, Some(sent)) => sent.saturating_add_millis(t.rto.saturating_add(f.jitter_ms)),
+                (None, None) => self.queued_at,
+            };
+        }
         match (f.held_at, f.last_sent) {
             (Some(held), _) => held.saturating_add_millis(t.max_rto),
             (None, Some(sent)) => sent.saturating_add_millis(t.rto.saturating_add(f.jitter_ms)),
@@ -389,6 +406,28 @@ pub(super) struct Contact {
     pub(super) hello_reply_at: Option<Timestamp>,
     /// The next SYNC asks for a reply.
     pub(super) sync_reply: bool,
+    /// On a relay: packets awaiting a receipt, oldest first.
+    pub(super) relay_log: VecDeque<RelaySent>,
+    /// On a relay: when the latest ACK-carrying packet went out, if no
+    /// receipt has confirmed it yet, and when to resend it.
+    pub(super) ack_sent_at: Option<Timestamp>,
+    pub(super) ack_retry_at: Option<Timestamp>,
+    /// On a relay: our Hello's last upload, and its receipt.
+    pub(super) hello_sent_at: Option<Timestamp>,
+    pub(super) hello_stored_at: Option<Timestamp>,
+    /// Mailbox proofs used, per (role, epoch) (persisted; `relay.md` §2.1).
+    pub(super) chain_used: BTreeMap<(ChainRole, u64), u32>,
+}
+
+/// A packet uploaded to a relay, until its receipt.
+#[derive(Debug, Clone)]
+pub(super) struct RelaySent {
+    pub(super) hash: ReceiptHash,
+    pub(super) sent_at: Timestamp,
+    /// (seq, fragment index) carried.
+    pub(super) frags: Vec<(u64, u64)>,
+    pub(super) ack: bool,
+    pub(super) hello: bool,
 }
 
 impl Contact {
@@ -430,6 +469,12 @@ impl Contact {
             hello_round: None,
             hello_reply_at: None,
             sync_reply: false,
+            relay_log: VecDeque::new(),
+            ack_sent_at: None,
+            ack_retry_at: None,
+            hello_sent_at: None,
+            hello_stored_at: None,
+            chain_used: BTreeMap::new(),
         }
     }
 
@@ -442,6 +487,7 @@ impl Contact {
         c.counter_reserved = r.counter_reserved;
         c.sent_digests = r.sent_digests.clone();
         c.confirmed = r.confirmed;
+        c.chain_used = r.chain_used.clone();
         // Announce the restored floor and next.
         c.sync_due = true;
         c
@@ -455,6 +501,7 @@ impl Contact {
             counter_reserved: self.counter_reserved,
             sent_digests: self.sent_digests.clone(),
             confirmed: self.confirmed,
+            chain_used: self.chain_used.clone(),
         }
     }
 
@@ -509,26 +556,37 @@ impl Contact {
     }
 
     /// Whether traffic goes out as one probe per interval: the peer looks
-    /// unreachable, or hasn't confirmed it knows us.
-    pub(super) fn probing(&self) -> bool {
-        self.backoff > 0 || self.introducing
+    /// unreachable, or hasn't confirmed it knows us. Never on a relay,
+    /// where silence is normal.
+    pub(super) fn probing(&self, t: Timers) -> bool {
+        !t.relay && (self.backoff > 0 || self.introducing)
     }
 
     /// When outgoing data is next due, if there is any. An introduction
-    /// probes even with nothing queued.
+    /// probes even with nothing queued (except on a relay).
     pub(super) fn data_due(&self, t: Timers) -> Option<Timestamp> {
-        if self.outbox.is_empty() && !self.introducing {
+        if self.outbox.is_empty() && (!self.introducing || t.relay) {
             return None;
         }
-        if self.probing() {
+        if self.probing(t) {
             return Some(self.probe_due);
         }
         self.outbox.values().map(|m| m.next_due(t)).min()
     }
 
+    /// When an ACK is due: one is owed, or (on a relay) the last one's
+    /// upload was never receipted.
+    pub(super) fn ack_due_at(&self, t: Timers) -> Option<Timestamp> {
+        let retry = self.ack_retry_at.filter(|_| t.relay);
+        match (self.ack_due, retry) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     /// Earliest time this contact has something to send, if anything.
     pub(super) fn next_work(&self, t: Timers) -> Option<Timestamp> {
-        match (self.data_due(t), self.ack_due) {
+        match (self.data_due(t), self.ack_due_at(t)) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
@@ -671,6 +729,8 @@ mod tests {
             probe_cap: 3_600_000,
             silence: 0,
             deep: false,
+            relay: false,
+            resend: 0,
         };
         c.deepen_backoff(Timestamp::ZERO);
         assert_eq!(c.probe_interval(t), 2000);

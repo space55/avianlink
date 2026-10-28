@@ -21,23 +21,36 @@ fn relay_msg() -> impl Strategy<Value = wire::RelayMsg> {
             .prop_map(|(tag, up, down)| RelayMsg::Register { tag, up, down }),
         (any::<[u8; 3]>(), any::<[u8; 16]>())
             .prop_map(|(tag, proof)| RelayMsg::Open { tag, proof }),
-        (any::<[u8; 3]>(), any::<[u8; 16]>(), any::<u64>())
-            .prop_map(|(tag, proof, since)| RelayMsg::Fetch { tag, proof, since }),
-        (any::<[u8; 2]>(), any::<u64>())
+        (
+            any::<[u8; 3]>(),
+            any::<[u8; 16]>(),
+            0u64..1 << 35,
+            0u64..1 << 35
+        )
+            .prop_map(|(tag, proof, since, release)| RelayMsg::Fetch {
+                tag,
+                proof,
+                since,
+                release
+            }),
+        (any::<[u8; 2]>(), 0u64..1 << 35)
             .prop_map(|(hint, since)| RelayMsg::FetchHello { hint, since }),
         (
             any::<u8>(),
             code.clone(),
             any::<[u8; 3]>(),
-            any::<u32>(),
-            any::<u64>()
+            (0u64..1 << 28, 0u64..1 << 35),
+            prop::collection::vec(any::<[u8; 4]>(), 0..=wire::MAX_PAGE)
         )
-            .prop_map(|(request, code, key, r, cursor)| RelayMsg::Reply {
-                request,
-                code,
-                key,
-                retention_s: u64::from(r),
-                cursor
+            .prop_map(|(request, code, key, (retention_s, cursor), page)| {
+                RelayMsg::Reply {
+                    request,
+                    code,
+                    key,
+                    retention_s,
+                    cursor,
+                    page,
+                }
             }),
         (code, prop::collection::vec(any::<[u8; 4]>(), 0..=10))
             .prop_map(|(code, hashes)| RelayMsg::Receipt { code, hashes }),

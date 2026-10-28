@@ -1534,3 +1534,73 @@ fn tombstones_survive_restore() {
         [(0, String::from("one")), (1, String::from("two"))]
     );
 }
+
+// ---------------------------------------------------------------------
+// Relay links (D-045)
+
+#[test]
+fn relay_link_resends_on_receipts_and_never_spins() {
+    let mut a = Engine::new(Config::default(), id(A), MemoryStorage::new(), rng(A)).unwrap();
+    a.add_relay_link(L, link(48)).unwrap();
+    let ab = a.add_contact(pk(B)).unwrap();
+    a.send_text(ab, &"x".repeat(100), t(0)).unwrap();
+    let day = 24 * 3_600_000;
+    let mut stored_events = 0;
+    let mut now = 0;
+    // Weeks of turns: each poll at a fixed time must run dry quickly, and
+    // receipts keep the relay copy fresh every half-retention.
+    while now < 30 * day {
+        let mut n = 0;
+        let mut hashes = Vec::new();
+        while let Some(tx) = a.poll_transmit(t(now)) {
+            n += 1;
+            assert!(n < 64, "poll_transmit spins at {now}");
+            hashes.push(hash::receipt_hash(tx.packet.as_bytes()));
+        }
+        a.handle_receipt(L, RelayCode::Ok, &hashes, t(now + 50));
+        stored_events += drain_events(&mut a)
+            .iter()
+            .filter(|e| matches!(e, Event::MessageStored { .. }))
+            .count();
+        assert!(a.next_timeout().is_none_or(|w| w > t(now)));
+        now = a
+            .next_timeout()
+            .map_or(now + day, |w| w.as_millis())
+            .max(now + 1);
+    }
+    let s = a.stats();
+    assert_eq!(s.probes_sent, 0);
+    assert!(stored_events >= 1);
+    // One copy every 3.5 days (half the default 7-day retention), not a
+    // storm: ~9 rounds of a message plus its Hello.
+    assert!(s.packets_sent < 200, "{s:?}");
+    let st = a.outgoing(ab).unwrap();
+    assert_eq!(st[0].fragments_stored, st[0].fragments);
+}
+
+#[test]
+fn relay_link_retransmits_until_receipted_and_backs_off_when_full() {
+    let mut a = Engine::new(base(), id(A), MemoryStorage::new(), rng(A)).unwrap();
+    a.add_relay_link(L, link(128)).unwrap();
+    let ab = a.add_contact(pk(B)).unwrap();
+    a.send_text(ab, "hi", t(0)).unwrap();
+    let first = drain_tx(&mut a, t(0));
+    assert_eq!(first.len(), 1);
+    // No receipt: the hop retransmits at the RTO.
+    let rto = a.next_timeout().unwrap();
+    assert!(rto.as_millis() <= 4_000);
+    let again = drain_tx(&mut a, rto);
+    assert_eq!(again.len(), 1);
+    // Refused (relay full): the next try waits about max_rto.
+    let h = hash::receipt_hash(&again[0]);
+    a.handle_receipt(L, RelayCode::Full, &[h], rto);
+    let next = a.next_timeout().unwrap();
+    assert!(next.as_millis() >= rto.as_millis() + 30_000, "{next:?}");
+    // set_link_retention works only on relay links.
+    a.set_link_retention(L, 2 * 24 * 3_600_000).unwrap();
+    a.add_link(LinkId(5), link(128)).unwrap();
+    assert_eq!(
+        a.set_link_retention(LinkId(5), 1),
+        Err(Error::InvalidLinkConfig)
+    );
+}

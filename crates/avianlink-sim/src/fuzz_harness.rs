@@ -67,7 +67,10 @@ pub fn decode(data: &[u8]) {
 /// sealed frames from the peer / `send_text` / time advance; bit 2 picks the
 /// link; bits 3.. scale the time step. A raw packet of exactly one byte `b`
 /// is replaced by a genuine Hello: from the known peer if `b` is even, else
-/// from a stranger whose key derives from `b`.
+/// from a stranger whose key derives from `b`. Link 1 is a relay link
+/// (`relay.md` §6); a time step whose chunk is non-empty also feeds a
+/// relay receipt, with the code `chunk[0]` picks, for the packets the
+/// engine sent most recently.
 pub fn handle_packet(data: &[u8]) {
     let mut e: Engine<MemoryStorage, ChaCha20Rng> = Engine::new(
         Config::default(),
@@ -82,13 +85,18 @@ pub fn handle_packet(data: &[u8]) {
             budget: LinkBudget::Unlimited,
             cost: i as u16,
         };
-        e.add_link(LinkId(i as u16), link).expect("link");
+        if i == 1 {
+            e.add_relay_link(LinkId(1), link).expect("relay link");
+        } else {
+            e.add_link(LinkId(0), link).expect("link");
+        }
     }
     let conv = e.add_contact(peer().public_key()).expect("contact");
     let keys = PairKeys::derive(&peer(), &local_key()).expect("valid keys");
 
     let mut now = crate::SIM_EPOCH_MS;
     let mut counter = 0u64;
+    let mut recent: Vec<wire::ReceiptHash> = Vec::new();
     let mut rest = data;
     while let [op, len, tail @ ..] = rest {
         let n = usize::from(*len).min(tail.len());
@@ -126,12 +134,31 @@ pub fn handle_packet(data: &[u8]) {
             2 => {
                 let _ = e.send_text(conv, &String::from_utf8_lossy(chunk), t);
             }
-            _ => e.handle_timeout(t),
+            _ => {
+                if let Some(&c) = chunk.first() {
+                    let code = match c % 4 {
+                        0 => wire::RelayCode::Ok,
+                        1 => wire::RelayCode::Full,
+                        2 => wire::RelayCode::NoSession,
+                        _ => wire::RelayCode::Unknown(c),
+                    };
+                    let take = recent.len().min(usize::from(c >> 2).max(1));
+                    let hashes = recent.split_off(recent.len() - take);
+                    e.handle_receipt(LinkId(1), code, &hashes, t);
+                }
+                e.handle_timeout(t)
+            }
         }
         let mut sent = 0;
         while let Some(tx) = e.poll_transmit(t) {
             let mtu = MTUS[usize::from(tx.link.0)];
             assert!(tx.packet.len() <= usize::from(mtu), "packet exceeds MTU");
+            if tx.link == LinkId(1) {
+                recent.push(avianlink_core::hashes::receipt_hash(tx.packet.as_bytes()));
+                if recent.len() > 64 {
+                    recent.remove(0);
+                }
+            }
             sent += 1;
             // Turn a livelock into a crash the fuzzer can report. The most
             // one call can owe is every queued fragment once.

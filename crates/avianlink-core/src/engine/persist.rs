@@ -7,7 +7,9 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use super::state::Inbox;
-use crate::wire::{put_varint, DecodeError, Reader};
+use alloc::collections::BTreeMap;
+
+use crate::wire::{put_varint, ChainRole, DecodeError, Reader};
 use crate::{ConversationId, Event, LinkId, MessageId, PublicKey, ReceivedMessage, Timestamp};
 
 /// Bumped on incompatible layout changes. Schema 3 is read too: it lacks
@@ -119,6 +121,8 @@ pub(super) struct ContactRecord {
     /// An authenticated packet from the contact has been accepted.
     /// Absent in schema 3 records, which decode as confirmed.
     pub(super) confirmed: bool,
+    /// Relay mailbox proofs used, per (role, epoch). Absent if none.
+    pub(super) chain_used: BTreeMap<(ChainRole, u64), u32>,
 }
 
 impl ContactRecord {
@@ -129,6 +133,17 @@ impl ContactRecord {
         put_varint(&mut v, self.counter_reserved);
         put_digests(&mut v, &self.sent_digests);
         v.push(u8::from(self.confirmed));
+        if !self.chain_used.is_empty() {
+            put_varint(&mut v, u64::try_from(self.chain_used.len()).unwrap_or(0));
+            for (&(role, epoch), &used) in &self.chain_used {
+                v.push(match role {
+                    ChainRole::Up => 0,
+                    ChainRole::Down => 1,
+                });
+                put_varint(&mut v, epoch);
+                put_varint(&mut v, u64::from(used));
+            }
+        }
         v
     }
 
@@ -144,6 +159,20 @@ impl ContactRecord {
             sent_digests.push((r.varint()?, r.array()?));
         }
         let confirmed = r.is_empty() || r.u8()? != 0;
+        let mut chain_used = BTreeMap::new();
+        if !r.is_empty() {
+            let n = r.varint()?;
+            for _ in 0..n.min(16) {
+                let role = match r.u8()? {
+                    0 => ChainRole::Up,
+                    1 => ChainRole::Down,
+                    _ => return Err(DecodeError::TooLarge),
+                };
+                let epoch = r.varint()?;
+                let used = u32::try_from(r.varint()?).map_err(|_| DecodeError::TooLarge)?;
+                chain_used.insert((role, epoch), used);
+            }
+        }
         Ok(Self {
             key,
             next_seq,
@@ -151,6 +180,7 @@ impl ContactRecord {
             counter_reserved,
             sent_digests,
             confirmed,
+            chain_used,
         })
     }
 }
@@ -308,7 +338,7 @@ pub(super) fn encode_event(ev: &Event) -> Option<Vec<u8>> {
             put_varint(&mut v, u64::from(link.0));
             put_varint(&mut v, received_at.as_millis());
         }
-        Event::MessageTransmitted { .. } => return None,
+        Event::MessageTransmitted { .. } | Event::MessageStored { .. } => return None,
     }
     Some(v)
 }
@@ -376,10 +406,15 @@ mod tests {
             counter_reserved: 1 << 40,
             sent_digests: alloc::vec![(3, [5; 8]), (4, [6; 8])],
             confirmed: false,
+            chain_used: BTreeMap::from([((ChainRole::Up, 671), 9), ((ChainRole::Down, 670), 300)]),
         };
         assert_eq!(ContactRecord::decode(&c.encode()), Ok(c.clone()));
         // Schema 3 records have no flag and decode as confirmed.
-        let mut v3 = c.encode();
+        let plain = ContactRecord {
+            chain_used: BTreeMap::new(),
+            ..c.clone()
+        };
+        let mut v3 = plain.encode();
         v3.pop();
         assert!(ContactRecord::decode(&v3).unwrap().confirmed);
 

@@ -115,7 +115,7 @@ Hellos, and are told apart by byte 0 (`wire-format.md` §2). All fields as in
 | `0x11` | OPEN | `tag[3] up_proof[16]` | 20 |
 | `0x12` | FETCH | `tag[3] down_proof[16] since:varint` | 21–30 |
 | `0x13` | FETCH_HELLO | `hint[2] since:varint` | 4–13 |
-| `0x18` | REPLY | `request:u8 code:u8 key[3] retention_s:varint cursor:varint` | 8–25 |
+| `0x18` | REPLY | `request:u8 code:u8 key[3] retention_s:varint cursor:varint count:varint check[4]` | 13–40 |
 | `0x19` | RECEIPT | `code:u8 count:u8 hash[4]×count` (count ≤ 10) | 3–43 |
 
 `key` is the request's tag, or its hint padded with a zero byte. Codes:
@@ -159,16 +159,25 @@ A receipt is sent only after the packet is **durable** at the relay.
 ### 4.3 FETCH
 FETCH proves the down chain. The relay sends, as plain datagrams exactly as
 uploaded, the mailbox's packets whose relay sequence number is ≥ `since`,
-up to one page. Then it sends REPLY with `cursor` = the next sequence
-number, and code `MORE` if packets remain or `OK` if not. The client
-fetches again with `since = cursor`.
+up to one page. Then it sends REPLY with:
+- `cursor`: the next sequence number;
+- `count` and `check`: the number of packets in the page, and the XOR of
+  their receipt hashes;
+- code `MORE` if packets remain, or `OK` if not.
+
+**The client advances to `cursor` only if the packets that arrived since
+the previous REPLY match `count` and `check`.** Otherwise a page packet
+was lost on the way, and the client fetches the same page again; the
+engine drops the duplicates. Without this check, a client would tell the
+relay to delete packets it never received.
 
 - **A proved `since` means the recipient has everything below it,** so the
   relay deletes those packets. That frees space in a spike without ever
   dropping anything undelivered.
-- **Lease.** For 60 seconds after a FETCH, renewed by each fetch, new
+- **Lease.** For 10 minutes after a FETCH, renewed by each fetch, new
   uploads to the mailbox are also forwarded to the fetcher's address at
-  once. If both ends happen to be online, traffic flows live. Forwarded
+  once. Online clients re-fetch every 5 minutes, which keeps the lease
+  alive and costs about 290 proofs a day, within an epoch's budget. If both ends happen to be online, traffic flows live. Forwarded
   packets are still stored and fetched normally.
 
 FETCH_HELLO works the same for a hint, without proof and without deletion.
