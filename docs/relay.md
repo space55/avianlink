@@ -21,7 +21,7 @@ and so on. In a disaster, everyone connects to the same relay at once.
 - **The relay never drops accepted packets.** It keeps them until the
   retention it is configured with (at most 30 days) expires, or until the
   recipient proves it has them (§4.3). When full, it refuses new uploads
-  rather than evicting old ones, and says so (§4.5). The sender's outbox is
+  rather than evicting old ones, and says so (§4.4). The sender's outbox is
   durable, so a refused packet is retried, never lost.
 - **Every relay message fits in 48 bytes,** the smallest MTU, so clients
   behind a LoRa gateway can use the relay.
@@ -70,7 +70,7 @@ mailbox. Recipients fetch the current and the previous epoch, since the
 previous one can hold packets for up to the retention period, until each
 is empty. Near a boundary a client registers both epochs, so a sender
 whose clock is ahead and a recipient whose clock is behind still meet.
-Idle old-epoch mailboxes expire like any other (§4.5). Relay use
+Idle old-epoch mailboxes expire like any other (§4.4). Relay use
 therefore needs a roughly correct wall clock (within days).
 
 ### 2.2 Shared tags
@@ -107,16 +107,24 @@ fetches.
 
 Relay messages travel in their own datagrams, beside data packets and
 Hellos, and are told apart by byte 0 (`wire-format.md` §2). All fields as in
-`wire-format.md` §1.
+`wire-format.md` §1. **Every relay message ends with a 4-byte checksum**,
+`SHA-256("avianlink-relay-v1" ‖ message)[..4]`, and is dropped if it doesn't
+match. Relay messages have no AEAD, and these links flip bits: one flipped
+bit in a REPLY cursor once made a simulated client release 250 packets it
+had never read. The checksum detects corruption, not forgery; the relay has
+no keys (§5). Sizes below include it.
 
-| Kind | Name | Body | Size |
+| Kind | Name | Body (then `check[4]`) | Size |
 |------|------|------|------|
-| `0x10` | REGISTER | `tag[3] up_anchor[16] down_anchor[16]` | 36 |
-| `0x11` | OPEN | `tag[3] up_proof[16]` | 20 |
-| `0x12` | FETCH | `tag[3] down_proof[16] since:varint` | 21–30 |
-| `0x13` | FETCH_HELLO | `hint[2] since:varint` | 4–13 |
-| `0x18` | REPLY | `request:u8 code:u8 key[3] retention_s:varint cursor:varint count:varint check[4]` | 13–40 |
-| `0x19` | RECEIPT | `code:u8 count:u8 hash[4]×count` (count ≤ 10) | 3–43 |
+| `0x10` | REGISTER | `tag[3] up_anchor[16] down_anchor[16]` | 40 |
+| `0x11` | OPEN | `tag[3] up_proof[16]` | 24 |
+| `0x12` | FETCH | `tag[3] down_proof[16] since:varint release:varint max:u8` | 27–35 |
+| `0x13` | FETCH_HELLO | `hint[2] since:varint` | 8–12 |
+| `0x18` | REPLY | `request:u8 code:u8 key[3] retention_s:varint cursor:varint n:u8 hash[4]×n` (n ≤ 6) | 14–44 |
+| `0x19` | RECEIPT | `code:u8 count:u8 hash[4]×count` (count ≤ 10) | 7–47 |
+
+All fit in 48 bytes while the retention is under 2²⁸ seconds and sequence
+numbers are under 2³⁵.
 
 `key` is the request's tag, or its hint padded with a zero byte. Codes:
 
@@ -157,23 +165,26 @@ A Hello uploaded to the relay needs no session: it's filed by its hint
 A receipt is sent only after the packet is **durable** at the relay.
 
 ### 4.3 FETCH
-FETCH proves the down chain. The relay sends, as plain datagrams exactly as
-uploaded, the mailbox's packets whose relay sequence number is ≥ `since`,
-up to one page. Then it sends REPLY with:
-- `cursor`: the next sequence number;
-- `count` and `check`: the number of packets in the page, and the XOR of
-  their receipt hashes;
+FETCH proves the down chain. The relay first deletes the mailbox's packets
+below `release` (≤ `since`): the client is proving it has them. That frees
+space in a spike without dropping anything undelivered. Then it sends, as
+plain datagrams exactly as uploaded, up to `max` packets (0: the relay's
+page size, at most 6) whose relay sequence number is ≥ `since`. Then a
+REPLY with:
+- `cursor`, the sequence number after the page;
+- the page's receipt hashes in order. They had sequence numbers
+  `cursor − n .. cursor`;
 - code `MORE` if packets remain, or `OK` if not.
 
-**The client advances to `cursor` only if the packets that arrived since
-the previous REPLY match `count` and `check`.** Otherwise a page packet
-was lost on the way, and the client fetches the same page again; the
-engine drops the duplicates. Without this check, a client would tell the
-relay to delete packets it never received.
-
-- **A proved `since` means the recipient has everything below it,** so the
-  relay deletes those packets. That frees space in a spike without ever
-  dropping anything undelivered.
+**Reading and releasing are separate.** From the hashes, the client knows
+exactly which sequence numbers it now holds, including page packets that
+arrive after their REPLY. It keeps reading forward (`since` = the highest
+seen), and records the ones that never arrived. Once at the end, it re-reads
+from the first gap, asking with `max` for just the span covering its gaps.
+`release` is always the first sequence number it still lacks, so loss slows
+reading but never makes the relay delete something unread. (A first design
+advanced only when a whole page arrived. On a 35%-loss link a 6–16 packet
+page rarely does, and the client never got past page one.)
 - **Lease.** For 10 minutes after a FETCH, renewed by each fetch, new
   uploads to the mailbox are also forwarded to the fetcher's address at
   once. Online clients re-fetch every 5 minutes, which keeps the lease
@@ -182,7 +193,7 @@ relay to delete packets it never received.
 
 FETCH_HELLO works the same for a hint, without proof and without deletion.
 
-### 4.5 Relay policy
+### 4.4 Relay policy
 These are relay-side settings; clients only learn the retention.
 - **Retention:** at most 30 days. Packets and Hellos are evicted at expiry
   and not before, except packets below a proved fetch cursor.
@@ -212,10 +223,16 @@ These are relay-side settings; clients only learn the retention.
 - **A malicious relay** can drop, delay, or withhold packets, or send false
   receipts. False `OK` receipts delay a message until the next end-to-end
   resend (§6). Delivery is never falsely confirmed.
+- **Forged replies.** Anyone able to spoof the relay's address can send a
+  REPLY. The checksum doesn't stop that, because it isn't keyed. A forged
+  page could make a client release packets it hasn't read. The sender
+  still holds every message until the recipient's end-to-end ACK and
+  resends it (§6), so the damage is delay, as with any packet dropped on
+  the way. Nothing is lost for good.
 
 ## 6. The engine on a relay
 
-A link registered with `store_and_forward: true` is a relay. Traffic routed
+A link registered with `Engine::add_relay_link` is a relay. Traffic routed
 over it follows these rules instead of `reliability.md` §3:
 
 - **Hop reliability by receipt.** The host passes each RECEIPT's hashes to
@@ -241,11 +258,66 @@ over it follows these rules instead of `reliability.md` §3:
   of a message is stored: "safe to go offline". `MessageDelivered` still
   means only the peer's ACK. `OutgoingStatus::fragments_stored` counts
   progress.
-- **Mailbox material:** `Engine::mailbox(conv)` returns both directions'
-  tags and anchors, and `Engine::mailbox_proof(conv, role)` returns the next
-  proof, persisting the position. The host runs the relay protocol itself
-  (registration, sessions, fetch paging, Hello fetches for
-  `Engine::hello_hint()`).
+- **Mailbox material:** `Engine::mailbox_register`, `mailbox_open` and
+  `mailbox_fetch` build the relay messages. Each proof's position is
+  persisted before the message is returned, so a proof is never reused.
+  `Engine::hello_fetch` builds the Hello fetch.
+- **When to go offline:** `Engine::relay_settled()` is true once every
+  fragment, ACK and Hello owed to a relay contact is stored there.
 
-`avianlink-udp`'s `UdpHost` does all of this when configured with a relay
-address.
+## 7. Hosts
+
+- **`avianlink_relay::RelayClient`** (sans-IO) runs the protocol next to an
+  engine:
+  - registers both directions per epoch (the next one too, near a
+    boundary);
+  - opens upload sessions and holds packets until they open;
+  - reads the previous then the current epoch, one fetch in flight per
+    contact, with gaps re-read;
+  - fetches Hellos;
+  - retries unanswered requests with fresh proofs;
+  - passes receipts and the retention to the engine.
+
+  `caught_up()` is true once nothing is outstanding and every mailbox is
+  read to the end with nothing missing. **A host should go offline only
+  when both `relay_settled()` and `caught_up()` hold.**
+- **`avianlink_relay::Relay`** is the relay itself, sans-IO: datagrams in,
+  datagrams out, a `Storage` for durability.
+- **`avianlink-relay`** (binary, in `avianlink-udp`) runs it on a UDP
+  socket with `FileStorage`:
+
+  ```
+  avianlink-relay --bind 0.0.0.0:7400 --dir /var/lib/avianlink-relay \
+                  [--retention-days 7] [--mailbox-quota-kib 1024] [--total-quota-mib 1024]
+  ```
+- **`UdpHost`** with `HostConfig::relay` sends and receives everything
+  through the relay, and reports `HostEvent::Settled` ("safe to go
+  offline").
+- **The CLI:** `avianlink chat DIR --bind HOST:PORT --relay HOST:PORT
+  [--peer KEY]`.
+
+## 8. Results
+
+`simrun --profile turns_all --seeds 10`. Per run, A and B alternate 40
+sessions each, never online together, about 2 h apart (exponential).
+Sessions last 30 s to 5 min: a node leaves once settled and caught up, or at
+the cap regardless. Each session writes 0–2 messages from the ~200-byte
+mix. Both hops (client→relay, relay→client) apply the named profile.
+Packets that arrive while a node is offline are lost. "Sessions" counts the
+recipient's sessions until the message arrived; 1 means its very next
+session.
+
+| Hops | Delivered by end of run | Still queued by sender | Lost | Sessions p95 (median) / max | Wire bytes / payload byte (median) |
+|---|--:|--:|--:|--:|--:|
+| `clean` | 818/818 | 0 | 0 | 1 / 1 | 3.8 |
+| `geo_satellite` | 818/818 | 0 | 0 | 1 / 1 | 4.1 |
+| `edge_2g` | 818/818 | 0 | 0 | 1 / 1 | 5.4 |
+| `disaster_cellular` | 774/818 (94.6%) | 44 | 0 | 2 / 15 | 18.7 |
+| `lora_like` | 805/818 (98.4%) | 13 | 0 | 1 / 2 | 21.4 |
+
+**No message was ever lost.** Anything undelivered at the end of a run is
+still in its sender's outbox, being resent. The cost on the worst links is
+overhead: about 20 bytes on the wire per payload byte, mostly relay
+protocol (polls, re-reads, page overlap) and retransmission over 35–60%
+bursty loss. That is the main thing to optimise next (D-045,
+"Open").

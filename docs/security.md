@@ -288,6 +288,14 @@ Data packets that follow stay as opaque as before. `HelloMode::Off`
 removes all of this, at the cost of both sides needing each other's keys
 out of band.
 
+**Through a relay** (`relay.md` §5), the relay and anyone watching it also
+see:
+- which client addresses upload to and fetch from each mailbox;
+- each mailbox's tag, sizes and timing;
+- the Hellos waiting under each hint.
+
+It sees no keys, and no message contents.
+
 ## 9. Denial of service
 
 **Per packet:**

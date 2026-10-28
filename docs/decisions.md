@@ -884,7 +884,7 @@ everything; `Engine::restore` returns a new error;
 `avianlink_udp::load_or_create_identity` is replaced by `load_identity`
 and `init_node`; and `avl_engine_open` takes a new argument.
 
-## D-045: Identity-less relays with hash-chain mailboxes (proposal, after Phase 7)
+## D-045: Identity-less relays with hash-chain mailboxes (after Phase 7)
 
 **Use case** (user): A and B are never online at the same time. A relay is
 the only path, and in a disaster everyone uses one relay at once.
@@ -933,3 +933,42 @@ Specified in `relay.md`.
   - no probes, backoff or FEC;
   - hop-reliable ACKs;
   - a transient `MessageStored` event.
+
+**Implementation (D-045).** Built as specified, with these changes, each
+forced by a test:
+- **Epochs instead of REKEY** (see above).
+- **Pages list their packets' hashes, and FETCH separates `since` from
+  `release`.** The spec had the client advance only when a whole page
+  arrived. The lossy turns test showed that a 6–16 packet page almost never
+  arrives whole at 35% loss, so the client never got past page one. Pages
+  are now at most 6 packets, so a REPLY with their hashes fits 48 bytes.
+- **Relay messages carry a 4-byte checksum.** In the simulator, one bit flip
+  in a REPLY cursor made a client release 250 packets it had never read.
+  Data packets have AEAD tags; relay messages had nothing.
+- **FETCH `max`, and give-up counting only rounds without progress.**
+  Without them, re-reads fetched whole pages around single gaps, and gave
+  up while still recovering.
+- **Leaving needs `relay_settled()` and `caught_up()`.** A node that left
+  once its reply was stored never uploaded its ACK of what it had just
+  received, so the sender never learned of delivery.
+- **The relay binary lives in `avianlink-udp`,** so the `avianlink-relay`
+  library depends only on the core and `UdpHost` can use `RelayClient`.
+- **A Hello busy loop.** A relay Hello due again after half a retention
+  kept its old "stored" time and was resent forever at the same instant.
+  The fix clears it on send, an engine test guards it, and the fuzz harness
+  now drives a relay link with receipts.
+
+**Results:** `relay.md` §8. 50 runs, 0 messages lost. Clean, satellite and
+2G hops deliver everything in the recipient's next session. Disaster and
+LoRa hops deliver 95–98% by the end of a run; the rest is still queued by
+its sender.
+
+**Open:**
+- **Overhead on the worst links,** about 20 wire bytes per payload byte.
+  Candidates: poll less often when idle; batch receipts (the format allows
+  10 per message, but the relay sends one per packet); a cheaper
+  "anything new?" probe before a full fetch.
+- **Throughput of `FileStorage` under a spike.** The relay commits, and
+  fsyncs, every upload separately.
+- **The C ABI** exposes none of this yet (`ffi.md` §5).
+- **Forged replies** can cause delay, not loss (`relay.md` §5).

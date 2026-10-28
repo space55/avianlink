@@ -127,6 +127,17 @@ The engine is built from these parts:
     receiver rebuild lost packets without a round trip;
   - the repair rate follows the loss the peer reports;
   - repairs are sent only from budget that would otherwise go unused.
+- **Relays** ([`docs/relay.md`](docs/relay.md)), for peers that are never
+  online at the same time: A sends and goes offline, B comes online later,
+  collects, replies and leaves.
+  - The relay has **no identity and no keys**: it stores packets it can't
+    read, in mailboxes that only the pair can prove control of, using
+    one-time hash-chain proofs.
+  - It never drops what it accepted: it refuses when full, and keeps
+    packets until its configured retention expires (at most 30 days).
+  - Delivery is still confirmed only by the recipient's end-to-end ACK,
+    which the relay carries like any packet.
+  - Every relay message fits in 48 bytes.
 - **Sync.** After an outage, peers exchange compact summaries (a floor, a
   receive bitmap and 8-byte digests of 64-message blocks) instead of
   "everything since X". It makes progress even when most sync packets are
@@ -176,14 +187,26 @@ On real networks, two CLI peers chatting through Linux `tc netem` running
 the `disaster_cellular` profile delivered 20/20 messages each way across two
 outages ([`docs/hosting.md`](docs/hosting.md) §7).
 
+**Through a relay, with A and B never online together**
+(`simrun --profile turns_all --seeds 10`, [`docs/relay.md`](docs/relay.md)
+§8). Over 50 runs, **no message was lost**:
+- clean, satellite and 2G hops: every message arrived in the recipient's
+  very next session;
+- disaster-grade and LoRa hops: 95–98% arrived by the end of each run, and
+  the rest were still queued by their senders.
+
+The cost on the worst links is about 20 wire bytes per payload byte, the
+main open item.
+
 ## Workspace
 
 | Crate | What it is |
 |---|---|
 | [`avianlink-core`](crates/avianlink-core) | The engine: wire format, reliability, crypto, FEC, sync. `no_std` + `alloc`, `forbid(unsafe_code)`. |
 | [`avianlink-sim`](crates/avianlink-sim) | Deterministic network simulator and test harness. Every run reproduces exactly from its seed. Also has `udp-impair` (a userspace impairment proxy) and `netem-gen`. |
-| [`avianlink-udp`](crates/avianlink-udp) | UDP host for `std` platforms: `UdpHost` driver loop, `FileStorage` (a crash-safe write-ahead log), identity files. |
+| [`avianlink-udp`](crates/avianlink-udp) | UDP host for `std` platforms: `UdpHost` driver loop (direct or through a relay), `FileStorage` (a crash-safe write-ahead log), identity files, and the `avianlink-relay` server binary. |
 | [`avianlink-cli`](crates/avianlink-cli) | `avianlink`: a terminal chat demo. |
+| [`avianlink-relay`](crates/avianlink-relay) | The identity-less relay (`Relay`) and its client (`RelayClient`), both sans-IO. |
 | [`avianlink-ffi`](crates/avianlink-ffi) | C ABI with a generated header, plus an Apple XCFramework, for iOS and Swift. |
 
 Other directories:
@@ -352,8 +375,8 @@ Verify fingerprints out of band when you add a contact.
 
 - An embedded example on a real microcontroller. The core already builds
   for `thumbv7em-none-eabihf` in CI.
-- A self-hostable store-and-forward relay over UDP, so peers who are never
-  online at the same time can still exchange messages.
+- Cut the relay protocol's overhead on the worst links, and expose relays
+  through the C ABI.
 - A ratchet for forward secrecy that tolerates heavy reordering and skipped
   messages (`docs/security.md` §7).
 - Swift-friendly wrappers on top of the C ABI.

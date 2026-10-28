@@ -13,6 +13,8 @@
 | `avianlink` (`avianlink-cli`) | Terminal demo: `init`, `whoami`, `chat`. |
 | `udp-impair` (`avianlink-sim`) | Userspace impairment proxy. Applies a simulator profile to real UDP traffic between two hosts, for testing without netem. |
 | `netem-gen` (`avianlink-sim`) | Generates `scripts/netem/*.sh` from the simulator profiles, so the two can't drift. |
+| `avianlink-relay` (`avianlink-udp`) | The identity-less store-and-forward relay on UDP (`relay.md` §7). |
+| `UdpHost` with `HostConfig::relay` | Everything goes through a relay; peers need not be online together (`relay.md`). |
 
 ## 2. `FileStorage`
 
@@ -77,7 +79,13 @@ avianlink init   DIR                 # new identity and its state; prints addres
 avianlink whoami DIR
 avianlink chat   DIR --bind HOST:PORT [--peer KEY@HOST:PORT]
                  [--profile NAME | --mtu N [--rate BYTES_PER_S]]
+avianlink chat   DIR --bind HOST:PORT --relay HOST:PORT [--peer KEY]
 ```
+
+With `--relay`, the peer is just a key, and the MTU defaults to 48 so
+recipients on any link can fetch. The CLI prints "stored on the relay"
+per message, and "safe to go offline" once everything owed is stored and
+everything waiting has been read.
 
 `init` creates the identity and the engine state together. `chat`
 refuses to start if the identity is there but the state is gone (D-046):

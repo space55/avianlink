@@ -137,3 +137,5 @@ all of Rust's `std`; the app's linker keeps only what is used.
   Swift package on top of this.
 - Kotlin/JNI.
 - Exposing the UDP host. Mobile hosts own their transports.
+- Relays (D-045): `add_relay_link`, `handle_receipt`, the mailbox calls,
+  `relay_settled`, and `RelayClient` itself are Rust-only for now.
