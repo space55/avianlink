@@ -681,12 +681,13 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
                 proof,
                 since,
                 release,
+                max,
             } => {
                 if !self.allow(from) {
                     return self.reply(from, RELAY_FETCH, RelayCode::RateLimited, tag, since);
                 }
                 match self.prove(tag, ChainRole::Down, &proof) {
-                    Ok(id) => self.fetch(from, id, tag, since, release.min(since)),
+                    Ok(id) => self.fetch(from, id, tag, since, release.min(since), max),
                     Err(code) => self.reply(from, RELAY_FETCH, code, tag, since),
                 }
             }
@@ -794,7 +795,7 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
         Err(RelayCode::BadProof)
     }
 
-    fn fetch(&mut self, from: A, id: u64, tag: PairTag, since: u64, release: u64) {
+    fn fetch(&mut self, from: A, id: u64, tag: PairTag, since: u64, release: u64, max: u8) {
         // The recipient proved it holds everything below `release`.
         let released: Vec<u64> = self
             .mailboxes
@@ -819,7 +820,10 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
                 }
             }
         }
-        let page = usize::from(self.config.page_packets);
+        let page = match usize::from(max) {
+            0 => usize::from(self.config.page_packets),
+            n => n.min(usize::from(self.config.page_packets)),
+        };
         let Some(m) = self.mailboxes.get(&id) else {
             return;
         };

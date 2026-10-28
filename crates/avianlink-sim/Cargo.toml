@@ -9,6 +9,7 @@ license.workspace = true
 
 [dependencies]
 avianlink-core = { workspace = true, features = ["std"] }
+avianlink-relay = { workspace = true }
 rand_core = { workspace = true }
 rand_chacha = { workspace = true }
 

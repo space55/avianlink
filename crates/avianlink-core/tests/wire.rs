@@ -25,13 +25,15 @@ fn relay_msg() -> impl Strategy<Value = wire::RelayMsg> {
             any::<[u8; 3]>(),
             any::<[u8; 16]>(),
             0u64..1 << 35,
-            0u64..1 << 35
+            0u64..1 << 35,
+            any::<u8>()
         )
-            .prop_map(|(tag, proof, since, release)| RelayMsg::Fetch {
+            .prop_map(|(tag, proof, since, release, max)| RelayMsg::Fetch {
                 tag,
                 proof,
                 since,
-                release
+                release,
+                max
             }),
         (any::<[u8; 2]>(), 0u64..1 << 35)
             .prop_map(|(hint, since)| RelayMsg::FetchHello { hint, since }),
@@ -64,6 +66,14 @@ proptest! {
         prop_assert_eq!(wire::parse_relay(&bytes), Ok(m.clone()));
         prop_assert!(wire::is_relay_kind(bytes[0]));
         prop_assert!(bytes.len() <= 48, "{} bytes", bytes.len());
+    }
+
+    #[test]
+    fn corrupted_relay_messages_are_rejected(m in relay_msg(), bit in any::<u16>()) {
+        let mut bytes = wire::encode_relay(&m);
+        let i = usize::from(bit) % (bytes.len() * 8);
+        bytes[i / 8] ^= 1 << (i % 8);
+        prop_assert!(wire::parse_relay(&bytes).is_err());
     }
 
     #[test]

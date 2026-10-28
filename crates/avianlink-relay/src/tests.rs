@@ -52,6 +52,7 @@ impl Mb {
             proof: proof(&self.down, self.down_k).unwrap(),
             since,
             release: since,
+            max: 0,
         })
     }
 }
@@ -195,6 +196,7 @@ fn proofs_are_one_time_and_tolerate_losses() {
         proof: proof(&mb.up, 1).unwrap(),
         since: 0,
         release: 0,
+        max: 0,
     });
     r.handle(EVE, &wrong, t(4));
     assert_eq!(last_cursor(&drain(&mut r)).0, RelayCode::BadProof);

@@ -17,6 +17,7 @@ pub mod netem;
 mod profiles;
 pub mod proxy;
 mod sim;
+mod turns;
 
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
@@ -25,6 +26,7 @@ pub use metrics::{fmt_ms, percentile, Report};
 pub use sim::{
     add_stats, total_channel_stats, Adversary, CrashModel, LengthMix, Scenario, SIM_EPOCH_MS,
 };
+pub use turns::{TurnsReport, TurnsScenario};
 
 /// Named impairment profiles; parameters in [`Profile::link`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

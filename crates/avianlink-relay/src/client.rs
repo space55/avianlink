@@ -25,12 +25,15 @@ const POLL_MS: u64 = 5 * 60_000;
 /// A request with no REPLY is retried after this, doubling, up to 4 tries.
 const RETRY_MS: u64 = 3_000;
 const MAX_TRIES: u32 = 4;
-/// Re-reads of missing packets in a row before waiting for the next poll.
+/// Re-reads in a row that recover nothing before waiting for the next poll.
 const MAX_REREADS: u32 = 8;
 /// Packets held per conversation while its upload session opens.
 const MAX_HELD: usize = 256;
 /// Missing sequence numbers tracked per mailbox.
 const MAX_MISSING: usize = 4096;
+/// Hashes of recently arrived packets remembered, so a page packet that
+/// arrives after its REPLY still counts.
+const MAX_ARRIVED: usize = 4096;
 /// Register the next epoch this close to its start, so clocks that
 /// disagree by up to a day still meet.
 const EPOCH_SLACK_MS: u64 = 24 * 3_600_000;
@@ -78,6 +81,21 @@ impl FetchState {
     /// Everything below this has arrived.
     fn release(&self) -> u64 {
         self.missing.first().copied().unwrap_or(self.next)
+    }
+
+    /// Packets to ask for: when re-reading, just the span covering the gaps
+    /// within one page; otherwise a full page (0).
+    fn max(&self) -> u8 {
+        let Some((true, &first)) = self.missing.first().map(|f| (self.at_end, f)) else {
+            return 0;
+        };
+        let last = self
+            .missing
+            .range(first..first + wire::MAX_PAGE as u64)
+            .next_back()
+            .copied()
+            .unwrap_or(first);
+        u8::try_from(last - first + 1).unwrap_or(0)
     }
 
     /// Applies a page: which of its sequence numbers arrived.
@@ -129,8 +147,9 @@ pub struct RelayClient {
     hellos: FetchState,
     pending: BTreeMap<Req, Pending>,
     out: VecDeque<Vec<u8>>,
-    /// Hashes of packets that arrived since the last REPLY.
+    /// Hashes of recently arrived packets, and their arrival order.
     arrived: BTreeSet<ReceiptHash>,
+    arrived_order: VecDeque<ReceiptHash>,
     stats: ClientStats,
 }
 
@@ -146,6 +165,7 @@ impl RelayClient {
             pending: BTreeMap::new(),
             out: VecDeque::new(),
             arrived: BTreeSet::new(),
+            arrived_order: VecDeque::new(),
             stats: ClientStats::default(),
         }
     }
@@ -185,7 +205,6 @@ impl RelayClient {
         self.online = false;
         self.pending.clear();
         self.out.clear();
-        self.arrived.clear();
         for m in self.mailboxes.values_mut() {
             m.session_until = None;
             m.held.clear();
@@ -205,7 +224,15 @@ impl RelayClient {
         };
         if !wire::is_relay_kind(kind) {
             self.stats.fetched += 1;
-            self.arrived.insert(receipt_hash(bytes));
+            let h = receipt_hash(bytes);
+            if self.arrived.insert(h) {
+                self.arrived_order.push_back(h);
+                if self.arrived_order.len() > MAX_ARRIVED {
+                    if let Some(old) = self.arrived_order.pop_front() {
+                        self.arrived.remove(&old);
+                    }
+                }
+            }
             return engine.handle_packet(self.link, bytes, now);
         }
         match parse_relay(bytes) {
@@ -228,6 +255,7 @@ impl RelayClient {
                 let _ = engine.set_link_retention(self.link, retention_s.saturating_mul(1000));
                 let arrived = std::mem::take(&mut self.arrived);
                 self.on_reply(engine, request, code, key, (cursor, &page, &arrived), now);
+                self.arrived = arrived;
             }
             _ => {}
         }
@@ -261,6 +289,20 @@ impl RelayClient {
             m.held.push_back(bytes);
             self.ensure_open(engine, tx.to, now);
         }
+    }
+
+    /// Whether everything waiting at the relay has been read: no requests
+    /// outstanding, every mailbox read to the end with nothing missing, and
+    /// our Hellos read. A host leaving after a session waits for this and
+    /// for [`Engine::relay_settled`].
+    pub fn caught_up(&self) -> bool {
+        self.online
+            && self.pending.is_empty()
+            && self.hellos.done
+            && self
+                .mailboxes
+                .values()
+                .all(|m| m.held.is_empty() && m.fetch.values().all(|f| f.done))
     }
 
     /// The next datagram for the relay.
@@ -311,12 +353,12 @@ impl RelayClient {
                 Err(_) => return,
             },
             Req::Fetch(conv, epoch) => {
-                let (since, release) = self
+                let (since, release, max) = self
                     .mailboxes
                     .get(&conv)
                     .and_then(|m| m.fetch.get(&epoch))
-                    .map_or((0, 0), |f| (f.since(), f.release()));
-                match engine.mailbox_fetch(conv, epoch, since, release) {
+                    .map_or((0, 0, 0), |f| (f.since(), f.release(), f.max()));
+                match engine.mailbox_fetch(conv, epoch, since, release, max) {
                     Ok(m) => vec![m],
                     Err(_) => return,
                 }
@@ -364,7 +406,12 @@ impl RelayClient {
     ) -> bool {
         f.last = Some(now);
         let (cursor, hashes, arrived) = page;
+        let before = (f.missing.len(), f.next);
         f.page(cursor, hashes, arrived);
+        if f.missing.len() < before.0 || f.next > before.1 {
+            // Progress: only re-reads that recover nothing count.
+            f.rereads = 0;
+        }
         match code {
             RelayCode::More => {
                 f.at_end = false;

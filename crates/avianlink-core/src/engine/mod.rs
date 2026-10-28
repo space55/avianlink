@@ -653,6 +653,29 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             .extend(stored_events.into_iter().take(room).map(|e| (None, e)));
     }
 
+    /// Whether it is safe to go offline from every relay link
+    /// (`docs/relay.md` §6): every fragment, ACK and Hello owed to a contact
+    /// reached through a relay is stored there. Hosts of the "come online,
+    /// collect, reply, leave" kind wait for this before disconnecting.
+    /// Contacts on other links are not considered.
+    pub fn relay_settled(&self) -> bool {
+        self.contacts.values().all(|c| {
+            let t = self.timers(c);
+            if !t.relay {
+                return true;
+            }
+            let frags_stored = c.outbox.values().all(|m| {
+                m.plan.as_ref().is_some_and(|p| {
+                    p.frags
+                        .iter()
+                        .all(|f| f.stored_at.is_some() || f.held_at.is_some())
+                })
+            });
+            let hello_ok = !c.introducing || c.hello_stored_at.is_some() || c.hello.is_none();
+            frags_stored && c.ack_due.is_none() && c.ack_retry_at.is_none() && hello_ok
+        })
+    }
+
     /// The current relay mailbox epoch (`docs/relay.md` §2.1), from the
     /// host's wall clock.
     pub fn mailbox_epoch(&self) -> u64 {
@@ -714,13 +737,15 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
     /// current one, or the previous while it still holds packets), from
     /// relay sequence number `since`, consuming one down-chain proof.
     /// `release` (≤ `since`) tells the relay every packet below it has
-    /// arrived, so it may delete them.
+    /// arrived, so it may delete them. `max` limits the page (0: the
+    /// relay's page size).
     pub fn mailbox_fetch(
         &mut self,
         conversation: ConversationId,
         epoch: u64,
         since: u64,
         release: u64,
+        max: u8,
     ) -> Result<Vec<u8>, Error> {
         let proof = self.next_proof(conversation, ChainRole::Down, epoch)?;
         let tag = self
@@ -733,6 +758,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             proof,
             since,
             release: release.min(since),
+            max,
         }))
     }
 

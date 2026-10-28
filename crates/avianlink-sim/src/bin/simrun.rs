@@ -15,7 +15,7 @@
 //! ```
 
 use avianlink_core::{FecMode, HelloMode};
-use avianlink_sim::{Report, Scenario};
+use avianlink_sim::{Profile, Report, Scenario, TurnsScenario};
 
 fn main() {
     let mut profiles: Vec<&str> = Scenario::NAMES[..5].to_vec();
@@ -39,6 +39,21 @@ fn main() {
         match a.as_str() {
             "--profile" => {
                 let v = val();
+                // Relay turns (D-045): `turns_<profile>` or `turns_all`.
+                if let Some(p) = v.strip_prefix("turns_") {
+                    let list: Vec<Profile> = match p {
+                        "all" => Profile::ALL.to_vec(),
+                        p => vec![Profile::from_name(p)
+                            .unwrap_or_else(|| usage(&format!("unknown profile {p}")))],
+                    };
+                    let all: Vec<String> = std::env::args().collect();
+                    let k = all
+                        .iter()
+                        .position(|a| a == "--seeds")
+                        .and_then(|i| all.get(i + 1))
+                        .map_or(1, |s| num(s));
+                    run_turns(&list, k);
+                }
                 profiles = match v.as_str() {
                     "all" => Scenario::NAMES[..5].to_vec(),
                     "everything" => Scenario::NAMES.to_vec(),
@@ -150,6 +165,37 @@ fn main() {
 fn num(s: &str) -> u64 {
     s.parse()
         .unwrap_or_else(|_| usage(&format!("not a number: {s}")))
+}
+
+/// Runs relay turns scenarios and prints a summary table.
+fn run_turns(profiles: &[Profile], seeds: u64) -> ! {
+    println!("| scenario | seed | delivered | acked | queued | lost | sessions p50/p95/max | latency p50/p95 | wire/payload | relay peak |");
+    println!("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|");
+    let mut failed = false;
+    for &p in profiles {
+        for seed in 1..=seeds {
+            let r = TurnsScenario::new(p, seed).run();
+            println!(
+                "| {} | {} | {}/{} | {} | {} | {} | {}/{}/{} | {}/{} | {:.2} | {} B |",
+                r.name,
+                r.seed,
+                r.delivered,
+                r.messages,
+                r.acked,
+                r.still_queued,
+                r.lost,
+                r.sessions_p50,
+                r.sessions_p95,
+                r.sessions_max,
+                avianlink_sim::fmt_ms(r.latency_p50_ms),
+                avianlink_sim::fmt_ms(r.latency_p95_ms),
+                r.wire_per_payload(),
+                r.relay_peak_bytes
+            );
+            failed |= r.bugs() != 0;
+        }
+    }
+    std::process::exit(i32::from(failed));
 }
 
 fn usage(msg: &str) -> ! {

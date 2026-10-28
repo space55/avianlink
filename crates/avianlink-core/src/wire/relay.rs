@@ -2,7 +2,26 @@
 
 use alloc::vec::Vec;
 
+use sha2::{Digest, Sha256};
+
 use super::{put_varint, DecodeError, PairTag, Reader, HELLO_HINT_LEN, TAG_LEN};
+
+/// Bytes of the checksum ending every relay message.
+pub const RELAY_CHECK_LEN: usize = 4;
+
+/// `SHA-256(label ‖ body)[..4]`: every relay message ends with it, because
+/// relay messages have no AEAD and these links corrupt bits. It detects
+/// corruption, not forgery (`relay.md` §4).
+fn relay_check(body: &[u8]) -> [u8; RELAY_CHECK_LEN] {
+    let d: [u8; 32] = Sha256::new()
+        .chain_update(b"avianlink-relay-v1")
+        .chain_update(body)
+        .finalize()
+        .into();
+    let mut c = [0u8; RELAY_CHECK_LEN];
+    c.iter_mut().zip(d).for_each(|(o, b)| *o = b);
+    c
+}
 
 /// Bytes in a chain proof or anchor.
 pub const PROOF_LEN: usize = 16;
@@ -120,6 +139,9 @@ pub enum RelayMsg {
         /// Every packet below this has been received; the relay may delete
         /// them (`relay.md` §4.3). At most `since`.
         release: u64,
+        /// Most packets wanted (0: the relay's page size); a re-read asks
+        /// only for the span covering its gaps.
+        max: u8,
     },
     /// Fetch a page of Hellos for a hint.
     FetchHello {
@@ -160,8 +182,9 @@ pub fn is_relay_kind(kind: u8) -> bool {
     (RELAY_REGISTER..=RELAY_RECEIPT).contains(&kind)
 }
 
-/// Encodes `msg`. Every encoding fits in 48 bytes, except a RECEIPT
-/// holding more than [`MAX_RECEIPT_HASHES`] hashes, which is truncated.
+/// Encodes `msg`, checksum included. Every encoding fits in 48 bytes (a
+/// RECEIPT keeps at most [`MAX_RECEIPT_HASHES`] hashes, a REPLY at most
+/// [`MAX_PAGE`]).
 pub fn encode_relay(msg: &RelayMsg) -> Vec<u8> {
     let mut v = Vec::with_capacity(48);
     match msg {
@@ -181,12 +204,14 @@ pub fn encode_relay(msg: &RelayMsg) -> Vec<u8> {
             proof,
             since,
             release,
+            max,
         } => {
             v.push(RELAY_FETCH);
             v.extend_from_slice(tag);
             v.extend_from_slice(proof);
             put_varint(&mut v, *since);
             put_varint(&mut v, *release);
+            v.push(*max);
         }
         RelayMsg::FetchHello { hint, since } => {
             v.push(RELAY_FETCH_HELLO);
@@ -223,12 +248,25 @@ pub fn encode_relay(msg: &RelayMsg) -> Vec<u8> {
             }
         }
     }
+    let check = relay_check(&v);
+    v.extend_from_slice(&check);
     v
 }
 
-/// Parses a relay message. Trailing bytes are an error.
+/// Parses a relay message, verifying its checksum. Trailing bytes are an
+/// error.
 pub fn parse_relay(bytes: &[u8]) -> Result<RelayMsg, DecodeError> {
-    let mut r = Reader::new(bytes);
+    let body_len = bytes
+        .len()
+        .checked_sub(RELAY_CHECK_LEN)
+        .ok_or(DecodeError::Truncated)?;
+    let (body, check) = bytes
+        .split_at_checked(body_len)
+        .ok_or(DecodeError::Truncated)?;
+    if relay_check(body) != check {
+        return Err(DecodeError::TooLarge);
+    }
+    let mut r = Reader::new(body);
     let kind = r.u8()?;
     let msg = match kind {
         RELAY_REGISTER => RelayMsg::Register {
@@ -245,6 +283,7 @@ pub fn parse_relay(bytes: &[u8]) -> Result<RelayMsg, DecodeError> {
             proof: r.array()?,
             since: r.varint()?,
             release: r.varint()?,
+            max: r.u8()?,
         },
         RELAY_FETCH_HELLO => RelayMsg::FetchHello {
             hint: r.array()?,

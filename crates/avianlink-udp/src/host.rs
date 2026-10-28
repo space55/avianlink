@@ -12,6 +12,7 @@ use avianlink_core::{
     Config, ContactStatus, ConversationId, Engine, Error, Event, Identity, LinkConfig, LinkId,
     LinkStats, PublicKey, Queued, Received, Stats, Timestamp,
 };
+use avianlink_relay::RelayClient;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 
@@ -50,6 +51,10 @@ pub struct HostConfig {
     pub link: LinkConfig,
     /// Engine configuration.
     pub engine: Config,
+    /// Send and receive everything through this relay (`docs/relay.md`):
+    /// the link becomes a store-and-forward link, and peers need no
+    /// address.
+    pub relay: Option<SocketAddr>,
 }
 
 /// Creates a node in `dir`: a new identity and, together with it, the
@@ -111,6 +116,10 @@ pub enum HostEvent {
     AcceptFailed(Error),
     /// Answer to [`Command::Status`].
     Status(Box<StatusReport>),
+    /// Through a relay: everything owed (messages, ACKs, Hellos) is stored
+    /// there and everything waiting there has been read, so it is safe to
+    /// go offline. Reported each time it becomes true.
+    Settled,
 }
 
 /// A snapshot for `/status`.
@@ -163,6 +172,8 @@ pub struct UdpHost {
     engine: Engine<FileStorage, ChaCha20Rng>,
     socket: UdpSocket,
     peers: BTreeMap<ConversationId, SocketAddr>,
+    relay: Option<(SocketAddr, RelayClient)>,
+    settled: bool,
     /// Where pending contact requests came from. Hellos can be replayed, so
     /// these are only candidates until the contact's own packets confirm
     /// them (`docs/security.md` §6).
@@ -178,14 +189,33 @@ impl UdpHost {
     pub fn open(dir: &Path, identity: Identity, config: HostConfig) -> Result<Self, HostError> {
         let storage = FileStorage::open(dir.join("state"))?;
         let mut engine = Engine::restore(config.engine, identity, storage, os_rng())?;
-        engine.add_link(LINK, config.link)?;
+        match config.relay {
+            Some(_) => engine.add_relay_link(LINK, config.link)?,
+            None => engine.add_link(LINK, config.link)?,
+        }
         let socket = UdpSocket::bind(config.bind)?;
         Ok(Self {
             engine,
             socket,
             peers: BTreeMap::new(),
+            relay: config.relay.map(|a| (a, RelayClient::new(LINK))),
+            settled: false,
             candidates: BTreeMap::new(),
         })
+    }
+
+    /// Adds `key` as a contact (if it is not one already); returns the
+    /// conversation. Through a relay, no address is needed.
+    pub fn add_contact(&mut self, key: PublicKey) -> Result<ConversationId, Error> {
+        let existing = self
+            .engine
+            .contacts()
+            .find(|(_, k)| *k == key)
+            .map(|(c, _)| c);
+        match existing {
+            Some(c) => Ok(c),
+            None => self.engine.add_contact(key),
+        }
     }
 
     /// Adds `key` as a contact (if it is not one already) reachable at
@@ -235,6 +265,9 @@ impl UdpHost {
     /// Runs until [`Command::Quit`] or until either channel closes.
     pub fn run(mut self, commands: Receiver<Command>, events: Sender<HostEvent>) -> io::Result<()> {
         let mut buf = vec![0u8; 65_536];
+        if let Some((_, client)) = self.relay.as_mut() {
+            client.connect(&mut self.engine, now());
+        }
         loop {
             loop {
                 match commands.try_recv() {
@@ -247,14 +280,24 @@ impl UdpHost {
                 return Ok(());
             }
             let t = now();
-            let wait = self
-                .engine
-                .next_timeout()
+            let client_next = self.relay.as_ref().and_then(|(_, c)| c.next_timeout());
+            let next = match (self.engine.next_timeout(), client_next) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            let wait = next
                 .map_or(MAX_WAIT_MS, |n| n.saturating_millis_since(t))
                 .clamp(1, MAX_WAIT_MS);
             self.socket
                 .set_read_timeout(Some(Duration::from_millis(wait)))?;
             match self.socket.recv_from(&mut buf) {
+                Ok((n, src)) if self.relay.as_ref().is_some_and(|(a, _)| *a == src) => {
+                    if let Some((_, client)) = self.relay.as_mut() {
+                        client.handle(&mut self.engine, &buf[..n], now());
+                    }
+                }
+                // Through a relay, nothing else is listened to.
+                Ok(_) if self.relay.is_some() => {}
                 Ok((n, src)) => match self.engine.handle_packet(LINK, &buf[..n], now()) {
                     // Only authenticated data packets move an address.
                     Received::Contact(conv) => {
@@ -275,6 +318,9 @@ impl UdpHost {
                     ) =>
                 {
                     self.engine.handle_timeout(now());
+                    if let Some((_, client)) = self.relay.as_mut() {
+                        client.handle_timeout(&mut self.engine, now());
+                    }
                 }
                 // ICMP-induced errors (e.g. port unreachable) are transient.
                 Err(_) => {}
@@ -294,6 +340,10 @@ impl UdpHost {
             },
             Command::Nudge => {
                 self.engine.nudge(now());
+                if let Some((_, client)) = self.relay.as_mut() {
+                    // "The network is back": fetch everything again.
+                    client.connect(&mut self.engine, now());
+                }
                 return;
             }
             Command::Status => HostEvent::Status(Box::new(StatusReport {
@@ -322,16 +372,30 @@ impl UdpHost {
     fn pump(&mut self, events: &Sender<HostEvent>) -> bool {
         let t = now();
         while let Some(tx) = self.engine.poll_transmit(t) {
-            if let Some(addr) = self.peers.get(&tx.to) {
+            if let Some((_, client)) = self.relay.as_mut() {
+                client.upload(&mut self.engine, tx, t);
+            } else if let Some(addr) = self.peers.get(&tx.to) {
                 // Send errors (no route, buffer full) are like loss: the
                 // engine retransmits.
                 let _ = self.socket.send_to(tx.packet.as_bytes(), addr);
+            }
+        }
+        if let Some((addr, client)) = self.relay.as_mut() {
+            while let Some(bytes) = client.poll_transmit() {
+                let _ = self.socket.send_to(&bytes, *addr);
             }
         }
         while let Some(ev) = self.engine.poll_event() {
             if events.send(HostEvent::Engine(ev)).is_err() {
                 return false;
             }
+        }
+        if let Some((_, client)) = self.relay.as_ref() {
+            let settled = self.engine.relay_settled() && client.caught_up();
+            if settled && !self.settled && events.send(HostEvent::Settled).is_err() {
+                return false;
+            }
+            self.settled = settled;
         }
         true
     }

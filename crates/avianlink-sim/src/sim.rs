@@ -415,7 +415,7 @@ struct Sim<'a> {
     skipped_after_wipe: u64,
 }
 
-fn stream(seed: u64, n: u64) -> ChaCha20Rng {
+pub(crate) fn stream(seed: u64, n: u64) -> ChaCha20Rng {
     let mut rng = crate::seeded_rng(seed);
     rng.set_stream(n);
     rng
@@ -455,7 +455,7 @@ const WORDS: &[&str] = &[
     "east",
 ];
 
-fn random_text(rng: &mut ChaCha20Rng, target: usize) -> String {
+pub(crate) fn random_text(rng: &mut ChaCha20Rng, target: usize) -> String {
     let mut s = String::new();
     while s.len() < target {
         if !s.is_empty() {
@@ -466,7 +466,7 @@ fn random_text(rng: &mut ChaCha20Rng, target: usize) -> String {
     s
 }
 
-fn exp_ms(rng: &mut ChaCha20Rng, mean: u64) -> u64 {
+pub(crate) fn exp_ms(rng: &mut ChaCha20Rng, mean: u64) -> u64 {
     ((-(unit(rng).max(f64::MIN_POSITIVE)).ln()) * mean as f64) as u64
 }
 

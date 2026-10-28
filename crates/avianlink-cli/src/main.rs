@@ -6,6 +6,7 @@
 //! avianlink whoami DIR
 //! avianlink chat   DIR --bind HOST:PORT [--peer KEY@HOST:PORT]
 //!                  [--profile NAME | --mtu N [--rate BYTES_PER_S]]
+//! avianlink chat   DIR --bind HOST:PORT --relay HOST:PORT [--peer KEY]
 //! ```
 
 use std::collections::BTreeMap;
@@ -30,6 +31,9 @@ const USAGE: &str = "usage:
   avianlink whoami DIR
   avianlink chat   DIR --bind HOST:PORT [--peer KEY@HOST:PORT]
                    [--profile NAME | --mtu N [--rate BYTES_PER_S]]
+  avianlink chat   DIR --bind HOST:PORT --relay HOST:PORT [--peer KEY]
+                   (through a store-and-forward relay; peers need not be
+                   online at the same time; MTU defaults to 48)
 
 In chat, type a line to send it. Commands: /status, /nudge, /accept, /quit.
 Without --peer, wait for a contact request: compare its fingerprint with the
@@ -88,8 +92,8 @@ fn resolve(s: &str) -> Result<SocketAddr, String> {
 }
 
 fn chat(dir: &str, opts: &[String]) -> Result<(), String> {
-    let (mut bind, mut peer, mut profile) = (None, None, None);
-    let (mut mtu, mut rate) = (1200u16, None);
+    let (mut bind, mut peer, mut profile, mut relay) = (None, None, None, None);
+    let (mut mtu, mut rate) = (None, None);
     let mut it = opts.iter();
     while let Some(o) = it.next() {
         let mut val = || it.next().cloned().ok_or(format!("{o} needs a value"));
@@ -97,20 +101,28 @@ fn chat(dir: &str, opts: &[String]) -> Result<(), String> {
             "--bind" => bind = Some(resolve(&val()?)?),
             "--peer" => peer = Some(val()?),
             "--profile" => profile = Some(val()?),
-            "--mtu" => mtu = val()?.parse().map_err(|_| "bad --mtu")?,
+            "--mtu" => mtu = Some(val()?.parse().map_err(|_| "bad --mtu")?),
+            "--relay" => relay = Some(resolve(&val()?)?),
             "--rate" => rate = Some(val()?.parse().map_err(|_| "bad --rate")?),
             _ => return Err(format!("unknown option {o}\n{USAGE}")),
         }
     }
     let bind = bind.ok_or("--bind is required")?;
-    let peer = match peer {
-        Some(p) => {
+    let peer = match (peer, relay) {
+        (Some(p), Some(_)) => {
+            let key = parse_public_key(&p).ok_or("with --relay, --peer is just the 64-hex KEY")?;
+            Some((key, None))
+        }
+        (Some(p), None) => {
             let (key, addr) = p.split_once('@').ok_or("--peer must be KEY@HOST:PORT")?;
             let key = parse_public_key(key).ok_or("peer KEY must be 64 hex characters")?;
-            Some((key, resolve(addr)?))
+            Some((key, Some(resolve(addr)?)))
         }
-        None => None,
+        (None, _) => None,
     };
+    // Through a relay, packets must suit whatever link the recipient
+    // fetches over: the smallest MTU unless told otherwise.
+    let mtu = mtu.unwrap_or(if relay.is_some() { 48 } else { 1200 });
     let link = match profile {
         Some(name) => {
             let sc = Scenario::named(&name, 0).ok_or(format!("unknown profile {name}"))?;
@@ -132,6 +144,7 @@ fn chat(dir: &str, opts: &[String]) -> Result<(), String> {
         bind,
         link,
         engine: Config::default(),
+        relay,
     };
     let mut host = UdpHost::open(&dir, identity, config).map_err(|e| match e {
         HostError::Engine(avianlink_core::Error::StateMissing) => format!(
@@ -147,12 +160,21 @@ fn chat(dir: &str, opts: &[String]) -> Result<(), String> {
     let conv: Arc<Mutex<Option<ConversationId>>> = Arc::new(Mutex::new(None));
     let request: Arc<Mutex<Option<PublicKey>>> = Arc::new(Mutex::new(None));
     match peer {
-        Some((key, addr)) => {
+        Some((key, Some(addr))) => {
             *conv.lock().unwrap() = Some(host.add_peer(key, addr).map_err(|e| e.to_string())?);
             println!(
                 "avianlink: {} on {local} → peer {} at {addr}",
                 format_fingerprint(&me.fingerprint()),
                 format_fingerprint(&key.fingerprint()),
+            );
+        }
+        Some((key, None)) => {
+            *conv.lock().unwrap() = Some(host.add_contact(key).map_err(|e| e.to_string())?);
+            println!(
+                "avianlink: {} on {local} → peer {} through relay {}",
+                format_fingerprint(&me.fingerprint()),
+                format_fingerprint(&key.fingerprint()),
+                relay.map_or("?".into(), |r| r.to_string()),
             );
         }
         None => println!(
@@ -235,6 +257,13 @@ fn chat(dir: &str, opts: &[String]) -> Result<(), String> {
                     public_key_hex(&public_key),
                 )
             }
+            HostEvent::Settled => {
+                "   ✓ everything is stored on the relay: safe to go offline".to_string()
+            }
+            HostEvent::Engine(Event::MessageStored { id, .. }) => match ours.get(&id) {
+                Some((seq, t)) => format!("   stored   #{seq} on the relay after {}", ago(*t)),
+                None => continue,
+            },
             HostEvent::Accepted { key, conversation } => {
                 *conv.lock().unwrap() = Some(conversation);
                 *request.lock().unwrap() = None;

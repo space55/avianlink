@@ -36,6 +36,15 @@ const MTUS: [u16; 2] = [48, 1200];
 pub fn decode(data: &[u8]) {
     let _ = wire::peek_tag(data);
     let _ = wire::parse_hello(data);
+    // Relay messages, with the checksum fixed up so the fuzzer reaches the
+    // field decoders.
+    let _ = wire::parse_relay(data);
+    if let Ok(m) = wire::parse_relay(&wire::encode_relay(&wire::RelayMsg::Receipt {
+        code: wire::RelayCode::Ok,
+        hashes: Vec::new(),
+    })) {
+        let _ = wire::encode_relay(&m);
+    }
     let _ = wire::parse_header(data);
     let _ = wire::validate_frames(data);
     for f in wire::Frames::new(data) {
