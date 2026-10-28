@@ -8,7 +8,65 @@ use avianlink_core::wire::{
 };
 use proptest::prelude::*;
 
+fn relay_msg() -> impl Strategy<Value = wire::RelayMsg> {
+    use wire::{ChainRole, RelayCode, RelayMsg};
+    let code = prop_oneof![
+        Just(RelayCode::Ok),
+        Just(RelayCode::Full),
+        Just(RelayCode::More),
+        (7u8..).prop_map(RelayCode::Unknown)
+    ];
+    let role = prop_oneof![Just(ChainRole::Up), Just(ChainRole::Down)];
+    prop_oneof![
+        (any::<[u8; 3]>(), any::<[u8; 16]>(), any::<[u8; 16]>())
+            .prop_map(|(tag, up, down)| RelayMsg::Register { tag, up, down }),
+        (any::<[u8; 3]>(), any::<[u8; 16]>())
+            .prop_map(|(tag, proof)| RelayMsg::Open { tag, proof }),
+        (any::<[u8; 3]>(), any::<[u8; 16]>(), any::<u64>())
+            .prop_map(|(tag, proof, since)| RelayMsg::Fetch { tag, proof, since }),
+        (any::<[u8; 2]>(), any::<u64>())
+            .prop_map(|(hint, since)| RelayMsg::FetchHello { hint, since }),
+        (any::<[u8; 3]>(), role, any::<[u8; 16]>(), any::<[u8; 16]>()).prop_map(
+            |(tag, role, proof, anchor)| RelayMsg::Rekey {
+                tag,
+                role,
+                proof,
+                anchor
+            }
+        ),
+        (
+            any::<u8>(),
+            code.clone(),
+            any::<[u8; 3]>(),
+            any::<u32>(),
+            any::<u64>()
+        )
+            .prop_map(|(request, code, key, r, cursor)| RelayMsg::Reply {
+                request,
+                code,
+                key,
+                retention_s: u64::from(r),
+                cursor
+            }),
+        (code, prop::collection::vec(any::<[u8; 4]>(), 0..=10))
+            .prop_map(|(code, hashes)| RelayMsg::Receipt { code, hashes }),
+    ]
+}
+
 proptest! {
+    #[test]
+    fn relay_messages_round_trip_within_48_bytes(m in relay_msg()) {
+        let bytes = wire::encode_relay(&m);
+        prop_assert_eq!(wire::parse_relay(&bytes), Ok(m.clone()));
+        prop_assert!(wire::is_relay_kind(bytes[0]));
+        prop_assert!(bytes.len() <= 48, "{} bytes", bytes.len());
+    }
+
+    #[test]
+    fn relay_parse_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..64)) {
+        let _ = wire::parse_relay(&bytes);
+    }
+
     #[test]
     fn hello_round_trips(hint in any::<[u8; 2]>(), key in any::<[u8; 32]>(), mac in any::<[u8; 12]>()) {
         let sender = avianlink_core::PublicKey(key);

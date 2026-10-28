@@ -31,6 +31,11 @@ pub fn hello_hint(recipient: &PublicKey) -> [u8; crate::wire::HELLO_HINT_LEN] {
     truncate(digest(b"avianlink-hello-hint-v1", &[&recipient.0]))
 }
 
+/// The 4-byte hash a relay RECEIPT names a packet by (`relay.md` §4.2).
+pub fn receipt_hash(packet: &[u8]) -> crate::wire::ReceiptHash {
+    truncate(digest(b"avianlink-receipt-v1", &[packet]))
+}
+
 /// Content-addressed ID of message `seq` with encoded `record`.
 pub fn message_id(sender: &PublicKey, recipient: &PublicKey, seq: u64, record: &[u8]) -> MessageId {
     let mut seq_buf = alloc::vec::Vec::with_capacity(10);

@@ -17,7 +17,8 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::wire::{
-    encode_hello, hello_signed, Hello, PairTag, AEAD_TAG_LEN, HELLO_LEN, HELLO_MAC_LEN, TAG_LEN,
+    encode_hello, hello_signed, put_varint, ChainRole, Hello, PairTag, Proof, AEAD_TAG_LEN,
+    HELLO_LEN, HELLO_MAC_LEN, TAG_LEN,
 };
 use crate::PublicKey;
 
@@ -130,6 +131,8 @@ pub struct PairKeys {
     /// Hello MAC keys (`security.md` §2.1, §3), one per direction.
     hello_tx_key: Zeroizing<[u8; 32]>,
     hello_rx_key: Zeroizing<[u8; 32]>,
+    /// The pair's HKDF pseudorandom key, for relay mailbox seeds.
+    prk: Zeroizing<[u8; 32]>,
     /// Tag on packets we send to the contact.
     pub tx_tag: PairTag,
     /// Tag on packets the contact sends to us.
@@ -159,7 +162,9 @@ impl PairKeys {
     pub fn derive(local: &Identity, peer: &PublicKey) -> Option<Self> {
         let shared = local.shared_secret(peer)?;
         let me = local.public_key();
-        let hk = Hkdf::<Sha256>::new(Some(PAIR_SALT), shared.as_ref());
+        let (prk_out, hk) = Hkdf::<Sha256>::extract(Some(PAIR_SALT), shared.as_ref());
+        let mut prk = Zeroizing::new([0u8; 32]);
+        prk.iter_mut().zip(prk_out).for_each(|(o, b)| *o = b);
         let expand = |label: &[u8], from: &PublicKey, to: &PublicKey, out: &mut [u8]| {
             hk.expand_multi_info(&[label, &from.0, &to.0], out).ok()
         };
@@ -180,6 +185,7 @@ impl PairKeys {
             rx_key,
             hello_tx_key,
             hello_rx_key,
+            prk,
             tx_tag,
             rx_tag,
         })
@@ -195,6 +201,29 @@ impl PairKeys {
         let mut tag = [0u8; HELLO_MAC_LEN];
         tag.iter_mut().zip(full).for_each(|(o, b)| *o = b);
         Some(encode_hello(&signed, &tag))
+    }
+
+    /// The seed of the relay mailbox chain for direction `from` → `to`, in
+    /// `role`, at `generation` (`relay.md` §2.1). Either member of the
+    /// pair computes the same seed.
+    pub fn mailbox_seed(
+        &self,
+        from: &PublicKey,
+        to: &PublicKey,
+        role: ChainRole,
+        generation: u64,
+    ) -> Option<Proof> {
+        let hk = Hkdf::<Sha256>::from_prk(self.prk.as_ref()).ok()?;
+        let r: &[u8] = match role {
+            ChainRole::Up => b"up",
+            ChainRole::Down => b"down",
+        };
+        let mut g = Vec::with_capacity(10);
+        put_varint(&mut g, generation);
+        let mut seed = [0u8; 16];
+        hk.expand_multi_info(&[b"mailbox", r, &g, &from.0, &to.0], &mut seed)
+            .ok()?;
+        Some(seed)
     }
 
     /// Whether `hello` was made by the contact for us. Constant time.
@@ -315,6 +344,34 @@ mod tests {
             bad[i] ^= 1;
             if let Ok(h) = crate::wire::parse_hello(&bad) {
                 assert!(!ba.verify_hello(&h), "bit flip at {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn mailbox_seeds_agree_across_the_pair_and_differ_otherwise() {
+        let (a, b) = ids();
+        let (pa, pb) = (a.public_key(), b.public_key());
+        let ab = PairKeys::derive(&a, &pb).unwrap();
+        let ba = PairKeys::derive(&b, &pa).unwrap();
+        let s = |k: &PairKeys, f, t, r, g| k.mailbox_seed(f, t, r, g).unwrap();
+        assert_eq!(
+            s(&ab, &pa, &pb, ChainRole::Up, 0),
+            s(&ba, &pa, &pb, ChainRole::Up, 0)
+        );
+        assert_eq!(
+            s(&ab, &pb, &pa, ChainRole::Down, 3),
+            s(&ba, &pb, &pa, ChainRole::Down, 3)
+        );
+        let all = [
+            s(&ab, &pa, &pb, ChainRole::Up, 0),
+            s(&ab, &pa, &pb, ChainRole::Down, 0),
+            s(&ab, &pb, &pa, ChainRole::Up, 0),
+            s(&ab, &pa, &pb, ChainRole::Up, 1),
+        ];
+        for i in 0..all.len() {
+            for j in i + 1..all.len() {
+                assert_ne!(all[i], all[j]);
             }
         }
     }

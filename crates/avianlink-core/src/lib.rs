@@ -47,6 +47,7 @@ mod event;
 pub mod fec;
 mod hash;
 mod link;
+pub mod mailbox;
 mod pacer;
 mod reassembly;
 mod storage;
@@ -69,5 +70,5 @@ pub use crypto::{format_fingerprint, Identity, FINGERPRINT_LEN};
 
 /// Hash helpers, exposed for tests and tooling. Not a stable API.
 pub mod hashes {
-    pub use crate::hash::{conversation_id, hello_hint, message_id};
+    pub use crate::hash::{conversation_id, hello_hint, message_id, receipt_hash};
 }

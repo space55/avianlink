@@ -7,6 +7,7 @@ mod hello;
 mod packet;
 mod reader;
 mod record;
+mod relay;
 mod sizing;
 mod varint;
 
@@ -31,6 +32,11 @@ pub use reader::Reader;
 pub use record::{
     decode_record, encode_record, record_len, Record, FLAG_EXTENSIONS, FLAG_TIMESTAMP,
     TIMESTAMP_EPOCH_UNIX_SECS,
+};
+pub use relay::{
+    encode_relay, is_relay_kind, parse_relay, ChainRole, Proof, ReceiptHash, RelayCode, RelayMsg,
+    MAX_RECEIPT_HASHES, PROOF_LEN, RECEIPT_HASH_LEN, RELAY_FETCH, RELAY_FETCH_HELLO, RELAY_OPEN,
+    RELAY_RECEIPT, RELAY_REGISTER, RELAY_REKEY, RELAY_REPLY,
 };
 pub use sizing::{frame_space, plan_fragments, FragmentPlan};
 pub use varint::{put_varint, varint_len, MAX_VARINT_LEN};
