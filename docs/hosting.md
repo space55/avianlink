@@ -115,8 +115,10 @@ its Hello came from.
 
 `--profile` sets the engine's link to the same MTU and budget as the named
 simulator profile. Use it with the matching netem script. In `chat`, each
-line typed is a message, and `/status`, `/nudge` and `/quit` are
-commands. Output lines show the engine's view honestly: queued,
+line typed is a message, and these are commands:
+- `/key` (or `/whoami`): your address and fingerprint;
+- `/status`, `/nudge`, `/accept`, `/add KEY@HOST:PORT`;
+- `/quit`. Output lines show the engine's view honestly: queued,
 transmitted, delivered, and received (with any `missing_before`).
 
 ## 5. netem profiles

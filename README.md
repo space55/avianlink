@@ -245,8 +245,9 @@ avianlink chat /tmp/bob   --bind 127.0.0.1:7002 --peer <ALICE_ADDRESS>@127.0.0.1
 picks another relay, including your own (`avianlink-relay`, port 41000 by
 default). A peer given with an address, or `--direct`, means no relay.
 
-Every line you type is a message. `/status` shows RTT, measured loss and
-reachability, and `/nudge` probes immediately. Leave out `--peer` on one
+Every line you type is a message. `/key` prints your address and
+fingerprint to share, `/status` shows RTT, measured loss and reachability,
+and `/nudge` probes immediately. Leave out `--peer` on one
 side to wait for a contact request instead: compare the fingerprint it
 prints with the sender, then type `/accept`. Add `--profile lora_like`
 (or any profile name) to give the engine that profile's MTU and budget.

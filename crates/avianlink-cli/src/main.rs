@@ -40,8 +40,9 @@ peers need not be online at the same time (MTU 48). --peer KEY@HOST:PORT,
 or --direct, talks to peers directly instead. --bind defaults to a random
 UDP port.
 
-In chat, type a line to send it. Commands: /status, /nudge, /accept,
-/add KEY@HOST:PORT (or /add KEY through a relay), /quit.
+In chat, type a line to send it. Commands: /key (your address and
+fingerprint), /status, /nudge, /accept, /add KEY@HOST:PORT (or /add KEY
+through a relay), /quit.
 Without --peer, wait for a contact request: compare its fingerprint with the
 sender out of band, then /accept it.";
 
@@ -237,6 +238,12 @@ fn chat(dir: &str, opts: &[String]) -> Result<(), String> {
             let cmd = match line.trim() {
                 "" => continue,
                 "/quit" => Command::Quit,
+                "/key" | "/whoami" => {
+                    // Answered here: our key is fixed for the session.
+                    println!("   address:     {}", public_key_hex(&me));
+                    println!("   fingerprint: {}", format_fingerprint(&me.fingerprint()));
+                    continue;
+                }
                 "/status" => Command::Status,
                 "/nudge" => Command::Nudge,
                 l if l.starts_with("/add ") => {
