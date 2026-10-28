@@ -204,14 +204,14 @@ impl PairKeys {
     }
 
     /// The seed of the relay mailbox chain for direction `from` → `to`, in
-    /// `role`, at `generation` (`relay.md` §2.1). Either member of the
+    /// `role`, for mailbox `epoch` (`relay.md` §2.1). Either member of the
     /// pair computes the same seed.
     pub fn mailbox_seed(
         &self,
         from: &PublicKey,
         to: &PublicKey,
         role: ChainRole,
-        generation: u64,
+        epoch: u64,
     ) -> Option<Proof> {
         let hk = Hkdf::<Sha256>::from_prk(self.prk.as_ref()).ok()?;
         let r: &[u8] = match role {
@@ -219,7 +219,7 @@ impl PairKeys {
             ChainRole::Down => b"down",
         };
         let mut g = Vec::with_capacity(10);
-        put_varint(&mut g, generation);
+        put_varint(&mut g, epoch);
         let mut seed = [0u8; 16];
         hk.expand_multi_info(&[b"mailbox", r, &g, &from.0, &to.0], &mut seed)
             .ok()?;

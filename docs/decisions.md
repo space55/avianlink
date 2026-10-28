@@ -904,8 +904,12 @@ Specified in `relay.md`.
 - **The relay is a link,** with no keys and no pair state. A rebuilt relay
   costs only buffered packets, which the endpoints resend.
 - **Mailboxes per (tag, anchors), filed by proven upload session.** Hash
-  chains from the pair secret: one-time 16-byte proofs, 4096 per
-  generation, a 64-step window for lost proofs, and REKEY.
+  chains from the pair secret: one-time 16-byte proofs, a 256-step window
+  for lost proofs, and 16384 proofs per 30-day **epoch**. Chains renew from
+  the clock with no messages. (Implementation note: the first draft had a
+  REKEY message. It was dropped because each side tracks generations only
+  for its own roles, so after a re-key the two can disagree on a mailbox's
+  anchors and lock each other out when re-registering.)
   **Rejected:**
   - tag-only subscriptions: anyone could read anyone's traffic metadata
     and copies;

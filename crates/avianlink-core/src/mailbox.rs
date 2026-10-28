@@ -4,10 +4,18 @@ use sha2::{Digest, Sha256};
 
 use crate::wire::{Proof, PROOF_LEN};
 
-/// Proofs per chain generation.
-pub const CHAIN_LEN: u32 = 4096;
+/// Proofs per chain (one chain per role, direction and epoch).
+pub const CHAIN_LEN: u32 = 16_384;
 /// How far ahead of the relay's last accepted value a proof may be.
-pub const PROOF_WINDOW: u32 = 64;
+pub const PROOF_WINDOW: u32 = 256;
+/// Length of a mailbox epoch: chains are renewed every epoch
+/// (`relay.md` §2.1).
+pub const EPOCH_MS: u64 = 30 * 24 * 3_600_000;
+
+/// The mailbox epoch that Unix time `now_ms` falls in.
+pub fn epoch(now_ms: u64) -> u64 {
+    now_ms / EPOCH_MS
+}
 
 const CHAIN_LABEL: &[u8] = b"avianlink-chain-v1";
 
@@ -34,7 +42,7 @@ pub fn anchor(seed: &Proof) -> Proof {
 }
 
 /// The `k`-th proof (`k` = 1 for the first), `v_{N-k}`; `None` once the
-/// generation is used up.
+/// chain is used up.
 pub fn proof(seed: &Proof, k: u32) -> Option<Proof> {
     let i = CHAIN_LEN.checked_sub(k)?;
     (k > 0).then(|| value(seed, i))

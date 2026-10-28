@@ -9,14 +9,13 @@ use avianlink_core::wire::{
 use proptest::prelude::*;
 
 fn relay_msg() -> impl Strategy<Value = wire::RelayMsg> {
-    use wire::{ChainRole, RelayCode, RelayMsg};
+    use wire::{RelayCode, RelayMsg};
     let code = prop_oneof![
         Just(RelayCode::Ok),
         Just(RelayCode::Full),
         Just(RelayCode::More),
         (7u8..).prop_map(RelayCode::Unknown)
     ];
-    let role = prop_oneof![Just(ChainRole::Up), Just(ChainRole::Down)];
     prop_oneof![
         (any::<[u8; 3]>(), any::<[u8; 16]>(), any::<[u8; 16]>())
             .prop_map(|(tag, up, down)| RelayMsg::Register { tag, up, down }),
@@ -26,14 +25,6 @@ fn relay_msg() -> impl Strategy<Value = wire::RelayMsg> {
             .prop_map(|(tag, proof, since)| RelayMsg::Fetch { tag, proof, since }),
         (any::<[u8; 2]>(), any::<u64>())
             .prop_map(|(hint, since)| RelayMsg::FetchHello { hint, since }),
-        (any::<[u8; 3]>(), role, any::<[u8; 16]>(), any::<[u8; 16]>()).prop_map(
-            |(tag, role, proof, anchor)| RelayMsg::Rekey {
-                tag,
-                role,
-                proof,
-                anchor
-            }
-        ),
         (
             any::<u8>(),
             code.clone(),

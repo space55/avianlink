@@ -37,21 +37,22 @@ Every direction of every pair (A→B, and separately B→A) has its own
 
 ### 2.1 Hash chains
 
-Both members of the pair derive, for direction S→R and role
-`r` ∈ {`up`, `down`}, at generation `g` (starting at 0):
+Both members of the pair derive, for direction S→R, role
+`r` ∈ {`up`, `down`} and **mailbox epoch** `e`:
 
 ```
-seed(r, g) = HKDF-Expand(prk(S,R), "mailbox" ‖ r ‖ varint(g) ‖ PK_S ‖ PK_R, 16)
-v_0        = seed(r, g)
+e          = floor(unix_ms / 30 days)
+seed(r, e) = HKDF-Expand(prk(S,R), "mailbox" ‖ r ‖ varint(e) ‖ PK_S ‖ PK_R, 16)
+v_0        = seed(r, e)
 v_{i+1}    = SHA-256("avianlink-chain-v1" ‖ v_i)[..16]
-anchor     = v_N,   N = 4096
+anchor     = v_N,   N = 16384
 ```
 
 `prk` is the pair's key-derivation secret (`security.md` §3), so nobody
 else can compute a seed. The *k*-th proof a client makes is `v_{N-k}`. A
 proof is a one-time password: the relay keeps the last value it accepted,
 `L` (initially the anchor), and accepts `p` if `H^j(p) = L` for some
-1 ≤ *j* ≤ 64, then sets `L = p`. The window of 64 tolerates proofs lost
+1 ≤ *j* ≤ 256, then sets `L = p`. The window of 256 tolerates proofs lost
 on the way. A recorded proof is useless once used, and the next one
 can't be computed from it.
 
@@ -60,9 +61,17 @@ can't be computed from it.
 
 Each user keeps its own position in its own chain, so the two never
 collide. Positions are persisted with the contact. A client whose state is
-lost gets a new identity (D-046), and with it new mailboxes. When a chain
-runs low (fewer than 64 proofs left), the client re-keys to generation
-`g + 1` (§4.4).
+lost gets a new identity (D-046), and with it new mailboxes.
+
+**Epochs renew the chains** with no coordination: both members compute
+`e` from the clock, so each epoch has fresh mailboxes. 16384 proofs per
+role per epoch is about 550 a day. Senders upload to the current epoch's
+mailbox. Recipients fetch the current and the previous epoch, since the
+previous one can hold packets for up to the retention period, until each
+is empty. Near a boundary a client registers both epochs, so a sender
+whose clock is ahead and a recipient whose clock is behind still meet.
+Idle old-epoch mailboxes expire like any other (§4.5). Relay use
+therefore needs a roughly correct wall clock (within days).
 
 ### 2.2 Shared tags
 
@@ -106,7 +115,6 @@ Hellos, and are told apart by byte 0 (`wire-format.md` §2). All fields as in
 | `0x11` | OPEN | `tag[3] up_proof[16]` | 20 |
 | `0x12` | FETCH | `tag[3] down_proof[16] since:varint` | 21–30 |
 | `0x13` | FETCH_HELLO | `hint[2] since:varint` | 4–13 |
-| `0x14` | REKEY | `tag[3] role:u8 proof[16] new_anchor[16]` | 37 |
 | `0x18` | REPLY | `request:u8 code:u8 key[3] retention_s:varint cursor:varint` | 8–25 |
 | `0x19` | RECEIPT | `code:u8 count:u8 hash[4]×count` (count ≤ 10) | 3–43 |
 
@@ -165,10 +173,6 @@ fetches again with `since = cursor`.
 
 FETCH_HELLO works the same for a hint, without proof and without deletion.
 
-### 4.4 REKEY
-Proves the current chain of one role (`0` up, `1` down) and replaces its
-anchor with `new_anchor` (generation `g + 1`). REPLY `OK` or `BAD_PROOF`.
-
 ### 4.5 Relay policy
 These are relay-side settings; clients only learn the retention.
 - **Retention:** at most 30 days. Packets and Hellos are evicted at expiry
@@ -179,7 +183,7 @@ These are relay-side settings; clients only learn the retention.
   refused with `FULL`; nothing stored is evicted early.
 - **Durability:** packets, mailboxes and cursors are committed to durable
   storage before they are acknowledged.
-- **Rate limits** per source address on proof checks (each costs up to 64
+- **Rate limits** per source address on proof checks (each costs up to 256
   hashes) and registrations.
 
 ## 5. Threats

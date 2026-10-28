@@ -19,8 +19,6 @@ pub const RELAY_OPEN: u8 = 0x11;
 pub const RELAY_FETCH: u8 = 0x12;
 /// FETCH_HELLO kind.
 pub const RELAY_FETCH_HELLO: u8 = 0x13;
-/// REKEY kind.
-pub const RELAY_REKEY: u8 = 0x14;
 /// REPLY kind.
 pub const RELAY_REPLY: u8 = 0x18;
 /// RECEIPT kind.
@@ -124,17 +122,6 @@ pub enum RelayMsg {
         /// First relay sequence number wanted.
         since: u64,
     },
-    /// Replace one chain's anchor.
-    Rekey {
-        /// Routing tag.
-        tag: PairTag,
-        /// Which chain.
-        role: ChainRole,
-        /// Proof from the current chain.
-        proof: Proof,
-        /// The next generation's anchor.
-        anchor: Proof,
-    },
     /// The relay's answer to a request.
     Reply {
         /// Kind of the request answered.
@@ -160,13 +147,6 @@ pub enum RelayMsg {
 /// Whether byte 0 belongs to the relay protocol.
 pub fn is_relay_kind(kind: u8) -> bool {
     (RELAY_REGISTER..=RELAY_RECEIPT).contains(&kind)
-}
-
-fn role_u8(r: ChainRole) -> u8 {
-    match r {
-        ChainRole::Up => 0,
-        ChainRole::Down => 1,
-    }
 }
 
 /// Encodes `msg`. Every encoding fits in 48 bytes, except a RECEIPT
@@ -195,18 +175,6 @@ pub fn encode_relay(msg: &RelayMsg) -> Vec<u8> {
             v.push(RELAY_FETCH_HELLO);
             v.extend_from_slice(hint);
             put_varint(&mut v, *since);
-        }
-        RelayMsg::Rekey {
-            tag,
-            role,
-            proof,
-            anchor,
-        } => {
-            v.push(RELAY_REKEY);
-            v.extend_from_slice(tag);
-            v.push(role_u8(*role));
-            v.extend_from_slice(proof);
-            v.extend_from_slice(anchor);
         }
         RelayMsg::Reply {
             request,
@@ -257,16 +225,6 @@ pub fn parse_relay(bytes: &[u8]) -> Result<RelayMsg, DecodeError> {
         RELAY_FETCH_HELLO => RelayMsg::FetchHello {
             hint: r.array()?,
             since: r.varint()?,
-        },
-        RELAY_REKEY => RelayMsg::Rekey {
-            tag: r.array()?,
-            role: match r.u8()? {
-                0 => ChainRole::Up,
-                1 => ChainRole::Down,
-                k => return Err(DecodeError::UnknownVersion(k)),
-            },
-            proof: r.array()?,
-            anchor: r.array()?,
         },
         RELAY_REPLY => RelayMsg::Reply {
             request: r.u8()?,

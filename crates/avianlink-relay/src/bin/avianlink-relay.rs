@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use avianlink_relay::{Relay, RelayConfig, MAX_RETENTION_MS};
 use avianlink_udp::{now, FileStorage};
 
-const USAGE: &str = "usage: avianlink-relay --bind HOST:PORT --dir DIR [--retention-days N (1-30, default 7)]
+const USAGE: &str =
+    "usage: avianlink-relay --bind HOST:PORT --dir DIR [--retention-days N (1-30, default 7)]
                        [--mailbox-quota-kib N (default 1024)] [--total-quota-mib N (default 1024)]";
 
 fn main() {
@@ -28,7 +29,11 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        let mut val = || it.next().cloned().ok_or(format!("{a} needs a value\n{USAGE}"));
+        let mut val = || {
+            it.next()
+                .cloned()
+                .ok_or(format!("{a} needs a value\n{USAGE}"))
+        };
         let num = |s: String| s.parse::<u64>().map_err(|_| format!("not a number: {s}"));
         match a.as_str() {
             "--bind" => bind = Some(val()?.parse::<SocketAddr>().map_err(|e| e.to_string())?),

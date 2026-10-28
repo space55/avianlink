@@ -31,7 +31,7 @@ introduce.
 | `0x00` | Never valid. |
 | `0x01` | v1 data packet (this section). |
 | `0x02` | v1 Hello (§2.5). |
-| `0x10`–`0x19` | Relay protocol (`relay.md` §4). Engines drop them; relays and their clients handle them. |
+| `0x10`–`0x13`, `0x18`, `0x19` | Relay protocol (`relay.md` §4). Engines drop them; relays and their clients handle them. |
 | other | Reserved. Drop. |
 
 A v1 data packet:

@@ -15,7 +15,7 @@ use avianlink_core::mailbox;
 use avianlink_core::wire::{
     self, encode_relay, parse_relay, ChainRole, PairTag, Proof, Reader, ReceiptHash, RelayCode,
     RelayMsg, HELLO_HINT_LEN, HELLO_KIND, RELAY_FETCH, RELAY_FETCH_HELLO, RELAY_OPEN,
-    RELAY_REGISTER, RELAY_REKEY, VERSION,
+    RELAY_REGISTER, VERSION,
 };
 use avianlink_core::{Storage, Timestamp};
 
@@ -669,50 +669,6 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
                 }
             }
             RelayMsg::FetchHello { hint, since } => self.fetch_hello(from, hint, since),
-            RelayMsg::Rekey {
-                tag,
-                role,
-                proof,
-                anchor,
-            } => {
-                if !self.allow(from) {
-                    return self.reply(from, RELAY_REKEY, RelayCode::RateLimited, tag, 0);
-                }
-                let code = match self.prove(tag, role, &proof) {
-                    Ok(id) => {
-                        let mut m = match self.mailboxes.get(&id) {
-                            Some(m) => m.clone(),
-                            None => return,
-                        };
-                        match role {
-                            ChainRole::Up => {
-                                m.up_anchor = anchor;
-                                m.up_last = anchor;
-                            }
-                            ChainRole::Down => {
-                                m.down_anchor = anchor;
-                                m.down_last = anchor;
-                            }
-                        }
-                        if self.commit(vec![(
-                            key(P_MAILBOX, &[&id.to_be_bytes()]),
-                            Some(m.header()),
-                        )]) {
-                            if let Some(slot) = self.mailboxes.get_mut(&id) {
-                                slot.up_anchor = m.up_anchor;
-                                slot.up_last = m.up_last;
-                                slot.down_anchor = m.down_anchor;
-                                slot.down_last = m.down_last;
-                            }
-                            RelayCode::Ok
-                        } else {
-                            RelayCode::Full
-                        }
-                    }
-                    Err(code) => code,
-                };
-                self.reply(from, RELAY_REKEY, code, tag, 0);
-            }
             // Relays don't take replies or receipts.
             RelayMsg::Reply { .. } | RelayMsg::Receipt { .. } => self.stats.dropped += 1,
         }
