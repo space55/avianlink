@@ -256,7 +256,9 @@ means seconds to minutes.
 - **Loss measurement.** Counter gaps over a separate arrivals bitmap, so
   FEC recoveries don't hide loss from the sender, which would make FEC
   turn itself off. Reported in a LOSS frame with an ACK whenever the
-  estimate moves by ≥ 20 ‰, or every 64 packets.
+  estimate moves by ≥ 20 ‰, or every 64 packets. A counter jump wider than
+  the 256-counter span, such as a restarted peer's reservation skip, is not
+  loss: the measurement starts again after it (D-051).
 
 **Cost model.** With FEC on, every packet gives up the `fec_reserve` bytes
 (about 7–9 at small MTUs), plus `m/k` extra packets. Sparse traffic means

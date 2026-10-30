@@ -1055,3 +1055,24 @@ identity.
   destination.
 - **Not exposed:** the relay server, and the raw mailbox and receipt calls
   (`ffi.md` §6).
+
+## D-051: A counter jump restarts the loss estimate (desktop AR-016)
+
+- **The problem.** A restored engine skips up to `counter_reservation`
+  (1024) counters (`security.md` §4). The receiver's estimator read every
+  skipped counter as lost: 1000 ‰ both ways after any restart, which also
+  turned FEC up to maximum on a link losing nothing. A receiver whose first
+  packet from a peer had a high counter read the same.
+- **The fix is local.** A jump wider than the estimate's 256-counter span
+  leaves no evidence in it, only the gap, so the estimate restarts from the
+  new counter and is `None` until 32 counters have aged into the span.
+  `None` already means "not measured" to the app and to FEC (no LOSS report
+  is sent).
+- **The trade.** A real burst of more than 256 consecutive losses is not
+  counted either. That is an outage, and backoff reports it; the loss rate
+  is for sizing FEC on a working link.
+- **Rejected:** a discontinuity notice from the sender. It is exact, but it
+  costs wire bytes within a 48-byte MTU for a statistic.
+- **Not covered:** a `counter_reservation` below 256 makes jumps that stay
+  inside the span, so they read as a burst until they age out (at most 256
+  packets).

@@ -847,6 +847,56 @@ fn lossy_until_fec() -> (E, E, ConversationId) {
     (a, b, ca)
 }
 
+/// Sends `n` messages each way over a clean link, checking that neither
+/// side ever measures loss. Returns the time reached.
+fn clean_turns(
+    a: &mut E,
+    ca: ConversationId,
+    b: &mut E,
+    cb: ConversationId,
+    n: u64,
+    from: u64,
+) -> u64 {
+    let mut now = from;
+    for _ in 0..n {
+        a.send_text(ca, "ping", t(now)).unwrap();
+        b.send_text(cb, "pong", t(now)).unwrap();
+        for _ in 0..3 {
+            let at = t(now);
+            deliver(b, &drain_tx(a, at), at);
+            deliver(a, &drain_tx(b, at), at);
+            now += 200;
+        }
+        drain_events(a);
+        drain_events(b);
+        for (e, c) in [(&*a, ca), (&*b, cb)] {
+            let st = e.contact_status(c).unwrap();
+            assert!(st.loss_in_permille.is_none_or(|p| p < 20), "{st:?}");
+            assert!(st.loss_out_permille.is_none_or(|p| p < 20), "{st:?}");
+        }
+    }
+    now
+}
+
+#[test]
+fn a_restart_is_not_reported_as_loss() {
+    // Desktop AR-016: the restored side skips to its counter reservation,
+    // and the other side must not read the skipped counters as lost.
+    let (mut a, ca) = engine(A, B, 128);
+    let (mut b, cb) = engine(B, A, 128);
+    let now = clean_turns(&mut a, ca, &mut b, cb, 80, 0);
+    assert!(b.contact_status(cb).unwrap().loss_in_permille.is_some());
+    let mut a = crash_and_restore(&a, 128);
+    let now = clean_turns(&mut a, ca, &mut b, cb, 200, now);
+    for (e, c) in [(&a, ca), (&b, cb)] {
+        let st = e.contact_status(c).unwrap();
+        assert_eq!(st.loss_in_permille, Some(0), "{st:?}");
+    }
+    assert_eq!(a.stats().fec_repairs_sent, 0);
+    assert_eq!(b.stats().fec_repairs_sent, 0);
+    let _ = now;
+}
+
 #[test]
 fn loss_reports_turn_fec_on_and_repairs_recover_without_retransmission() {
     let (mut a, mut b, ca) = lossy_until_fec();

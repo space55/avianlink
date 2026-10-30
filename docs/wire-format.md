@@ -295,7 +295,9 @@ body = loss_permille:varint
 
 Loss the receiver measured on packets from the sender, in parts per
 thousand. It counts gaps in the packet counter, before any FEC recovery,
-over the most recent ~256 counters. The sender uses it to size FEC
+over the most recent ~256 counters. A jump wider than that (a restarted
+sender skipping its counter reservation) restarts the measurement, and no
+LOSS is sent until it has 32 counters again. The sender uses it to size FEC
 (`reliability.md` §6). It is advisory, and values above 1000 are clamped.
 
 ### 3.6 SYNC

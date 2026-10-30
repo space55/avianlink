@@ -206,6 +206,14 @@ impl Rtt {
 /// Replay window size in packets (`security.md` §6).
 pub(super) const REPLAY_WINDOW: u64 = 512;
 const REPLAY_WORDS: usize = 8;
+/// The loss estimate skips the newest counters, which may still be
+/// reordered…
+const LOSS_YOUNGEST: u64 = 32;
+/// …and looks no further back than this.
+const LOSS_OLDEST: u64 = 287;
+/// Counters in the loss estimate's span. A jump that skips more than this
+/// leaves no evidence in the span, only the gap.
+const LOSS_SPAN: u64 = LOSS_OLDEST - LOSS_YOUNGEST + 1;
 
 /// Highest accepted counter plus a 512-packet bitmap below it. Bit `k` set:
 /// counter `high - k` was accepted.
@@ -213,6 +221,10 @@ const REPLAY_WORDS: usize = 8;
 pub(super) struct Replay {
     high: Option<u64>,
     bits: [u64; REPLAY_WORDS],
+    /// First counter of the current run of evidence: the first one marked,
+    /// or the one after a jump wider than [`LOSS_SPAN`]. The loss estimate
+    /// counts nothing older (desktop AR-016).
+    since: u64,
 }
 
 impl Replay {
@@ -221,6 +233,7 @@ impl Replay {
         Self {
             high: floor,
             bits: [u64::MAX; REPLAY_WORDS],
+            since: floor.unwrap_or(0),
         }
     }
 
@@ -248,15 +261,22 @@ impl Replay {
     }
 
     /// Fraction of counters missing among those aged 32..288 below the
-    /// highest, in permille; `None` until 32 such counters exist.
+    /// highest, in permille; `None` until 32 such counters exist since the
+    /// run began.
+    ///
+    /// A peer's counter jumps by up to `counter_reservation` when it
+    /// restarts (`security.md` §4), and the skipped counters were never
+    /// sent. The receiver cannot tell that from a burst loss, so a jump
+    /// wider than the span starts a new run, and the estimate is `None`
+    /// until it has evidence again, rather than 1000 ‰.
     pub(super) fn loss_permille(&self) -> Option<u64> {
         let high = self.high?;
-        let last = high.min(287);
-        if last < 63 {
+        let last = high.saturating_sub(self.since).min(LOSS_OLDEST);
+        if last < LOSS_YOUNGEST.saturating_mul(2).saturating_sub(1) {
             return None;
         }
         let (mut seen, mut total) = (0u64, 0u64);
-        for k in 32..=last {
+        for k in LOSS_YOUNGEST..=last {
             total = total.saturating_add(1);
             let hit = usize::try_from(k / 64)
                 .ok()
@@ -286,6 +306,9 @@ impl Replay {
             }
             prev => {
                 let shift = prev.map_or(REPLAY_WINDOW, |h| counter.saturating_sub(h));
+                if prev.is_none() || shift > LOSS_SPAN {
+                    self.since = counter;
+                }
                 self.shift(shift);
                 self.high = Some(counter);
                 if let Some(w0) = self.bits.first_mut() {
@@ -693,6 +716,42 @@ mod tests {
         let f = Replay::with_floor(Some(1000));
         assert!(!f.fresh(1000) && !f.fresh(999) && f.fresh(1001));
         assert!(Replay::with_floor(None).fresh(0));
+    }
+
+    #[test]
+    fn loss_estimate_restarts_after_a_counter_jump() {
+        let mut r = Replay::default();
+        for c in 0..100 {
+            r.mark(c);
+        }
+        assert_eq!(r.loss_permille(), Some(0));
+        // A restart skips the rest of a 1024-counter reservation.
+        for c in 1124..1150 {
+            r.mark(c);
+            assert_eq!(r.loss_permille(), None, "{c}: the gap is not loss");
+        }
+        for c in 1150..1500 {
+            r.mark(c);
+        }
+        assert_eq!(r.loss_permille(), Some(0));
+        // The first counter seen may be high: nothing before it counts.
+        let mut fresh = Replay::default();
+        for c in 5000..5040 {
+            fresh.mark(c);
+        }
+        assert_eq!(fresh.loss_permille(), None);
+        for c in 5040..5100 {
+            fresh.mark(c);
+        }
+        assert_eq!(fresh.loss_permille(), Some(0));
+        // Real loss, including a burst narrower than the span, still counts.
+        let mut lossy = Replay::default();
+        for c in (0..600).filter(|c| c % 4 != 0) {
+            lossy.mark(c);
+        }
+        assert_eq!(lossy.loss_permille(), Some(250));
+        lossy.mark(800);
+        assert!(lossy.loss_permille().is_some_and(|p| p > 600));
     }
 
     #[test]
