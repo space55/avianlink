@@ -1,6 +1,6 @@
 # systemd unit for the avianlink relay (docs/relay.md §7).
 #
-# Install:
+# Install with deploy/install-relay.sh, or by hand:
 #   cargo install avianlink-udp            # provides avianlink-relay
 #   sudo install -m 0755 ~/.cargo/bin/avianlink-relay /usr/local/bin/
 #   sudo install -m 0644 avianlink-relay.service /etc/systemd/system/

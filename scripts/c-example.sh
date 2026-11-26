@@ -7,6 +7,7 @@ cd "$(dirname "$0")/.."
 cargo build -p avianlink-ffi --release --quiet
 out="target/c-example"
 mkdir -p "$out"
+# shellcheck disable=SC2046 # the Linux-only flags are meant to split into two
 cc -std=c99 -Wall -Wextra -Werror -pedantic \
     -I crates/avianlink-ffi/include \
     crates/avianlink-ffi/examples/c/loopback.c \

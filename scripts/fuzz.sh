@@ -8,6 +8,8 @@ secs="${1:-60}"
 shift || true
 targets=("$@")
 if [ ${#targets[@]} -eq 0 ]; then
+    # One target per line, no spaces; mapfile is missing from macOS bash 3.2.
+    # shellcheck disable=SC2207
     targets=($(cargo +nightly fuzz list))
 fi
 for t in "${targets[@]}"; do

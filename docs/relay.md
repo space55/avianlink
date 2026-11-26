@@ -297,8 +297,10 @@ over it follows these rules instead of `reliability.md` §3:
 
   To run it as a service, `deploy/systemd/` has a hardened unit (state in
   `/var/lib/avianlink-relay`, a dynamic user, UDP only) and an
-  `/etc/default/avianlink-relay` file for the flags above; install steps
-  are at the top of the unit.
+  `/etc/default/avianlink-relay` file for the flags above.
+  `deploy/install-relay.sh` builds the relay and installs, starts or
+  upgrades the service (`--push-service`, `--retention-days`, `--binary`,
+  `--uninstall`, `--dry-run`); run it on the server as yourself.
 - **Push notifications** (optional) wake an offline phone when something
   arrives: `push.md`.
 - **`UdpHost`** with `HostConfig::relay` sends and receives everything

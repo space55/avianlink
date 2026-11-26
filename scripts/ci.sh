@@ -59,4 +59,9 @@ fi
 step "Wireshark dissector (skipped without tshark)"
 scripts/wireshark-check.sh
 
+step "shell scripts (skipped without shellcheck)"
+if command -v shellcheck >/dev/null; then
+    shellcheck deploy/install-relay.sh scripts/*.sh
+fi
+
 step "ok"
