@@ -931,3 +931,93 @@ fn relay_calls_need_a_relay_link() {
         );
     }
 }
+
+#[test]
+fn push_through_the_c_abi() {
+    let mut relay = avianlink_relay::Relay::open(
+        avianlink_relay::RelayConfig {
+            push: true,
+            ..Default::default()
+        },
+        MemoryStorage::new(),
+    )
+    .unwrap();
+    let service = Identity::from_secret_bytes(&[0x50; 32]);
+    let token = [0xde; 32];
+    let (mut blob, mut len) = ([0u8; 512], 0usize);
+    // SAFETY: sized buffers.
+    unsafe {
+        let mut tiny = [0u8; 8];
+        assert_eq!(
+            avl_push_seal(
+                service.public_key().0.as_ptr(),
+                AvlPushProvider::ApnsSandbox as u8,
+                3,
+                token.as_ptr(),
+                token.len(),
+                tiny.as_mut_ptr(),
+                tiny.len(),
+                &mut len
+            ),
+            AvlStatus::ErrBufferTooSmall
+        );
+        assert_eq!(
+            avl_push_seal(
+                service.public_key().0.as_ptr(),
+                AvlPushProvider::ApnsSandbox as u8,
+                3,
+                token.as_ptr(),
+                token.len(),
+                blob.as_mut_ptr(),
+                blob.len(),
+                &mut len
+            ),
+            AvlStatus::Ok
+        );
+    }
+    let blob = &blob[..len];
+    assert_eq!(
+        push::open(&service, blob),
+        Some(push::Registration {
+            provider: push::Provider::ApnsSandbox,
+            app: 3,
+            token: token.to_vec(),
+        })
+    );
+    let a = relay_node(25);
+    let b = relay_node(26);
+    let ab = add_contact(&a, &b.public);
+    add_contact(&b, &a.public);
+    let mut now = 1_793_100_000_000u64;
+    // SAFETY: live engine; sized buffers.
+    unsafe {
+        assert_eq!(
+            avl_relay_set_push(
+                b.engine,
+                [7u8; 16].as_ptr(),
+                blob.as_ptr(),
+                blob.len(),
+                false,
+                now
+            ),
+            AvlStatus::Ok
+        );
+        // Not on a direct-only engine.
+        assert_eq!(
+            avl_relay_set_push(a.engine, null(), blob.as_ptr(), blob.len(), false, now),
+            AvlStatus::ErrInvalidArgument
+        );
+    }
+    relay_session(&b, 2, &mut relay, &mut now);
+    assert_eq!(relay.push_handle_count(), 1);
+    now += 3_600_000;
+    send(&a, &ab, "wake B", now);
+    relay_session(&a, 1, &mut relay, &mut now);
+    let due = relay.poll_push().expect("a push for B");
+    assert_eq!(due.blob, blob);
+    // SAFETY: live engine.
+    now += 3_600_000;
+    unsafe { assert_eq!(avl_relay_clear_push(b.engine, now), AvlStatus::Ok) };
+    relay_session(&b, 2, &mut relay, &mut now);
+    assert_eq!(relay.push_handle_count(), 0);
+}

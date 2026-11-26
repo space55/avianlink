@@ -1,11 +1,12 @@
 //! A and B are never online at the same time; a relay carries everything
 //! (`docs/relay.md` §1).
 
+use avianlink_core::push::PushKind;
 use avianlink_core::{
     Config, ConversationId, Engine, Event, Identity, LinkBudget, LinkConfig, LinkId, MemoryStorage,
     PublicKey, Timestamp,
 };
-use avianlink_relay::{Relay, RelayClient, RelayConfig};
+use avianlink_relay::{PushConfig, PushDue, Relay, RelayClient, RelayConfig};
 use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
@@ -67,15 +68,28 @@ struct World {
     /// Datagrams lost on the way: every `drop_every`-th one, if set.
     drop_every: Option<u64>,
     sent: u64,
+    /// Pushes the relay asked for, and when.
+    pushes: Vec<(u64, PushDue)>,
 }
 
 impl World {
     fn new() -> Self {
+        Self::with(RelayConfig::default())
+    }
+
+    fn with(config: RelayConfig) -> Self {
         Self {
-            relay: Relay::open(RelayConfig::default(), MemoryStorage::new()).unwrap(),
+            relay: Relay::open(config, MemoryStorage::new()).unwrap(),
             now: T0,
             drop_every: None,
             sent: 0,
+            pushes: Vec::new(),
+        }
+    }
+
+    fn collect_pushes(&mut self) {
+        while let Some(p) = self.relay.poll_push() {
+            self.pushes.push((self.now, p));
         }
     }
 
@@ -106,6 +120,7 @@ impl World {
                     node.client.handle(&mut node.engine, &bytes, now);
                 }
             }
+            self.collect_pushes();
             while let Some(ev) = node.engine.poll_event() {
                 if let (true, Event::ContactRequest { public_key, .. }) = (accept_requests, &ev) {
                     node.engine.add_contact(*public_key).unwrap();
@@ -121,6 +136,7 @@ impl World {
     fn wait(&mut self, secs: u64) {
         self.now += secs * 1000;
         self.relay.handle_timeout(Timestamp::from_millis(self.now));
+        self.collect_pushes();
     }
 }
 
@@ -248,4 +264,121 @@ fn a_wiped_relay_costs_only_a_resend() {
     w.wait(3_600);
     w.session(&mut b, 2, 60, false);
     assert_eq!(b.received(), ["first"]);
+}
+
+fn push_config(hellos: bool) -> PushConfig {
+    PushConfig {
+        secret: [0xb0; 16],
+        blob: b"B's sealed token".to_vec(),
+        hellos,
+    }
+}
+
+fn push_world() -> World {
+    World::with(RelayConfig {
+        push: true,
+        ..RelayConfig::default()
+    })
+}
+
+#[test]
+fn a_push_wakes_the_offline_recipient() {
+    let mut w = push_world();
+    w.drop_every = Some(7); // registration and binding survive loss
+    let (mut a, mut b) = (Node::new(1), Node::new(2));
+    let (ab, _) = befriend(&mut a, &mut b);
+    b.client.set_push(Some(push_config(false)));
+    w.session(&mut b, 2, 60, false);
+    assert!(w.pushes.is_empty());
+    w.wait(3_600);
+    a.engine
+        .send_text(ab, "wake up", Timestamp::from_millis(w.now))
+        .unwrap();
+    w.session(&mut a, 1, 60, false);
+    let kinds: Vec<_> = w
+        .pushes
+        .iter()
+        .map(|(_, p)| (p.kind, p.blob.clone()))
+        .collect();
+    assert_eq!(kinds, [(PushKind::Message, b"B's sealed token".to_vec())]);
+    // B, woken, collects it at once.
+    w.session(&mut b, 2, 30, false);
+    assert_eq!(b.received(), ["wake up"]);
+    // A never registered, so nothing ever pushes to A.
+    assert!(w.pushes.iter().all(|(_, p)| p.blob == b"B's sealed token"));
+    // B writes back; A's ACK of it lands in B's mailbox, but an ACK is not
+    // worth waking B for.
+    let ba = b.engine.contacts().next().unwrap().0;
+    b.engine
+        .send_text(ba, "got it", Timestamp::from_millis(w.now))
+        .unwrap();
+    w.session(&mut b, 2, 30, false);
+    w.wait(3_600);
+    let before = w.pushes.len();
+    w.session(&mut a, 1, 60, false);
+    w.wait(3_600);
+    assert_eq!(a.received(), ["got it"]);
+    assert_eq!(w.pushes.len(), before, "{:?}", &w.pushes[before..]);
+}
+
+#[test]
+fn a_contact_request_pushes_only_with_hellos_on() {
+    for hellos in [false, true] {
+        let mut w = push_world();
+        let (mut a, mut b) = (Node::new(1), Node::new(2));
+        b.client.set_push(Some(push_config(hellos)));
+        w.session(&mut b, 2, 30, true);
+        w.wait(3_600);
+        let ab = a.engine.add_contact(b.key()).unwrap();
+        a.engine
+            .send_text(ab, "hi, it's A", Timestamp::from_millis(w.now))
+            .unwrap();
+        w.session(&mut a, 1, 60, false);
+        let kinds: Vec<PushKind> = w.pushes.iter().map(|(_, p)| p.kind).collect();
+        if hellos {
+            assert_eq!(kinds, [PushKind::Hello]);
+        } else {
+            assert!(kinds.is_empty(), "{kinds:?}");
+        }
+        w.session(&mut b, 2, 60, true);
+        assert_eq!(b.received(), ["hi, it's A"]);
+    }
+}
+
+#[test]
+fn turning_push_off_deletes_the_registration() {
+    let mut w = push_world();
+    let (mut a, mut b) = (Node::new(1), Node::new(2));
+    let (ab, _) = befriend(&mut a, &mut b);
+    b.client.set_push(Some(push_config(true)));
+    w.session(&mut b, 2, 30, false);
+    assert_eq!(w.relay.push_handle_count(), 1);
+    b.client.set_push(None);
+    w.session(&mut b, 2, 30, false);
+    assert_eq!(w.relay.push_handle_count(), 0);
+    a.engine
+        .send_text(ab, "quiet", Timestamp::from_millis(w.now))
+        .unwrap();
+    w.session(&mut a, 1, 60, false);
+    assert!(w.pushes.is_empty());
+}
+
+#[test]
+fn a_relay_without_push_leaves_clients_unaffected() {
+    let mut w = World::new();
+    let (mut a, mut b) = (Node::new(1), Node::new(2));
+    let (ab, _) = befriend(&mut a, &mut b);
+    b.client.set_push(Some(push_config(true)));
+    a.engine
+        .send_text(ab, "still works", Timestamp::from_millis(w.now))
+        .unwrap();
+    w.session(&mut a, 1, 60, false);
+    w.session(&mut b, 2, 60, false);
+    assert_eq!(b.received(), ["still works"]);
+    assert_eq!(w.relay.push_handle_count(), 0);
+    assert_eq!(
+        b.client.stats().requests_failed,
+        0,
+        "refused once, not retried"
+    );
 }

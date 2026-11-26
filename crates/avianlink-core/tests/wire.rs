@@ -56,6 +56,35 @@ fn relay_msg() -> impl Strategy<Value = wire::RelayMsg> {
             }),
         (code, prop::collection::vec(any::<[u8; 4]>(), 0..=10))
             .prop_map(|(code, hashes)| RelayMsg::Receipt { code, hashes }),
+        (any::<[u8; 3]>(), any::<[u8; 16]>(), any::<[u8; 8]>())
+            .prop_map(|(tag, proof, handle)| RelayMsg::PushBind { tag, proof, handle }),
+        (any::<[u8; 4]>(), any::<[u8; 8]>())
+            .prop_map(|(hello_hash, detect)| RelayMsg::HelloNote { hello_hash, detect }),
+        any::<[u8; 3]>().prop_map(|tag| RelayMsg::PushNote { tag }),
+    ]
+}
+
+/// The push registrations, which are sent only over IP (`push.md` §4).
+fn ip_relay_msg() -> impl Strategy<Value = wire::RelayMsg> {
+    use wire::RelayMsg;
+    prop_oneof![
+        (
+            any::<[u8; 16]>(),
+            prop::collection::vec(any::<u8>(), 0..=wire::MAX_PUSH_BLOB)
+        )
+            .prop_map(|(secret, blob)| RelayMsg::PushRegister { secret, blob }),
+        (
+            any::<[u8; 32]>(),
+            any::<[u8; 8]>(),
+            any::<bool>(),
+            prop::collection::vec(any::<u8>(), 64)
+        )
+            .prop_map(|(key, handle, on, sig)| RelayMsg::PushBindHello {
+                key,
+                handle,
+                on,
+                sig: sig.try_into().unwrap(),
+            }),
     ]
 }
 
@@ -69,7 +98,17 @@ proptest! {
     }
 
     #[test]
-    fn corrupted_relay_messages_are_rejected(m in relay_msg(), bit in any::<u16>()) {
+    fn push_registrations_round_trip(m in ip_relay_msg()) {
+        let bytes = wire::encode_relay(&m);
+        prop_assert_eq!(wire::parse_relay(&bytes), Ok(m.clone()));
+        prop_assert!(bytes.len() <= 21 + wire::MAX_PUSH_BLOB);
+    }
+
+    #[test]
+    fn corrupted_relay_messages_are_rejected(
+        m in prop_oneof![relay_msg(), ip_relay_msg()],
+        bit in any::<u16>(),
+    ) {
         let mut bytes = wire::encode_relay(&m);
         let i = usize::from(bit) % (bytes.len() * 8);
         bytes[i / 8] ^= 1 << (i % 8);

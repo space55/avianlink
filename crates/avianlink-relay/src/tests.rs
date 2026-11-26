@@ -433,3 +433,320 @@ fn garbage_is_dropped() {
     assert!(drain(&mut r).is_empty());
     assert_eq!(r.stats().dropped, 6);
 }
+
+mod push_tests {
+    use super::*;
+    use avianlink_core::hashes::hello_hint;
+    use avianlink_core::push::{self as p, PushKind};
+    use avianlink_core::wire::PushHandle;
+    use avianlink_core::{Identity, PublicKey};
+    use rand_chacha::rand_core::SeedableRng;
+
+    const SECRET: [u8; 16] = [0x5e; 16];
+    const BLOB: &[u8] = b"sealed registration";
+
+    fn push_relay() -> R {
+        relay(RelayConfig {
+            push: true,
+            ..RelayConfig::default()
+        })
+    }
+
+    fn register(secret: [u8; 16], blob: &[u8]) -> Vec<u8> {
+        encode_relay(&RelayMsg::PushRegister {
+            secret,
+            blob: blob.to_vec(),
+        })
+    }
+
+    impl Mb {
+        fn bind(&mut self, handle: PushHandle) -> Vec<u8> {
+            self.down_k += 1;
+            encode_relay(&RelayMsg::PushBind {
+                tag: self.tag,
+                proof: proof(&self.down, self.down_k).unwrap(),
+                handle,
+            })
+        }
+    }
+
+    /// The uploads in `from`'s session carry a message.
+    fn push_note() -> Vec<u8> {
+        encode_relay(&RelayMsg::PushNote { tag: TAG })
+    }
+
+    /// A message upload: a packet, then its PUSH_NOTE.
+    fn message(r: &mut R, n: u8, at: Timestamp) {
+        r.handle(A, &packet(TAG, n), at);
+        r.handle(A, &push_note(), at);
+    }
+
+    fn pushes(r: &mut R) -> Vec<PushDue> {
+        std::iter::from_fn(|| r.poll_push()).collect()
+    }
+
+    fn reply(r: &mut R) -> (RelayCode, u64) {
+        last_cursor(&drain(r))
+    }
+
+    /// A relay with B's incoming mailbox registered and bound to B's handle.
+    fn bound() -> (R, Mb) {
+        let mut r = push_relay();
+        let mut mb = Mb::new(TAG, 1);
+        r.handle(A, &mb.register(), t(0));
+        drain(&mut r);
+        r.handle(B, &register(SECRET, BLOB), t(0));
+        assert_eq!(reply(&mut r), (RelayCode::Ok, 0), "a new handle");
+        r.handle(B, &mb.bind(p::handle(&SECRET)), t(0));
+        assert_eq!(reply(&mut r).0, RelayCode::Ok);
+        r.handle(A, &mb.open(), t(0));
+        drain(&mut r);
+        (r, mb)
+    }
+
+    #[test]
+    fn a_relay_without_a_push_service_refuses_registration() {
+        let mut r = relay(RelayConfig::default());
+        r.handle(B, &register(SECRET, BLOB), t(0));
+        assert_eq!(reply(&mut r).0, RelayCode::Full);
+        assert_eq!(r.push_handle_count(), 0);
+    }
+
+    #[test]
+    fn acknowledgements_alone_never_push() {
+        let (mut r, _) = bound();
+        for n in 0..5 {
+            r.handle(A, &packet(TAG, n), t(1_000));
+        }
+        r.handle_timeout(t(100_000));
+        assert!(pushes(&mut r).is_empty());
+        // The note covers the uploads it follows…
+        r.handle(A, &push_note(), t(100_000));
+        assert_eq!(pushes(&mut r).len(), 1);
+        // …or, arriving first, the next packet.
+        let (mut r, _) = bound();
+        r.handle(A, &push_note(), t(1_000));
+        assert!(pushes(&mut r).is_empty());
+        r.handle(A, &packet(TAG, 9), t(1_001));
+        assert_eq!(pushes(&mut r).len(), 1);
+        // A note from an address with no upload session is ignored.
+        let (mut r, _) = bound();
+        r.handle(EVE, &packet(TAG, 1), t(1_000));
+        r.handle(EVE, &push_note(), t(1_000));
+        assert!(pushes(&mut r).is_empty());
+    }
+
+    #[test]
+    fn stored_packets_push_once_per_interval() {
+        let (mut r, _) = bound();
+        r.handle(A, &packet(TAG, 1), t(1_000));
+        r.handle(A, &push_note(), t(1_000));
+        let due = pushes(&mut r);
+        assert_eq!(
+            due,
+            [PushDue {
+                handle: p::handle(&SECRET),
+                kind: PushKind::Message,
+                blob: BLOB.to_vec(),
+            }]
+        );
+        // A burst inside the interval is one more push, at its end.
+        for n in 2..50 {
+            message(&mut r, n, t(2_000));
+        }
+        assert!(pushes(&mut r).is_empty());
+        assert_eq!(r.stats().pushes_coalesced, 48);
+        assert_eq!(r.next_timeout(), Some(t(61_000)));
+        r.handle_timeout(t(61_000));
+        assert_eq!(pushes(&mut r).len(), 1);
+        r.handle_timeout(t(200_000));
+        assert!(pushes(&mut r).is_empty(), "nothing new arrived");
+    }
+
+    #[test]
+    fn no_push_while_the_owner_is_fetching() {
+        let (mut r, mut mb) = bound();
+        r.handle(B, &mb.fetch(0), t(1));
+        drain(&mut r);
+        message(&mut r, 1, t(2));
+        assert_eq!(packets(&drain(&mut r)), [packet(TAG, 1)], "forwarded live");
+        assert!(pushes(&mut r).is_empty());
+        // Once the lease lapses, uploads push again.
+        r.handle(A, &mb.open(), t(700_000));
+        message(&mut r, 2, t(700_001));
+        assert_eq!(pushes(&mut r).len(), 1);
+    }
+
+    #[test]
+    fn binding_needs_the_down_proof_and_a_known_handle() {
+        let mut r = push_relay();
+        let mut mb = Mb::new(TAG, 1);
+        r.handle(A, &mb.register(), t(0));
+        r.handle(EVE, &register([9; 16], b"eve's phone"), t(0));
+        drain(&mut r);
+        // Eve has seen the tag, but has no proof: an up proof won't do.
+        let forged = encode_relay(&RelayMsg::PushBind {
+            tag: TAG,
+            proof: proof(&mb.up, 1).unwrap(),
+            handle: p::handle(&[9; 16]),
+        });
+        r.handle(EVE, &forged, t(1));
+        assert_eq!(reply(&mut r).0, RelayCode::BadProof);
+        r.handle(B, &mb.bind(p::handle(&SECRET)), t(1));
+        assert_eq!(reply(&mut r).0, RelayCode::UnknownMailbox, "no such handle");
+        r.handle(A, &mb.open(), t(2));
+        message(&mut r, 1, t(2));
+        assert!(pushes(&mut r).is_empty());
+    }
+
+    #[test]
+    fn handles_survive_restart_and_can_be_deleted() {
+        let (r, _) = bound();
+        let cfg = *r.config();
+        let mut r: R = Relay::open(cfg, r.storage().crash_snapshot()).unwrap();
+        assert_eq!(r.push_handle_count(), 1);
+        r.handle(B, &register(SECRET, BLOB), t(10));
+        assert_eq!(reply(&mut r), (RelayCode::Ok, 1), "it already existed");
+        r.handle(A, &Mb::new(TAG, 1).open(), t(10));
+        drain(&mut r);
+        let mut mb = Mb::new(TAG, 1);
+        mb.up_k = 1;
+        r.handle(A, &mb.open(), t(10));
+        message(&mut r, 1, t(11));
+        assert_eq!(pushes(&mut r).len(), 1, "the binding came back too");
+        // An empty blob deletes the handle and its bindings, durably.
+        r.handle(B, &register(SECRET, &[]), t(12));
+        assert_eq!(reply(&mut r).0, RelayCode::Ok);
+        let mut r: R = Relay::open(cfg, r.storage().crash_snapshot()).unwrap();
+        assert_eq!(r.push_handle_count(), 0);
+        r.handle(A, &mb.open(), t(100_000));
+        message(&mut r, 2, t(100_001));
+        assert!(pushes(&mut r).is_empty());
+    }
+
+    #[test]
+    fn dead_tokens_and_idle_handles_are_forgotten() {
+        let (mut r, _) = bound();
+        r.push_gone(&p::handle(&SECRET));
+        assert_eq!(r.push_handle_count(), 0);
+        let (mut r, _) = bound();
+        let ret = r.config().retention_ms;
+        r.handle_timeout(t(ret));
+        assert_eq!(r.push_handle_count(), 0);
+    }
+
+    fn hello_to(recipient: &PublicKey, sender: u8) -> Vec<u8> {
+        let signed = wire::hello_signed(hello_hint(recipient), &PublicKey([sender; 32]));
+        wire::encode_hello(&signed, &[sender; 12]).to_vec()
+    }
+
+    fn note(hello: &[u8], recipient: &PublicKey) -> Vec<u8> {
+        encode_relay(&RelayMsg::HelloNote {
+            hello_hash: avianlink_core::hashes::receipt_hash(hello),
+            detect: p::detect(recipient),
+        })
+    }
+
+    fn bind_hello(id: &Identity, secret: [u8; 16], on: bool) -> Vec<u8> {
+        let h = p::handle(&secret);
+        encode_relay(&RelayMsg::PushBindHello {
+            key: id.public_key().0,
+            handle: h,
+            on,
+            sig: p::sign_hello_binding(id, &h, on),
+        })
+    }
+
+    /// A relay where `who` registered `secret` and bound its Hellos.
+    fn hello_bound(who: &Identity, secret: [u8; 16], r: &mut R) {
+        r.handle(B, &register(secret, BLOB), t(0));
+        r.handle(B, &bind_hello(who, secret, true), t(0));
+        assert_eq!(reply(r).0, RelayCode::Ok);
+    }
+
+    /// Two identities whose keys share a Hello hint.
+    fn hint_twins() -> (Identity, Identity) {
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(7);
+        let mut seen = std::collections::BTreeMap::new();
+        loop {
+            let id = Identity::generate(&mut rng);
+            let hint = hello_hint(&id.public_key());
+            if let Some(twin) = seen.insert(hint, id) {
+                let id = seen.remove(&hint).unwrap();
+                return (twin, id);
+            }
+        }
+    }
+
+    #[test]
+    fn hello_pushes_reach_only_the_recipient() {
+        let (bob, carol) = hint_twins();
+        let mut r = push_relay();
+        hello_bound(&bob, SECRET, &mut r);
+        hello_bound(&carol, [0xca; 16], &mut r);
+        // A Hello to Carol has Bob's hint too, but its note names Carol.
+        let to_carol = hello_to(&carol.public_key(), 1);
+        r.handle(A, &to_carol, t(1));
+        r.handle(A, &note(&to_carol, &carol.public_key()), t(1));
+        let due = pushes(&mut r);
+        assert_eq!(due.len(), 1);
+        assert_eq!(
+            (due[0].handle, due[0].kind),
+            (p::handle(&[0xca; 16]), PushKind::Hello)
+        );
+        // The note may come first.
+        let to_bob = hello_to(&bob.public_key(), 2);
+        r.handle(A, &note(&to_bob, &bob.public_key()), t(2));
+        assert!(pushes(&mut r).is_empty());
+        r.handle(A, &to_bob, t(3));
+        assert_eq!(pushes(&mut r)[0].handle, p::handle(&SECRET));
+        // No note (an older sender): no push.
+        let silent = hello_to(&bob.public_key(), 3);
+        r.handle(A, &silent, t(70_000));
+        assert!(pushes(&mut r).is_empty());
+    }
+
+    #[test]
+    fn hello_bindings_need_the_keys_signature() {
+        let (bob, carol) = hint_twins();
+        let mut r = push_relay();
+        r.handle(EVE, &register([9; 16], b"eve's phone"), t(0));
+        drain(&mut r);
+        // Eve binds Bob's key to her handle with her own signature.
+        let h = p::handle(&[9; 16]);
+        let forged = encode_relay(&RelayMsg::PushBindHello {
+            key: bob.public_key().0,
+            handle: h,
+            on: true,
+            sig: p::sign_hello_binding(&carol, &h, true),
+        });
+        r.handle(EVE, &forged, t(1));
+        assert_eq!(reply(&mut r).0, RelayCode::BadProof);
+        let hello = hello_to(&bob.public_key(), 1);
+        r.handle(A, &hello, t(2));
+        r.handle(A, &note(&hello, &bob.public_key()), t(2));
+        assert!(pushes(&mut r).is_empty());
+    }
+
+    #[test]
+    fn hello_pushes_stop_when_unbound_or_while_fetching() {
+        let (bob, _) = hint_twins();
+        let mut r = push_relay();
+        hello_bound(&bob, SECRET, &mut r);
+        let fetch = encode_relay(&RelayMsg::FetchHello {
+            hint: hello_hint(&bob.public_key()),
+            since: 0,
+        });
+        r.handle(B, &fetch, t(1));
+        let hello = hello_to(&bob.public_key(), 1);
+        r.handle(A, &hello, t(2));
+        r.handle(A, &note(&hello, &bob.public_key()), t(2));
+        assert!(pushes(&mut r).is_empty(), "Bob is online");
+        r.handle(B, &bind_hello(&bob, SECRET, false), t(3));
+        assert_eq!(reply(&mut r).0, RelayCode::Ok);
+        let later = hello_to(&bob.public_key(), 2);
+        r.handle(A, &later, t(900_000));
+        r.handle(A, &note(&later, &bob.public_key()), t(900_000));
+        assert!(pushes(&mut r).is_empty(), "unbound");
+    }
+}

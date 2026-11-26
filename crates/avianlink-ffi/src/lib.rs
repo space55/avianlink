@@ -6,12 +6,14 @@ use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use avianlink_core::push;
+use avianlink_core::wire::MAX_PUSH_BLOB;
 use avianlink_core::{
     format_fingerprint, AirtimeModel, Config, ConversationId, Engine, Error, Event, FecMode,
     HelloMode, Identity, LinkBudget, LinkConfig, LinkId, MemoryStorage, PublicKey, Received,
     Storage, Timestamp, Transmit,
 };
-use avianlink_relay::RelayClient;
+use avianlink_relay::{PushConfig, RelayClient};
 use avianlink_udp::{os_rng, FileStorage};
 use rand_chacha::ChaCha20Rng;
 use std::collections::VecDeque;
@@ -1439,6 +1441,134 @@ pub unsafe extern "C" fn avl_relay_caught_up(engine: *mut AvlEngine) -> bool {
 pub unsafe extern "C" fn avl_relay_safe_to_disconnect(engine: *mut AvlEngine) -> bool {
     // SAFETY: forwarded under the same contract.
     unsafe { avl_relay_settled(engine) && avl_relay_caught_up(engine) }
+}
+
+// ---------------------------------------------------------------------
+// Push notifications (docs/push.md)
+
+/// Who delivers a push: the `provider` argument of `avl_push_seal`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AvlPushProvider {
+    /// APNs, production.
+    Apns = 1,
+    /// APNs sandbox (development builds).
+    ApnsSandbox = 2,
+    /// Firebase Cloud Messaging.
+    Fcm = 3,
+}
+
+/// Seals a device token to the push service whose public key is
+/// `service_key` (`push.md` §2). Do it once per token and keep the blob;
+/// pass it to `avl_relay_set_push`. `provider` is an `AvlPushProvider`;
+/// `app` is the app's index in the push service's configuration. Writes at
+/// most 512 bytes; `AVL_STATUS_ERR_BUFFER_TOO_SMALL` with the size needed.
+///
+/// # Safety
+/// `service_key` 32 readable bytes; `token` `token_len` readable bytes;
+/// `buf` `cap` writable bytes; `len_out` writable.
+#[no_mangle]
+pub unsafe extern "C" fn avl_push_seal(
+    service_key: *const u8,
+    provider: u8,
+    app: u8,
+    token: *const u8,
+    token_len: usize,
+    buf: *mut u8,
+    cap: usize,
+    len_out: *mut usize,
+) -> AvlStatus {
+    guard(|| {
+        if service_key.is_null()
+            || token.is_null()
+            || len_out.is_null()
+            || (buf.is_null() && cap > 0)
+            || token_len > push::MAX_TOKEN
+        {
+            return AvlStatus::ErrInvalidArgument;
+        }
+        // SAFETY: caller guarantees 32 and `token_len` readable bytes.
+        let (key, token) = unsafe {
+            (
+                PublicKey(*service_key.cast::<[u8; 32]>()),
+                std::slice::from_raw_parts(token, token_len),
+            )
+        };
+        let reg = push::Registration {
+            provider: push::Provider::from_u8(provider),
+            app,
+            token: token.to_vec(),
+        };
+        let Some(blob) = push::seal(&key, &reg, &mut os_rng()) else {
+            return AvlStatus::ErrInvalidArgument;
+        };
+        // SAFETY: caller guarantees writable `len_out`.
+        unsafe { *len_out = blob.len() };
+        if blob.len() > cap {
+            return AvlStatus::ErrBufferTooSmall;
+        }
+        // SAFETY: caller guarantees `cap` ≥ len writable bytes.
+        unsafe { copy_out(&blob, buf) };
+        AvlStatus::Ok
+    })
+}
+
+/// Turns on push notifications at the relay, or updates them. `secret` is
+/// 16 random bytes the app chooses once and keeps (in the keychain, beside
+/// the identity); `blob` comes from `avl_push_seal`. With `hellos`, contact
+/// requests push too, which lets the relay operator link this registration
+/// to the identity (`push.md` §4.3). Takes effect at once if connected,
+/// else at the next `avl_relay_connect`.
+///
+/// # Safety
+/// `engine` live, with a relay link; `secret` 16 readable bytes; `blob`
+/// `blob_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn avl_relay_set_push(
+    engine: *mut AvlEngine,
+    secret: *const u8,
+    blob: *const u8,
+    blob_len: usize,
+    hellos: bool,
+    now_ms: u64,
+) -> AvlStatus {
+    with_relay(engine, |e| {
+        if secret.is_null() || blob.is_null() || blob_len == 0 || blob_len > MAX_PUSH_BLOB {
+            return AvlStatus::ErrInvalidArgument;
+        }
+        // SAFETY: caller guarantees 16 and `blob_len` readable bytes.
+        let (secret, blob) = unsafe {
+            (
+                *secret.cast::<[u8; 16]>(),
+                std::slice::from_raw_parts(blob, blob_len).to_vec(),
+            )
+        };
+        if let Some(client) = e.relay.as_mut() {
+            client.set_push(Some(PushConfig {
+                secret,
+                blob,
+                hellos,
+            }));
+            client.handle_timeout(&mut e.engine, ts(now_ms));
+        }
+        AvlStatus::Ok
+    })
+}
+
+/// Turns push notifications off: the relay deletes the registration and
+/// its bindings at the next chance.
+///
+/// # Safety
+/// `engine` live, with a relay link.
+#[no_mangle]
+pub unsafe extern "C" fn avl_relay_clear_push(engine: *mut AvlEngine, now_ms: u64) -> AvlStatus {
+    with_relay(engine, |e| {
+        if let Some(client) = e.relay.as_mut() {
+            client.set_push(None);
+            client.handle_timeout(&mut e.engine, ts(now_ms));
+        }
+        AvlStatus::Ok
+    })
 }
 
 /// Maps a `Received` to a status and its outputs.

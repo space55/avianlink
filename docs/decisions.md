@@ -1098,6 +1098,12 @@ identity.
 - **Cost of Hello pushes,** accepted as opt-in: anyone who knows a key can
   recognise Hellos for it at a relay, and the relay operator learns which
   handle belongs to which key.
+- **Pushes only for messages.** The relay can't tell an ACK from a
+  message, and every turn ends with the recipient's ACKs landing in the
+  sender's mailbox, so pushing on every stored packet woke the other phone
+  for nothing after each reply (found in the sample capture). The sender
+  marks upload sessions that carry a message with an 8-byte PUSH_NOTE; the
+  engine reports it per packet (`Transmit::carries_message`).
 - **Visible alerts with `mutable-content`,** not silent pushes, which iOS
   throttles and drops for apps the user has closed.
 - **NOTIFY over UDP,** not HTTPS: the relay stays free of TLS dependencies,

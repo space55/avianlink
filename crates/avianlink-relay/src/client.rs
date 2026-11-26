@@ -11,9 +11,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use avianlink_core::hashes::receipt_hash;
 use avianlink_core::mailbox::EPOCH_MS;
+use avianlink_core::push;
 use avianlink_core::wire::{
-    self, parse_relay, PairTag, ReceiptHash, RelayCode, RelayMsg, RELAY_FETCH, RELAY_FETCH_HELLO,
-    RELAY_OPEN, RELAY_REGISTER,
+    self, encode_relay, parse_relay, PairTag, ReceiptHash, RelayCode, RelayMsg, PUSH_SECRET_LEN,
+    RELAY_FETCH, RELAY_FETCH_HELLO, RELAY_OPEN, RELAY_PUSH_BIND, RELAY_PUSH_BIND_HELLO,
+    RELAY_PUSH_REGISTER, RELAY_REGISTER,
 };
 use avianlink_core::{ConversationId, Engine, LinkId, Received, Storage, Timestamp, Transmit};
 use rand_core::CryptoRng;
@@ -44,6 +46,41 @@ enum Req {
     Open(ConversationId),
     Fetch(ConversationId, u64),
     Hellos,
+    PushRegister,
+    PushBind(ConversationId, u64),
+    PushBindHello(bool),
+}
+
+/// Push notifications for this client (`docs/push.md`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushConfig {
+    /// A random secret the host chose once and keeps with its state; the
+    /// relay names the registration by its hash.
+    pub secret: [u8; PUSH_SECRET_LEN],
+    /// The registration sealed to the push service
+    /// ([`avianlink_core::push::seal`]).
+    pub blob: Vec<u8>,
+    /// Also push for contact requests (Hellos). Lets the relay operator
+    /// link this registration to our key (`push.md` §4.3).
+    pub hellos: bool,
+}
+
+/// Push progress at the relay.
+#[derive(Debug, Default)]
+struct PushState {
+    config: Option<PushConfig>,
+    /// A registration to delete (push was turned off).
+    clear: Option<[u8; PUSH_SECRET_LEN]>,
+    /// PUSH_REGISTER answered OK in this session.
+    registered: bool,
+    /// The relay has no push service; don't retry this session.
+    unsupported: bool,
+    /// Mailboxes (conversation, epoch) bound to our handle.
+    bound: BTreeSet<(ConversationId, u64)>,
+    /// Bindings refused in this session; retried next session.
+    failed: BTreeSet<(ConversationId, u64)>,
+    /// The Hello binding the relay last confirmed.
+    hellos: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -151,6 +188,10 @@ pub struct RelayClient {
     arrived: BTreeSet<ReceiptHash>,
     arrived_order: VecDeque<ReceiptHash>,
     stats: ClientStats,
+    push: PushState,
+    /// Conversations whose uploads carried a message since their last
+    /// PUSH_NOTE, with their outgoing tag.
+    note_due: BTreeMap<ConversationId, PairTag>,
 }
 
 impl RelayClient {
@@ -167,7 +208,36 @@ impl RelayClient {
             arrived: BTreeSet::new(),
             arrived_order: VecDeque::new(),
             stats: ClientStats::default(),
+            push: PushState::default(),
+            note_due: BTreeMap::new(),
         }
+    }
+
+    /// Sets (or with `None`, removes) push notifications. Takes effect at
+    /// once if online, else at the next [`RelayClient::connect`].
+    pub fn set_push(&mut self, config: Option<PushConfig>) {
+        let old = self.push.config.take();
+        match (&old, &config) {
+            (Some(o), Some(n)) if o.secret == n.secret => {
+                if o.blob != n.blob {
+                    self.push.registered = false;
+                }
+            }
+            (Some(o), _) => {
+                self.push.clear = Some(o.secret);
+                self.push.registered = false;
+                self.push.bound.clear();
+                self.push.hellos = None;
+            }
+            (None, _) => self.push.registered = false,
+        }
+        if config
+            .as_ref()
+            .is_some_and(|n| Some(n.secret) == self.push.clear)
+        {
+            self.push.clear = None;
+        }
+        self.push.config = config;
     }
 
     /// The relay link.
@@ -195,6 +265,10 @@ impl RelayClient {
         self.hellos.done = false;
         self.hellos.at_end = false;
         self.hellos.last = None;
+        // Re-register every session: it keeps the handle from expiring.
+        self.push.registered = false;
+        self.push.unsupported = false;
+        self.push.failed.clear();
         engine.nudge(now);
         self.tick(engine, now);
     }
@@ -205,6 +279,7 @@ impl RelayClient {
         self.online = false;
         self.pending.clear();
         self.out.clear();
+        self.note_due.clear();
         for m in self.mailboxes.values_mut() {
             m.session_until = None;
             m.held.clear();
@@ -273,10 +348,18 @@ impl RelayClient {
     ) {
         let bytes = tx.packet.into_vec();
         if bytes.first() == Some(&wire::HELLO_KIND) {
-            // Hellos are filed by hint: no session needed.
+            // Hellos are filed by hint: no session needed. The note lets
+            // the relay push to the recipient (`push.md` §4.3).
+            let note = engine.hello_note(tx.to, &bytes);
             self.out.push_back(bytes);
+            self.out.extend(note);
             self.stats.uploads += 1;
             return;
+        }
+        if tx.carries_message {
+            if let Some((tag, _)) = engine.mailbox_tags(tx.to) {
+                self.note_due.insert(tx.to, tag);
+            }
         }
         let m = self.mailboxes.entry(tx.to).or_default();
         if m.session_until.is_some_and(|t| t > now) {
@@ -307,7 +390,18 @@ impl RelayClient {
 
     /// The next datagram for the relay.
     pub fn poll_transmit(&mut self) -> Option<Vec<u8>> {
-        self.out.pop_front()
+        if let Some(bytes) = self.out.pop_front() {
+            return Some(bytes);
+        }
+        // After a burst of uploads, one PUSH_NOTE per conversation whose
+        // uploads carried a message and are out (`push.md` §4.4).
+        let conv = self.note_due.keys().copied().find(|c| {
+            self.mailboxes
+                .get(c)
+                .is_some_and(|m| m.held.is_empty() && m.session_until.is_some())
+        })?;
+        let tag = self.note_due.remove(&conv)?;
+        Some(encode_relay(&RelayMsg::PushNote { tag }))
     }
 
     /// Advances timers: retries, session refreshes, periodic fetches.
@@ -364,6 +458,29 @@ impl RelayClient {
                 }
             }
             Req::Hellos => vec![engine.hello_fetch(self.hellos.since())],
+            Req::PushRegister => {
+                let (secret, blob) = match (&self.push.config, self.push.clear) {
+                    (_, Some(old)) => (old, Vec::new()),
+                    (Some(c), None) => (c.secret, c.blob.clone()),
+                    (None, None) => return,
+                };
+                vec![encode_relay(&RelayMsg::PushRegister { secret, blob })]
+            }
+            Req::PushBind(conv, epoch) => {
+                let Some(secret) = self.push.config.as_ref().map(|c| c.secret) else {
+                    return;
+                };
+                match engine.mailbox_push_bind(conv, epoch, push::handle(&secret)) {
+                    Ok(m) => vec![m],
+                    Err(_) => return,
+                }
+            }
+            Req::PushBindHello(on) => {
+                let Some(secret) = self.push.config.as_ref().map(|c| c.secret) else {
+                    return;
+                };
+                vec![engine.push_bind_hello(push::handle(&secret), on)]
+            }
         };
         let tries = self.pending.get(&req).map_or(0, |p| p.tries + 1);
         self.pending.insert(
@@ -453,6 +570,18 @@ impl RelayClient {
             self.stats.errors += 1;
         }
         let epoch = engine.mailbox_epoch();
+        if request == RELAY_PUSH_REGISTER {
+            self.on_push_register(code, page.0);
+            return;
+        }
+        if request == RELAY_PUSH_BIND_HELLO {
+            for on in [false, true] {
+                if self.pending.remove(&Req::PushBindHello(on)).is_some() && code == RelayCode::Ok {
+                    self.push.hellos = Some(on);
+                }
+            }
+            return;
+        }
         if request == RELAY_FETCH_HELLO {
             self.pending.remove(&Req::Hellos);
             if Self::read_page(&mut self.hellos, code, page, &mut self.stats, now) {
@@ -502,6 +631,27 @@ impl RelayClient {
                         _ => {}
                     }
                 }
+                RELAY_PUSH_BIND if !outgoing => {
+                    for e in [epoch, epoch + 1] {
+                        if self.pending.remove(&Req::PushBind(conv, e)).is_none() {
+                            continue;
+                        }
+                        match code {
+                            RelayCode::Ok => {
+                                self.push.bound.insert((conv, e));
+                            }
+                            RelayCode::UnknownMailbox => {
+                                // The relay lost our handle (or the
+                                // mailbox): register again, bind next time.
+                                self.push.registered = false;
+                                self.push.failed.insert((conv, e));
+                            }
+                            _ => {
+                                self.push.failed.insert((conv, e));
+                            }
+                        }
+                    }
+                }
                 RELAY_FETCH if !outgoing => {
                     let Some(e) = [epoch, epoch.saturating_sub(1)]
                         .into_iter()
@@ -537,6 +687,62 @@ impl RelayClient {
                 _ => {}
             }
         }
+    }
+
+    fn on_push_register(&mut self, code: RelayCode, existed: u64) {
+        if self.pending.remove(&Req::PushRegister).is_none() {
+            return;
+        }
+        match code {
+            RelayCode::Ok if self.push.clear.is_some() => self.push.clear = None,
+            RelayCode::Ok => {
+                self.push.registered = true;
+                if existed == 0 {
+                    // A new handle at the relay: nothing is bound to it.
+                    self.push.bound.clear();
+                    self.push.hellos = None;
+                }
+            }
+            RelayCode::Full => self.push.unsupported = true,
+            _ => {}
+        }
+    }
+
+    /// Push requests due: deregister, register, then bind.
+    fn push_wants<S: Storage, R: CryptoRng>(
+        &self,
+        engine: &Engine<S, R>,
+        now: Timestamp,
+    ) -> Vec<Req> {
+        let p = &self.push;
+        if p.unsupported {
+            return Vec::new();
+        }
+        if p.clear.is_some() || (p.config.is_some() && !p.registered) {
+            return vec![Req::PushRegister];
+        }
+        let Some(config) = &p.config else {
+            return Vec::new();
+        };
+        let epoch = engine.mailbox_epoch();
+        let near_next = (now.as_millis() % EPOCH_MS) + EPOCH_SLACK_MS >= EPOCH_MS;
+        let mut wants = Vec::new();
+        for (conv, m) in &self.mailboxes {
+            for e in [epoch, epoch + 1] {
+                let key = (*conv, e);
+                if (e == epoch || near_next)
+                    && m.registered.get(&e) == Some(&true)
+                    && !p.bound.contains(&key)
+                    && !p.failed.contains(&key)
+                {
+                    wants.push(Req::PushBind(*conv, e));
+                }
+            }
+        }
+        if p.hellos != Some(config.hellos) {
+            wants.push(Req::PushBindHello(config.hellos));
+        }
+        wants
     }
 
     fn tick<S: Storage, R: CryptoRng>(&mut self, engine: &mut Engine<S, R>, now: Timestamp) {
@@ -609,6 +815,11 @@ impl RelayClient {
             .is_none_or(|t| t.saturating_add_millis(POLL_MS) <= now);
         if stale && !self.pending.contains_key(&Req::Hellos) {
             self.send(engine, Req::Hellos, now);
+        }
+        for req in self.push_wants(engine, now) {
+            if !self.pending.contains_key(&req) {
+                self.send(engine, req, now);
+            }
         }
     }
 }

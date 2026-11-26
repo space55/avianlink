@@ -55,6 +55,12 @@ impl Identity {
         Zeroizing::new(self.signing.to_bytes())
     }
 
+    /// Ed25519 signature of `msg`.
+    pub(crate) fn sign(&self, msg: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer;
+        self.signing.sign(msg).to_bytes()
+    }
+
     /// The public key: this identity's address.
     pub fn public_key(&self) -> PublicKey {
         PublicKey(self.signing.verifying_key().to_bytes())
@@ -62,7 +68,7 @@ impl Identity {
 
     /// X25519 shared secret with `peer`, or `None` for invalid, weak or
     /// low-order peer keys.
-    fn shared_secret(&self, peer: &PublicKey) -> Option<Zeroizing<[u8; 32]>> {
+    pub(crate) fn shared_secret(&self, peer: &PublicKey) -> Option<Zeroizing<[u8; 32]>> {
         let vk = VerifyingKey::from_bytes(&peer.0).ok()?;
         if vk.is_weak() {
             return None;

@@ -7,14 +7,17 @@
 //!
 //! Part 1: A and B talk directly (10.0.0.1:7000 ↔ 10.0.0.2:7000). B doesn't
 //! know A, so A's first round is a Hello. Part 2: the same two through a
-//! relay (10.0.0.9:7400), never online together.
+//! relay (10.0.0.9:7400), never online together. Part 3: B registers for
+//! push notifications, Hellos included; C (10.0.0.3), a stranger, writes to
+//! B through the relay, which notifies the push service (10.0.0.10:41001).
 
 use std::io::Write;
 
+use avianlink_core::push::{encode_service, AckCode, ServiceMsg};
 use avianlink_core::{
     Config, Engine, Event, Identity, LinkBudget, LinkConfig, LinkId, MemoryStorage, Timestamp,
 };
-use avianlink_relay::{Relay, RelayClient, RelayConfig};
+use avianlink_relay::{Notifier, PushConfig, Relay, RelayClient, RelayConfig};
 use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
@@ -22,7 +25,9 @@ type E = Engine<MemoryStorage, ChaCha20Rng>;
 const T0: u64 = 1_793_000_000_000;
 const A: ([u8; 4], u16) = ([10, 0, 0, 1], 7000);
 const B: ([u8; 4], u16) = ([10, 0, 0, 2], 7000);
+const C: ([u8; 4], u16) = ([10, 0, 0, 3], 7000);
 const R: ([u8; 4], u16) = ([10, 0, 0, 9], 7400);
+const S: ([u8; 4], u16) = ([10, 0, 0, 10], 41_001);
 
 struct Pcap(Vec<u8>);
 
@@ -136,58 +141,99 @@ fn main() {
     }
 
     // Part 2: through a relay, one at a time.
-    let mut relay: Relay<MemoryStorage, u8> =
-        Relay::open(RelayConfig::default(), MemoryStorage::new()).unwrap();
+    let config = RelayConfig {
+        push: true,
+        ..RelayConfig::default()
+    };
+    let mut relay: Relay<MemoryStorage, u8> = Relay::open(config, MemoryStorage::new()).unwrap();
     let (mut a, mut b) = (engine(3, true), engine(4, true));
     let ab = a.add_contact(b.local_key()).unwrap();
     let ba = b.add_contact(a.local_key()).unwrap();
-    let mut session =
-        |e: &mut E, addr: ([u8; 4], u16), id: u8, text: Option<(_, &str)>, now: &mut u64| {
-            let mut c = RelayClient::new(LinkId(0));
-            if let Some((conv, t)) = text {
-                e.send_text(conv, t, ms(*now)).unwrap();
+    let mut notifier = Notifier::new();
+    let mut session = |e: &mut E,
+                       addr: ([u8; 4], u16),
+                       id: u8,
+                       text: Option<(_, &str)>,
+                       push: Option<PushConfig>,
+                       now: &mut u64| {
+        let mut c = RelayClient::new(LinkId(0));
+        c.set_push(push);
+        if let Some((conv, t)) = text {
+            e.send_text(conv, t, ms(*now)).unwrap();
+        }
+        c.connect(e, ms(*now));
+        for _ in 0..80 {
+            e.handle_timeout(ms(*now));
+            c.handle_timeout(e, ms(*now));
+            while let Some(tx) = e.poll_transmit(ms(*now)) {
+                c.upload(e, tx, ms(*now));
             }
-            c.connect(e, ms(*now));
-            for _ in 0..80 {
-                e.handle_timeout(ms(*now));
-                c.handle_timeout(e, ms(*now));
-                while let Some(tx) = e.poll_transmit(ms(*now)) {
-                    c.upload(e, tx, ms(*now));
-                }
-                while let Some(bytes) = c.poll_transmit() {
-                    pcap.udp(*now, addr, R, &bytes);
-                    relay.handle(id, &bytes, ms(*now));
-                }
-                while let Some((_, bytes)) = relay.poll_transmit() {
-                    pcap.udp(*now + 20, R, addr, &bytes);
-                    c.handle(e, &bytes, ms(*now + 20));
-                }
-                while e.poll_event().is_some() {}
-                *now += 250;
-                if e.relay_settled() && c.caught_up() {
-                    break;
+            while let Some(bytes) = c.poll_transmit() {
+                pcap.udp(*now, addr, R, &bytes);
+                relay.handle(id, &bytes, ms(*now));
+            }
+            while let Some((_, bytes)) = relay.poll_transmit() {
+                pcap.udp(*now + 20, R, addr, &bytes);
+                c.handle(e, &bytes, ms(*now + 20));
+            }
+            while let Some(p) = relay.poll_push() {
+                notifier.push(p, 0x5eed_0000 + u64::from(id), ms(*now));
+                while let Some(n) = notifier.poll_transmit() {
+                    pcap.udp(*now + 5, R, S, &n);
+                    let ack = encode_service(&ServiceMsg::Ack {
+                        id: 0x5eed_0000 + u64::from(id),
+                        code: AckCode::Ok,
+                    });
+                    pcap.udp(*now + 60, S, R, &ack);
+                    notifier.handle(&ack);
                 }
             }
-            c.disconnect();
-        };
+            while e.poll_event().is_some() {}
+            *now += 250;
+            if e.relay_settled() && c.caught_up() {
+                break;
+            }
+        }
+        c.disconnect();
+    };
     now += 60_000;
     session(
         &mut a,
         A,
         1,
         Some((ab, "Through the relay: A writes, then goes offline.")),
+        None,
         &mut now,
     );
     now += 3_600_000;
+    let push = PushConfig {
+        secret: [0xb5; 16],
+        blob: b"(sealed to the push service)".to_vec(),
+        hellos: true,
+    };
     session(
         &mut b,
         B,
         2,
         Some((ba, "B collects and replies.")),
+        Some(push.clone()),
         &mut now,
     );
     now += 3_600_000;
-    session(&mut a, A, 1, None, &mut now);
+    session(&mut a, A, 1, None, None, &mut now);
+
+    // Part 3: a stranger's Hello wakes B through the push service.
+    now += 3_600_000;
+    let mut c = engine(5, true);
+    let cb = c.add_contact(b.local_key()).unwrap();
+    session(
+        &mut c,
+        C,
+        3,
+        Some((cb, "C here: we haven't met.")),
+        None,
+        &mut now,
+    );
 
     std::fs::File::create(&path)
         .and_then(|mut f| f.write_all(&pcap.0))

@@ -22,8 +22,8 @@ use crate::wire::{
     AEAD_TAG_LEN, HELLO_HINT_LEN, HELLO_KIND, HELLO_LEN, TIMESTAMP_EPOCH_UNIX_SECS,
 };
 use crate::wire::{
-    encode_relay, put_sync_frame, sync_frame_len, ChainRole, Proof, ReceiptHash, RelayCode,
-    RelayMsg, HELLO_HINT_LEN as HINT_LEN,
+    encode_relay, put_sync_frame, sync_frame_len, ChainRole, Proof, PushHandle, ReceiptHash,
+    RelayCode, RelayMsg, HELLO_HINT_LEN as HINT_LEN,
 };
 use crate::{
     Config, ConversationId, Error, Event, LinkConfig, LinkId, MessageId, Packet, PublicKey,
@@ -48,6 +48,10 @@ pub struct Transmit {
     pub to: ConversationId,
     /// Encoded packet, no larger than the link's MTU.
     pub packet: Packet,
+    /// The packet carries (part of) a message, not only acknowledgements
+    /// or control frames. A relay client marks such uploads so the
+    /// recipient's phone is pushed only for them (`docs/push.md` §4.4).
+    pub carries_message: bool,
 }
 
 /// What [`Engine::handle_packet`] made of a packet, for hosts that track
@@ -773,6 +777,44 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
     /// Our Hello hint.
     pub fn hello_hint(&self) -> [u8; HINT_LEN] {
         self.hint
+    }
+
+    /// A PUSH_BIND binding `conversation`'s incoming mailbox at `epoch` to
+    /// push `handle` (`docs/push.md` §4.2), consuming one down-chain proof.
+    pub fn mailbox_push_bind(
+        &mut self,
+        conversation: ConversationId,
+        epoch: u64,
+        handle: PushHandle,
+    ) -> Result<Vec<u8>, Error> {
+        let proof = self.next_proof(conversation, ChainRole::Down, epoch)?;
+        let tag = self
+            .contacts
+            .get(&conversation)
+            .map(|c| c.keys.rx_tag)
+            .ok_or(Error::UnknownConversation)?;
+        Ok(encode_relay(&RelayMsg::PushBind { tag, proof, handle }))
+    }
+
+    /// A PUSH_BIND_HELLO, signed by our identity: push `handle` for Hellos
+    /// to us, or with `on` false, stop (`docs/push.md` §4.3).
+    pub fn push_bind_hello(&self, handle: PushHandle, on: bool) -> Vec<u8> {
+        encode_relay(&RelayMsg::PushBindHello {
+            key: self.local.0,
+            handle,
+            on,
+            sig: crate::push::sign_hello_binding(&self.identity, &handle, on),
+        })
+    }
+
+    /// The HELLO_NOTE to upload beside `hello`, a Hello to `conversation`'s
+    /// contact (`docs/push.md` §4.3).
+    pub fn hello_note(&self, conversation: ConversationId, hello: &[u8]) -> Option<Vec<u8>> {
+        let c = self.contacts.get(&conversation)?;
+        Some(encode_relay(&RelayMsg::HelloNote {
+            hello_hash: crate::hash::receipt_hash(hello),
+            detect: crate::push::detect(&c.key),
+        }))
     }
 
     /// The next proof of one of `conversation`'s chains, persisted before
@@ -1890,6 +1932,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
                 )
             }));
         contact.log_sent(counter, now, usize::from(self.config.max_sent_log));
+        let carries_message = !log.frags.is_empty();
         if timers.relay {
             // Track the upload until the relay receipts it.
             if log.ack {
@@ -1919,6 +1962,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             link: link_id,
             to: conv,
             packet: Packet::from_vec(bytes),
+            carries_message,
         })
     }
 
@@ -1952,6 +1996,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             link: link_id,
             to: conv,
             packet: Packet::from_vec(hello.to_vec()),
+            carries_message: false,
         })
     }
 
@@ -1991,6 +2036,7 @@ impl<S: Storage, R: CryptoRng> Engine<S, R> {
             link: link_id,
             to: conv,
             packet: Packet::from_vec(hello.to_vec()),
+            carries_message: false,
         })
     }
 

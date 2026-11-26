@@ -74,10 +74,10 @@ it at a different blob.
 
 ## 4. Protocol
 
-Four more relay message kinds, in the format of `relay.md` §4: byte 0 is
+Five more relay message kinds, in the format of `relay.md` §4: byte 0 is
 the kind, and the 4-byte checksum ends the message. The relay answers the
-first three with a REPLY (`relay.md` §4) naming the request; HELLO_NOTE
-has no answer.
+first three with a REPLY (`relay.md` §4) naming the request; the notes
+have no answer.
 
 | Kind | Name | Body (then `check[4]`) | Size |
 |------|------|------|------|
@@ -85,6 +85,7 @@ has no answer.
 | `0x15` | PUSH_BIND | `tag[3] down_proof[16] handle[8]` | 32 |
 | `0x16` | PUSH_BIND_HELLO | `key[32] handle[8] on:u8 sig[64]` | 110 |
 | `0x17` | HELLO_NOTE | `hello_hash[4] detect[8]` | 17 |
+| `0x1a` | PUSH_NOTE | `tag[3]` | 8 |
 
 **PUSH_REGISTER and PUSH_BIND_HELLO are over 48 bytes.** They are sent
 only by a client that can reach a push provider, which is on IP. Every
@@ -143,9 +144,22 @@ opt-in (`on`), and why notes carry no more than a hash of the key.
 
 ### 4.4 When the relay pushes
 
-- **Messages:** when a packet is stored in a mailbox bound to a handle,
-  unless that mailbox's fetch lease (`relay.md` §4.3) is live: then its
-  owner is online and gets the packet forwarded at once.
+- **Messages:** when an upload session that is marked by a **PUSH_NOTE**
+  stores a packet in a mailbox bound to a handle. Unless that mailbox's
+  fetch lease (`relay.md` §4.3) is live: then its owner is online and gets
+  the packet forwarded at once.
+
+  The relay can't tell a message from an acknowledgement, since both are
+  encrypted, and the recipient's own ACKs land in its mailbox after every
+  turn. Pushing on every stored packet would show a false "New message"
+  for each. So the sender says which uploads carry a message: after a
+  burst of uploads that included one, the client sends PUSH_NOTE with the
+  session's tag (8 bytes, so LoRa senders send it too). It's honoured only
+  from the address holding that upload session, like the uploads
+  themselves. A note covers what the session stored since its last push,
+  or, arriving first, the next packet it stores. ACK-only uploads are never
+  noted. The relay learns which uploads are messages, which their sizes and
+  timing mostly showed anyway.
 - **Hellos:** on a match (§4.3), unless a FETCH_HELLO for that hint came
   from anywhere in the last 10 minutes.
 - **Coalescing:** at most one push per handle per minute. Anything that
@@ -208,8 +222,9 @@ The push service sends no content, only the kind:
   and `hello_note`.
 - **`RelayClient::set_push`** takes the secret, the blob and whether to
   push Hellos. In each session the client sends PUSH_REGISTER, then binds
-  every incoming mailbox not yet bound by this process, and uploads a note
-  with every Hello.
+  every incoming mailbox not yet bound by this process, uploads a
+  HELLO_NOTE with every Hello, and sends a PUSH_NOTE after each burst of
+  uploads that carried a message (`Transmit::carries_message`).
 - **`Relay`** keeps handles and bindings, and queues pushes;
   `poll_push` hands them to the host, and `push_gone` deletes a handle.
 - **`avianlink-relay --push-service HOST:PORT`** sends NOTIFY datagrams and

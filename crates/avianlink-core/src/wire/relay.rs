@@ -41,13 +41,34 @@ pub const RELAY_OPEN: u8 = 0x11;
 pub const RELAY_FETCH: u8 = 0x12;
 /// FETCH_HELLO kind.
 pub const RELAY_FETCH_HELLO: u8 = 0x13;
+/// PUSH_REGISTER kind (`push.md` §4).
+pub const RELAY_PUSH_REGISTER: u8 = 0x14;
+/// PUSH_BIND kind.
+pub const RELAY_PUSH_BIND: u8 = 0x15;
+/// PUSH_BIND_HELLO kind.
+pub const RELAY_PUSH_BIND_HELLO: u8 = 0x16;
+/// HELLO_NOTE kind.
+pub const RELAY_HELLO_NOTE: u8 = 0x17;
 /// REPLY kind.
 pub const RELAY_REPLY: u8 = 0x18;
 /// RECEIPT kind.
 pub const RELAY_RECEIPT: u8 = 0x19;
+/// PUSH_NOTE kind (`push.md` §4.4).
+pub const RELAY_PUSH_NOTE: u8 = 0x1a;
+
+/// Bytes in a push secret (`push.md` §3).
+pub const PUSH_SECRET_LEN: usize = 16;
+/// Bytes in a push handle.
+pub const PUSH_HANDLE_LEN: usize = 8;
+/// Bytes in a HELLO_NOTE's recipient hash.
+pub const PUSH_DETECT_LEN: usize = 8;
+/// Largest sealed push registration.
+pub const MAX_PUSH_BLOB: usize = 512;
 
 /// A chain proof or anchor.
 pub type Proof = [u8; PROOF_LEN];
+/// Names a push registration at a relay.
+pub type PushHandle = [u8; PUSH_HANDLE_LEN];
 /// A receipt's packet hash.
 pub type ReceiptHash = [u8; RECEIPT_HASH_LEN];
 
@@ -143,6 +164,47 @@ pub enum RelayMsg {
         /// only for the span covering its gaps.
         max: u8,
     },
+    /// Create, refresh or (with an empty blob) delete a push handle.
+    PushRegister {
+        /// The secret the handle is derived from.
+        secret: [u8; PUSH_SECRET_LEN],
+        /// The registration sealed to the push service (at most
+        /// [`MAX_PUSH_BLOB`] bytes).
+        blob: Vec<u8>,
+    },
+    /// Bind a mailbox to a push handle.
+    PushBind {
+        /// Routing tag.
+        tag: PairTag,
+        /// Down-chain proof.
+        proof: Proof,
+        /// The handle.
+        handle: PushHandle,
+    },
+    /// Bind (or unbind) Hellos for a key to a push handle.
+    PushBindHello {
+        /// The recipient's public key.
+        key: [u8; 32],
+        /// The handle.
+        handle: PushHandle,
+        /// Bind, or remove the binding.
+        on: bool,
+        /// Ed25519 signature by `key` (`push.md` §4.3).
+        sig: [u8; 64],
+    },
+    /// The packets just uploaded in this upload session carry a message,
+    /// not only acknowledgements: worth a push.
+    PushNote {
+        /// Routing tag of the session.
+        tag: PairTag,
+    },
+    /// Names the recipient of an uploaded Hello, for push.
+    HelloNote {
+        /// The Hello's receipt hash.
+        hello_hash: ReceiptHash,
+        /// Hash of the recipient's key.
+        detect: [u8; PUSH_DETECT_LEN],
+    },
     /// Fetch a page of Hellos for a hint.
     FetchHello {
         /// Recipient hint.
@@ -179,12 +241,13 @@ pub enum RelayMsg {
 
 /// Whether byte 0 belongs to the relay protocol.
 pub fn is_relay_kind(kind: u8) -> bool {
-    (RELAY_REGISTER..=RELAY_RECEIPT).contains(&kind)
+    (RELAY_REGISTER..=RELAY_PUSH_NOTE).contains(&kind)
 }
 
 /// Encodes `msg`, checksum included. Every encoding fits in 48 bytes (a
 /// RECEIPT keeps at most [`MAX_RECEIPT_HASHES`] hashes, a REPLY at most
-/// [`MAX_PAGE`]).
+/// [`MAX_PAGE`]), except PUSH_REGISTER and PUSH_BIND_HELLO, which are sent
+/// only over IP (`push.md` §4). A blob is cut at [`MAX_PUSH_BLOB`].
 pub fn encode_relay(msg: &RelayMsg) -> Vec<u8> {
     let mut v = Vec::with_capacity(48);
     match msg {
@@ -212,6 +275,38 @@ pub fn encode_relay(msg: &RelayMsg) -> Vec<u8> {
             put_varint(&mut v, *since);
             put_varint(&mut v, *release);
             v.push(*max);
+        }
+        RelayMsg::PushRegister { secret, blob } => {
+            v.push(RELAY_PUSH_REGISTER);
+            v.extend_from_slice(secret);
+            v.extend_from_slice(blob.get(..MAX_PUSH_BLOB).unwrap_or(blob));
+        }
+        RelayMsg::PushBind { tag, proof, handle } => {
+            v.push(RELAY_PUSH_BIND);
+            v.extend_from_slice(tag);
+            v.extend_from_slice(proof);
+            v.extend_from_slice(handle);
+        }
+        RelayMsg::PushBindHello {
+            key,
+            handle,
+            on,
+            sig,
+        } => {
+            v.push(RELAY_PUSH_BIND_HELLO);
+            v.extend_from_slice(key);
+            v.extend_from_slice(handle);
+            v.push(u8::from(*on));
+            v.extend_from_slice(sig);
+        }
+        RelayMsg::PushNote { tag } => {
+            v.push(RELAY_PUSH_NOTE);
+            v.extend_from_slice(tag);
+        }
+        RelayMsg::HelloNote { hello_hash, detect } => {
+            v.push(RELAY_HELLO_NOTE);
+            v.extend_from_slice(hello_hash);
+            v.extend_from_slice(detect);
         }
         RelayMsg::FetchHello { hint, since } => {
             v.push(RELAY_FETCH_HELLO);
@@ -284,6 +379,37 @@ pub fn parse_relay(bytes: &[u8]) -> Result<RelayMsg, DecodeError> {
             since: r.varint()?,
             release: r.varint()?,
             max: r.u8()?,
+        },
+        RELAY_PUSH_REGISTER => {
+            let secret = r.array()?;
+            let blob = r.rest();
+            if blob.len() > MAX_PUSH_BLOB {
+                return Err(DecodeError::TooLarge);
+            }
+            RelayMsg::PushRegister {
+                secret,
+                blob: blob.to_vec(),
+            }
+        }
+        RELAY_PUSH_BIND => RelayMsg::PushBind {
+            tag: r.array()?,
+            proof: r.array()?,
+            handle: r.array()?,
+        },
+        RELAY_PUSH_BIND_HELLO => RelayMsg::PushBindHello {
+            key: r.array()?,
+            handle: r.array()?,
+            on: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(DecodeError::TooLarge),
+            },
+            sig: r.array()?,
+        },
+        RELAY_PUSH_NOTE => RelayMsg::PushNote { tag: r.array()? },
+        RELAY_HELLO_NOTE => RelayMsg::HelloNote {
+            hello_hash: r.array()?,
+            detect: r.array()?,
         },
         RELAY_FETCH_HELLO => RelayMsg::FetchHello {
             hint: r.array()?,

@@ -11,7 +11,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 mod client;
-pub use client::{ClientStats, RelayClient};
+mod notify;
+mod push;
+pub use client::{ClientStats, PushConfig, RelayClient};
+pub use notify::{Acked, Notifier, NotifierStats};
+pub use push::PushDue;
 
 use avianlink_core::hashes::receipt_hash;
 use avianlink_core::mailbox;
@@ -47,6 +51,16 @@ pub struct RelayConfig {
     pub requests_per_minute: u32,
     /// Source addresses tracked for rate limiting; the oldest is forgotten.
     pub max_tracked_addresses: u32,
+    /// Whether a push service is configured (`push.md`). Without one,
+    /// push registrations are refused with `FULL`.
+    pub push: bool,
+    /// Most push handles.
+    pub max_push_handles: u32,
+    /// Most mailboxes one push handle may be bound to.
+    pub max_push_bindings: u32,
+    /// Least time between two pushes to one handle; anything in between is
+    /// coalesced into one push at the end.
+    pub push_interval_ms: u64,
 }
 
 impl Default for RelayConfig {
@@ -61,6 +75,10 @@ impl Default for RelayConfig {
             lease_ms: 600_000,
             requests_per_minute: 120,
             max_tracked_addresses: 65_536,
+            push: false,
+            max_push_handles: 1_000_000,
+            max_push_bindings: 1024,
+            push_interval_ms: 60_000,
         }
     }
 }
@@ -77,6 +95,7 @@ impl RelayConfig {
             && usize::from(self.page_packets) <= MAX_PAGE
             && self.requests_per_minute > 0
             && self.max_tracked_addresses > 0
+            && self.push_interval_ms > 0
     }
 }
 
@@ -127,6 +146,12 @@ pub struct RelayStats {
     pub expired: u64,
     /// Storage failures (the triggering upload was refused, not lost).
     pub storage_errors: u64,
+    /// Push handles created or refreshed.
+    pub push_registrations: u64,
+    /// Pushes queued for the push service.
+    pub pushes: u64,
+    /// Pushes folded into a later one by the per-handle interval.
+    pub pushes_coalesced: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -240,11 +265,14 @@ pub struct Relay<S, A> {
     next_id: u64,
     used_bytes: u64,
     sessions: BTreeMap<(A, PairTag), (u64, Timestamp)>,
+    /// Push state of upload sessions (`push.md` §4.4).
+    session_push: BTreeMap<(A, PairTag), push::SessionPush>,
     leases: BTreeMap<u64, (A, Timestamp)>,
     buckets: BTreeMap<A, Bucket>,
     out: VecDeque<(A, Vec<u8>)>,
     now: Timestamp,
     stats: RelayStats,
+    push: push::PushState,
 }
 
 /// A pending storage batch.
@@ -326,11 +354,13 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
             next_id,
             used_bytes: 0,
             sessions: BTreeMap::new(),
+            session_push: BTreeMap::new(),
             leases: BTreeMap::new(),
             buckets: BTreeMap::new(),
             out: VecDeque::new(),
             now: Timestamp::ZERO,
             stats: RelayStats::default(),
+            push: push::PushState::default(),
         };
         for (id, m) in &r.mailboxes {
             r.by_tag.entry(m.tag).or_default().push(*id);
@@ -354,6 +384,7 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
             b.packets.insert(seq, s);
             r.used_bytes += len;
         }
+        r.load_push()?;
         Ok(r)
     }
 
@@ -377,6 +408,7 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
     pub fn handle_timeout(&mut self, now: Timestamp) {
         self.observe(now);
         self.expire();
+        self.push_tick();
     }
 
     /// The next datagram to send, and to whom.
@@ -403,10 +435,10 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
             .values()
             .map(|m| m.active.saturating_add_millis(ret))
             .min();
-        match (oldest_packet, idle) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        [oldest_packet, idle, self.push_next_timeout()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Counters.
@@ -601,12 +633,15 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
         self.used_bytes += len;
         self.stats.stored += 1;
         self.receipt(from, RelayCode::Ok, hash);
+        let mut live = false;
         if let Some(&(to, until)) = self.leases.get(&id) {
             if until > now {
                 self.out.push_back((to, bytes.to_vec()));
                 self.stats.delivered += 1;
+                live = true;
             }
         }
+        self.packet_stored(from, tag, id, live);
     }
 
     fn upload_hello(&mut self, from: A, bytes: &[u8]) {
@@ -658,6 +693,7 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
         self.used_bytes += len;
         self.stats.stored += 1;
         self.receipt(from, RelayCode::Ok, hash);
+        self.hello_stored(&hash);
     }
 
     fn request(&mut self, from: A, msg: RelayMsg) {
@@ -692,6 +728,16 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
                 }
             }
             RelayMsg::FetchHello { hint, since } => self.fetch_hello(from, hint, since),
+            RelayMsg::PushRegister { secret, blob } => self.push_register(from, secret, blob),
+            RelayMsg::PushBind { tag, proof, handle } => self.push_bind(from, tag, proof, handle),
+            RelayMsg::PushBindHello {
+                key,
+                handle,
+                on,
+                sig,
+            } => self.push_bind_hello(from, key, handle, on, sig),
+            RelayMsg::HelloNote { hello_hash, detect } => self.hello_note(hello_hash, detect),
+            RelayMsg::PushNote { tag } => self.push_note(from, tag),
             // Relays don't take replies or receipts.
             RelayMsg::Reply { .. } | RelayMsg::Receipt { .. } => self.stats.dropped += 1,
         }
@@ -847,6 +893,7 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
     }
 
     fn fetch_hello(&mut self, from: A, hint: [u8; HELLO_HINT_LEN], since: u64) {
+        self.hellos_fetched(hint);
         let page = usize::from(self.config.page_packets);
         let key3 = [hint[0], hint[1], 0];
         let Some(b) = self.hellos.get(&hint) else {
@@ -886,6 +933,7 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
                 ));
             }
             if dead(m.active) {
+                self.unbind_mailbox_ops(*id, &mut ops);
                 gone_mailboxes.push(*id);
                 ops.push((key(P_MAILBOX, &[&id.to_be_bytes()]), None));
                 for seq in m.packets.keys() {
@@ -949,8 +997,11 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
                 }
                 self.leases.remove(&id);
             }
+            self.mailbox_gone(id);
         }
         self.sessions.retain(|_, (_, until)| *until > now);
+        let sessions = &self.sessions;
+        self.session_push.retain(|k, _| sessions.contains_key(k));
         self.leases.retain(|_, (_, until)| *until > now);
     }
 }

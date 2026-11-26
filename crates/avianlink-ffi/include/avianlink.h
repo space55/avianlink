@@ -120,6 +120,16 @@ typedef enum AvlHelloMode {
   AVL_HELLO_MODE_UNCONFIRMED_AND_BACKOFF = 2,
 } AvlHelloMode;
 
+// Who delivers a push: the `provider` argument of `avl_push_seal`.
+typedef enum AvlPushProvider {
+  // APNs, production.
+  AVL_PUSH_PROVIDER_APNS = 1,
+  // APNs sandbox (development builds).
+  AVL_PUSH_PROVIDER_APNS_SANDBOX = 2,
+  // Firebase Cloud Messaging.
+  AVL_PUSH_PROVIDER_FCM = 3,
+} AvlPushProvider;
+
 // An engine instance. Not thread-safe: use from one thread at a time.
 typedef struct AvlEngine AvlEngine;
 
@@ -529,6 +539,48 @@ bool avl_relay_caught_up(struct AvlEngine *engine);
 // # Safety
 // `engine` null or live.
 bool avl_relay_safe_to_disconnect(struct AvlEngine *engine);
+
+// Seals a device token to the push service whose public key is
+// `service_key` (`push.md` §2). Do it once per token and keep the blob;
+// pass it to `avl_relay_set_push`. `provider` is an `AvlPushProvider`;
+// `app` is the app's index in the push service's configuration. Writes at
+// most 512 bytes; `AVL_STATUS_ERR_BUFFER_TOO_SMALL` with the size needed.
+//
+// # Safety
+// `service_key` 32 readable bytes; `token` `token_len` readable bytes;
+// `buf` `cap` writable bytes; `len_out` writable.
+enum AvlStatus avl_push_seal(const uint8_t *service_key,
+                             uint8_t provider,
+                             uint8_t app,
+                             const uint8_t *token,
+                             size_t token_len,
+                             uint8_t *buf,
+                             size_t cap,
+                             size_t *len_out);
+
+// Turns on push notifications at the relay, or updates them. `secret` is
+// 16 random bytes the app chooses once and keeps (in the keychain, beside
+// the identity); `blob` comes from `avl_push_seal`. With `hellos`, contact
+// requests push too, which lets the relay operator link this registration
+// to the identity (`push.md` §4.3). Takes effect at once if connected,
+// else at the next `avl_relay_connect`.
+//
+// # Safety
+// `engine` live, with a relay link; `secret` 16 readable bytes; `blob`
+// `blob_len` readable bytes.
+enum AvlStatus avl_relay_set_push(struct AvlEngine *engine,
+                                  const uint8_t *secret,
+                                  const uint8_t *blob,
+                                  size_t blob_len,
+                                  bool hellos,
+                                  uint64_t now_ms);
+
+// Turns push notifications off: the relay deletes the registration and
+// its bindings at the next chance.
+//
+// # Safety
+// `engine` live, with a relay link.
+enum AvlStatus avl_relay_clear_push(struct AvlEngine *engine, uint64_t now_ms);
 
 // Writes the next event. `AVL_STATUS_NONE` when there is none.
 //

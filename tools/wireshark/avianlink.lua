@@ -1,13 +1,14 @@
--- Wireshark dissector for avianlink (docs/wire-format.md, docs/relay.md).
+-- Wireshark dissector for avianlink (docs/wire-format.md, docs/relay.md,
+-- docs/push.md).
 --
 -- Install: copy to your Wireshark personal plugins folder (Help → About
 -- Wireshark → Folders → Personal Lua Plugins), or run
 --   tshark -X lua_script:avianlink.lua -r capture.pcap
 --
 -- avianlink has no fixed port, so traffic is recognised by content:
---   * Hellos (kind 0x02, exactly 47 bytes) and relay messages (kinds
---     0x10–0x13, 0x18, 0x19, whose checksum is verified) are recognised
---     anywhere;
+--   * Hellos (kind 0x02, exactly 47 bytes), relay messages (kinds
+--     0x10–0x1a) and relay ↔ push service messages (0x20, 0x21), whose
+--     checksums are verified, are recognised anywhere;
 --   * data packets (kind 0x01) are encrypted and only start with 0x01,
 --     which is too weak alone: they are decoded on the UDP ports set in
 --     the preferences, with "Decode As…", or in a UDP conversation where a
@@ -80,9 +81,10 @@ local function receipt_hash(raw)
   return sha256("avianlink-receipt-v1" .. raw):sub(1, 4)
 end
 
-local function relay_check(body)
-  return sha256("avianlink-relay-v1" .. body):sub(1, 4)
+local function relay_check(body, label)
+  return sha256((label or "avianlink-relay-v1") .. body):sub(1, 4)
 end
+local PUSH_LABEL = "avianlink-push-v1"
 
 local function fingerprint(key)
   local fp = hex(sha256("avianlink-fingerprint-v1" .. key):sub(1, 10))
@@ -105,8 +107,14 @@ end
 local KINDS = {
   [0x01] = "Data", [0x02] = "Hello",
   [0x10] = "REGISTER", [0x11] = "OPEN", [0x12] = "FETCH", [0x13] = "FETCH_HELLO",
-  [0x18] = "REPLY", [0x19] = "RECEIPT",
+  [0x14] = "PUSH_REGISTER", [0x15] = "PUSH_BIND", [0x16] = "PUSH_BIND_HELLO",
+  [0x17] = "HELLO_NOTE", [0x18] = "REPLY", [0x19] = "RECEIPT", [0x1a] = "PUSH_NOTE",
+  [0x20] = "NOTIFY", [0x21] = "NOTIFY_ACK",
 }
+local ACK_CODES = {
+  [0] = "OK", [1] = "GONE", [2] = "BAD_BLOB", [3] = "RATE_LIMITED", [4] = "FAILED",
+}
+local PUSH_KINDS = { [0] = "message", [1] = "hello" }
 local CODES = {
   [0] = "OK", [1] = "BAD_PROOF", [2] = "UNKNOWN_MAILBOX", [3] = "FULL",
   [4] = "NO_SESSION", [5] = "RATE_LIMITED", [6] = "MORE",
@@ -139,6 +147,18 @@ local F = {
   cursor = ProtoField.uint64("avianlink.relay.cursor", "Cursor"),
   count = ProtoField.uint8("avianlink.relay.count", "Count"),
   hash = ProtoField.bytes("avianlink.relay.hash", "Packet hash"),
+  -- Push
+  secret = ProtoField.bytes("avianlink.push.secret", "Push secret"),
+  blob = ProtoField.bytes("avianlink.push.blob", "Sealed registration"),
+  handle = ProtoField.bytes("avianlink.push.handle", "Push handle"),
+  push_key = ProtoField.bytes("avianlink.push.key", "Recipient key"),
+  push_on = ProtoField.bool("avianlink.push.on", "Bind"),
+  sig = ProtoField.bytes("avianlink.push.sig", "Signature"),
+  hello_hash = ProtoField.bytes("avianlink.push.hello_hash", "Hello hash"),
+  detect = ProtoField.bytes("avianlink.push.detect", "Recipient hash"),
+  notify_id = ProtoField.uint64("avianlink.push.id", "Notify ID", base.HEX),
+  push_kind = ProtoField.uint8("avianlink.push.kind", "What arrived", base.DEC, PUSH_KINDS),
+  ack_code = ProtoField.uint8("avianlink.push.code", "Code", base.DEC, ACK_CODES),
   check = ProtoField.bytes("avianlink.relay.check", "Checksum"),
   check_ok = ProtoField.bool("avianlink.relay.check_ok", "Checksum valid"),
 }
@@ -157,14 +177,18 @@ avl.experts = { E.bad_check, E.malformed }
 avl.prefs.ports = Pref.range("UDP ports", "", "UDP ports always decoded as avianlink (e.g. 7000,7400)", 65535)
 
 local function is_relay_kind(k)
-  return (k >= 0x10 and k <= 0x13) or k == 0x18 or k == 0x19
+  return k >= 0x10 and k <= 0x1a
 end
 
-local function relay_check_ok(tvb)
+local function is_service_kind(k)
+  return k == 0x20 or k == 0x21
+end
+
+local function relay_check_ok(tvb, label)
   local n = tvb:len()
   if n < 5 then return false end
   local raw = tvb:raw()
-  return relay_check(raw:sub(1, n - 4)) == raw:sub(n - 3)
+  return relay_check(raw:sub(1, n - 4), label) == raw:sub(n - 3)
 end
 
 local function dissect_data(tvb, tree)
@@ -196,7 +220,7 @@ end
 local function dissect_relay(tvb, tree, kind)
   local n = tvb:len()
   local body = n - 4
-  local ok = relay_check_ok(tvb)
+  local ok = relay_check_ok(tvb, is_service_kind(kind) and PUSH_LABEL or nil)
   local o = 1
   local info = KINDS[kind]
   local function need(k)
@@ -224,6 +248,40 @@ local function dissect_relay(tvb, tree, kind)
   elseif kind == 0x13 and need(2) then
     tree:add(F.hint, tvb(1, 2)); o = 3
     info = string.format("%s hint=%s since=%s", info, hex(tvb(1, 2):raw()), tostring(v(F.since)))
+  elseif kind == 0x14 and need(16) then
+    tree:add(F.secret, tvb(1, 16))
+    local blob = body - 17
+    if blob > 0 then
+      tree:add(F.blob, tvb(17, blob)):append_text(string.format(" (%d bytes)", blob))
+      info = string.format("%s blob=%dB", info, blob)
+    else
+      info = info .. " (delete)"
+    end
+  elseif kind == 0x15 and need(27) then
+    tree:add(F.tag, tvb(1, 3)); tree:add(F.proof, tvb(4, 16)); tree:add(F.handle, tvb(20, 8))
+    info = string.format("%s tag=%s handle=%s", info, hex(tvb(1, 3):raw()), hex(tvb(20, 8):raw()))
+  elseif kind == 0x16 and need(105) then
+    tree:add(F.push_key, tvb(1, 32))
+    local fp = fingerprint(tvb(1, 32):raw())
+    tree:add(F.fingerprint, tvb(1, 32), fp)
+    tree:add(F.handle, tvb(33, 8)); tree:add(F.push_on, tvb(41, 1)); tree:add(F.sig, tvb(42, 64))
+    info = string.format("%s %s %s handle=%s", info, tvb(41, 1):uint() == 1 and "bind" or "unbind",
+      fp, hex(tvb(33, 8):raw()))
+  elseif kind == 0x17 and need(12) then
+    tree:add(F.hello_hash, tvb(1, 4)); tree:add(F.detect, tvb(5, 8))
+    info = string.format("%s hello=%s", info, hex(tvb(1, 4):raw()))
+  elseif kind == 0x1a and need(3) then
+    tree:add(F.tag, tvb(1, 3))
+    info = info .. " tag=" .. hex(tvb(1, 3):raw())
+  elseif kind == 0x20 and need(9) then
+    tree:add(F.notify_id, tvb(1, 8)); tree:add(F.push_kind, tvb(9, 1))
+    local blob = body - 10
+    if blob > 0 then tree:add(F.blob, tvb(10, blob)) end
+    info = string.format("NOTIFY %s id=%s", PUSH_KINDS[tvb(9, 1):uint()] or "?", hex(tvb(1, 8):raw()))
+  elseif kind == 0x21 and need(9) then
+    tree:add(F.notify_id, tvb(1, 8)); tree:add(F.ack_code, tvb(9, 1))
+    local code = tvb(9, 1):uint()
+    info = string.format("NOTIFY_ACK %s id=%s", ACK_CODES[code] or tostring(code), hex(tvb(1, 8):raw()))
   elseif kind == 0x18 and need(5) then
     local req, code = tvb(1, 1):uint(), tvb(2, 1):uint()
     tree:add(F.request, tvb(1, 1)); tree:add(F.code, tvb(2, 1)); tree:add(F.key, tvb(3, 3)); o = 6
@@ -276,7 +334,7 @@ function avl.dissector(tvb, pinfo, root)
     info = dissect_data(tvb, tree)
   elseif kind == 0x02 and n == 47 then
     info = dissect_hello(tvb, tree)
-  elseif is_relay_kind(kind) then
+  elseif is_relay_kind(kind) or is_service_kind(kind) then
     info = dissect_relay(tvb, tree, kind)
   else
     tree:add_proto_expert_info(E.malformed)
@@ -301,6 +359,7 @@ local function heuristic(tvb, pinfo, root)
   if n < 1 then return false end
   local kind = tvb(0, 1):uint()
   local strong = (kind == 0x02 and n == 47) or (is_relay_kind(kind) and relay_check_ok(tvb))
+    or (is_service_kind(kind) and relay_check_ok(tvb, PUSH_LABEL))
   if not strong then return false end
   pinfo.conversation = avl
   avl.dissector(tvb, pinfo, root)

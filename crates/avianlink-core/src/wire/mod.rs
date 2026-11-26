@@ -34,9 +34,11 @@ pub use record::{
     TIMESTAMP_EPOCH_UNIX_SECS,
 };
 pub use relay::{
-    encode_relay, is_relay_kind, parse_relay, ChainRole, Proof, ReceiptHash, RelayCode, RelayMsg,
-    MAX_PAGE, MAX_RECEIPT_HASHES, PROOF_LEN, RECEIPT_HASH_LEN, RELAY_FETCH, RELAY_FETCH_HELLO,
-    RELAY_OPEN, RELAY_RECEIPT, RELAY_REGISTER, RELAY_REPLY,
+    encode_relay, is_relay_kind, parse_relay, ChainRole, Proof, PushHandle, ReceiptHash, RelayCode,
+    RelayMsg, MAX_PAGE, MAX_PUSH_BLOB, MAX_RECEIPT_HASHES, PROOF_LEN, PUSH_DETECT_LEN,
+    PUSH_HANDLE_LEN, PUSH_SECRET_LEN, RECEIPT_HASH_LEN, RELAY_FETCH, RELAY_FETCH_HELLO,
+    RELAY_HELLO_NOTE, RELAY_OPEN, RELAY_PUSH_BIND, RELAY_PUSH_BIND_HELLO, RELAY_PUSH_NOTE,
+    RELAY_PUSH_REGISTER, RELAY_RECEIPT, RELAY_REGISTER, RELAY_REPLY,
 };
 pub use sizing::{frame_space, plan_fragments, FragmentPlan};
 pub use varint::{put_varint, varint_len, MAX_VARINT_LEN};

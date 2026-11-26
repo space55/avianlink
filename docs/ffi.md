@@ -143,6 +143,30 @@ while (!avl_relay_safe_to_disconnect(e)) {
 avl_relay_disconnect(e);
 ```
 
+### 4.1 Push notifications
+
+Optional: the relay wakes the phone through APNs or FCM when something
+arrives (`push.md`).
+
+| Call | Use |
+|---|---|
+| `avl_push_seal(service_key, provider, app, token, len, buf, cap, &len)` | Seal the OS's device token to the push service (`AVL_PUSH_PROVIDER_*`; `app` is the app's index in its configuration). Once per token; keep the result. |
+| `avl_relay_set_push(e, secret, blob, len, hellos, now)` | Turn push on, or update it. `secret`: 16 random bytes chosen once and kept with the identity. `hellos`: also push for contact requests (costs some privacy, `push.md` §4.3). |
+| `avl_relay_clear_push(e, now)` | Turn push off; the relay deletes the registration. |
+
+The client registers and binds at every `avl_relay_connect`, so call
+`avl_relay_set_push` once at startup (and when the OS hands over a new
+token). In the Notification Service Extension, open an engine on the
+app's storage (shared through an App Group), run one relay session (the
+loop above) until `avl_relay_safe_to_disconnect`, and rewrite the alert
+from the events. **Never let the app and the extension run engines on the
+same storage at once:** two engines on one state would reuse packet
+counters (`security.md` §4). Nothing in the library prevents it yet; the
+host must, for example with a lock file both take before opening, the
+extension falling back to a generic alert if the app holds it. A
+push's `avl` field says what arrived (`"m"` messages, `"h"` a contact
+request), only for the alert text; fetch everything either way.
+
 ## 5. Apple packaging
 
 `scripts/build-xcframework.sh` builds `Avianlink.xcframework` with these
