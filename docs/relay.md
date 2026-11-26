@@ -124,7 +124,8 @@ no keys (§5). Sizes below include it.
 | `0x19` | RECEIPT | `code:u8 count:u8 hash[4]×count` (count ≤ 10) | 7–47 |
 
 All fit in 48 bytes while the retention is under 2²⁸ seconds and sequence
-numbers are under 2³⁵.
+numbers are under 2³⁵. Kinds `0x14`–`0x17` are push registrations
+(`push.md` §4).
 
 `key` is the request's tag, or its hint padded with a zero byte. Codes:
 
@@ -290,6 +291,8 @@ over it follows these rules instead of `reliability.md` §3:
   avianlink-relay --dir /var/lib/avianlink-relay [--bind 0.0.0.0:41000] \
                   [--retention-days 7] [--mailbox-quota-kib 1024] [--total-quota-mib 1024]
   ```
+- **Push notifications** (optional) wake an offline phone when something
+  arrives: `push.md`.
 - **`UdpHost`** with `HostConfig::relay` sends and receives everything
   through the relay, and reports `HostEvent::Settled` ("safe to go
   offline").

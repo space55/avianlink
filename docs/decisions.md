@@ -1076,3 +1076,31 @@ identity.
 - **Not covered:** a `counter_reservation` below 256 makes jumps that stay
   inside the span, so they read as a burst until they age out (at most 256
   packets).
+
+## D-052: Push notifications through a publisher-run push service
+
+- **A separate push service.** APNs and FCM only take pushes from the app's
+  publisher, and relays are run by anyone, so relays forward to
+  `avianlink-push`, which the publisher runs (`push.md` §1). The relay sees
+  a blob sealed to the service; the service sees the token but no traffic.
+- **Provider-neutral from the start.** The provider is a byte inside the
+  blob, so Android (FCM) needs no relay or protocol change.
+- **Binding a mailbox needs its down proof,** like FETCH. Otherwise anyone
+  who had seen a tag could subscribe to its owner's arrival times.
+- **Exact Hello pushes.** A 2-byte hint would wake about one in 65,536
+  registered recipients per Hello. The Hello itself stays 47 bytes; the
+  sender uploads a 17-byte HELLO_NOTE beside it with an 8-byte hash of the
+  recipient's key, and the recipient binds its key with an Ed25519
+  signature. Rejected: a longer hint (the Hello has one spare byte, which
+  still collides); hint-only pushes with the app silently discarding false
+  ones (needs Apple's notification-filtering entitlement, and still costs
+  wake-ups); fuzzy message detection (far too heavy).
+- **Cost of Hello pushes,** accepted as opt-in: anyone who knows a key can
+  recognise Hellos for it at a relay, and the relay operator learns which
+  handle belongs to which key.
+- **Visible alerts with `mutable-content`,** not silent pushes, which iOS
+  throttles and drops for apps the user has closed.
+- **NOTIFY over UDP,** not HTTPS: the relay stays free of TLS dependencies,
+  a lost push is only a delay, and the blob is already sealed. The push
+  service rate-limits per token, which bounds what replaying a recorded
+  blob can do.
