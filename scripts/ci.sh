@@ -8,7 +8,16 @@ EMBEDDED_TARGETS=(thumbv7em-none-eabihf aarch64-apple-ios)
 # the workspace don't join the gate.
 LIB_PKGS=(-p avianlink-core -p avianlink-sim -p avianlink-udp -p avianlink-cli -p avianlink-ffi -p avianlink-relay)
 
-step() { printf '\n==> %s\n' "$*"; }
+# Each step reports how long the previous one took.
+started=$(date +%s)
+last=$started
+step() {
+    local now
+    now=$(date +%s)
+    [ "$now" = "$started" ] || printf '    (%ss)\n' "$((now - last))"
+    last=$now
+    printf '\n==> %s\n' "$*"
+}
 
 step "rustup targets"
 installed=$(rustup target list --installed)
@@ -64,4 +73,4 @@ if command -v shellcheck >/dev/null; then
     shellcheck deploy/install-relay.sh scripts/*.sh
 fi
 
-step "ok"
+step "ok ($(( $(date +%s) - started ))s in all)"

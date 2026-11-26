@@ -41,3 +41,13 @@ missing_docs = "warn"
 [workspace.lints.clippy]
 dbg_macro = "deny"
 todo = "deny"
+
+# The simulation tests run hours of simulated traffic, and unoptimised
+# crypto made the suite take minutes. Dependencies are always optimised;
+# the workspace's own code lightly, in test builds only. Debug assertions
+# and overflow checks stay on.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.test]
+opt-level = 1
