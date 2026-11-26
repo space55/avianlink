@@ -301,6 +301,12 @@ over it follows these rules instead of `reliability.md` §3:
   `deploy/install-relay.sh` builds the relay and installs, starts or
   upgrades the service (`--push-service`, `--retention-days`, `--binary`,
   `--uninstall`, `--dry-run`); run it on the server as yourself.
+
+  Or in Docker: the repository's `Dockerfile` builds a minimal image
+  (non-root, state in the `/data` volume, UDP 41000), and
+  `deploy/docker-compose.yml` runs it. Arguments after the image name
+  replace its default flags. Run it with `--init`: the relay has no signal
+  handler, so as PID 1 it would otherwise ignore `docker stop`.
 - **Push notifications** (optional) wake an offline phone when something
   arrives: `push.md`.
 - **`UdpHost`** with `HostConfig::relay` sends and receives everything

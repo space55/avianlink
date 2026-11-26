@@ -1,0 +1,19 @@
+# The avianlink relay with Docker Compose:
+#   docker compose -f deploy/docker-compose.yml up -d
+services:
+  relay:
+    build: ..
+    image: avianlink-relay
+    restart: unless-stopped
+    # The relay has no signal handler of its own; see the Dockerfile.
+    init: true
+    ports:
+      - "41000:41000/udp"
+    volumes:
+      - relay-data:/data
+    # Replaces the image's default flags.
+    command: ["--retention-days", "7"]
+    # command: ["--retention-days", "30", "--push-service", "push.avianlink.dev:41001"]
+
+volumes:
+  relay-data:
