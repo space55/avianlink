@@ -1,0 +1,68 @@
+# systemd unit for the avianlink relay (docs/relay.md §7).
+#
+# Install:
+#   cargo install avianlink-udp            # provides avianlink-relay
+#   sudo install -m 0755 ~/.cargo/bin/avianlink-relay /usr/local/bin/
+#   sudo install -m 0644 avianlink-relay.service /etc/systemd/system/
+#   sudo install -m 0644 avianlink-relay.env /etc/default/avianlink-relay   # optional
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now avianlink-relay
+#
+# State lives in /var/lib/avianlink-relay. Logs: journalctl -u avianlink-relay
+# Open UDP 41000 in the firewall. The relay's DNS name must not be proxied:
+# proxies such as Cloudflare's don't forward UDP.
+
+[Unit]
+Description=avianlink store-and-forward relay
+Documentation=https://github.com/space55/avianlink/blob/main/docs/relay.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Retention, quotas and the push service, as extra flags (see the .env file).
+EnvironmentFile=-/etc/default/avianlink-relay
+# $AVIANLINK_RELAY_ARGS is unbraced on purpose: systemd splits it into
+# separate arguments. ${STATE_DIRECTORY} is /var/lib/avianlink-relay.
+ExecStart=/usr/local/bin/avianlink-relay --dir ${STATE_DIRECTORY} --bind 0.0.0.0:41000 $AVIANLINK_RELAY_ARGS
+# Every packet is committed to disk before it is receipted, so a stop or a
+# crash loses nothing a client was told is stored.
+Restart=on-failure
+RestartSec=2
+
+# A throwaway user owning only the state directory.
+DynamicUser=yes
+StateDirectory=avianlink-relay
+StateDirectoryMode=0700
+UMask=0077
+
+# The relay reads and writes its state directory, and talks UDP. Nothing else.
+# Port 41000 needs no privileges.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+# AF_UNIX for name lookups through systemd-resolved (--push-service HOST).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target
