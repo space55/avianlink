@@ -192,7 +192,11 @@ page rarely does, and the client never got past page one.)
   alive and costs about 290 proofs a day, within an epoch's budget. If both ends happen to be online, traffic flows live. Forwarded
   packets are still stored and fetched normally.
 
-FETCH_HELLO works the same for a hint, without proof and without deletion.
+FETCH_HELLO works the same for a hint, without proof and without deletion,
+and with the same lease: for 10 minutes after a FETCH_HELLO, new Hellos for
+that hint are forwarded to the fetcher's address at once. Without it, a
+first message to someone online waited for their next 5-minute poll (D-053).
+The lease reveals nothing new, since anyone may fetch any hint's Hellos.
 
 ### 4.4 Relay policy
 These are relay-side settings; clients only learn the retention.

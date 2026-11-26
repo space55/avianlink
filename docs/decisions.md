@@ -1110,3 +1110,18 @@ identity.
   a lost push is only a delay, and the blob is already sealed. The push
   service rate-limits per token, which bounds what replaying a recorded
   blob can do.
+
+## D-053: Hellos are forwarded live, like mailbox uploads
+
+- **The problem.** A first message to someone who is online took up to 5
+  minutes to show up as a contact request. Mailbox uploads were forwarded
+  at once to a recipient who had fetched lately (the lease, `relay.md`
+  §4.3), but Hellos only reached them at their next poll. Seen from an
+  iPhone writing to a laptop: the message was stored at the relay at once,
+  and the laptop showed the request minutes later.
+- **The fix.** FETCH_HELLO takes a lease too: for the lease period, new
+  Hellos for the hint go straight to the fetcher. At most 16 fetchers per
+  hint (hints collide); the oldest is dropped, and still gets the Hello at
+  its next fetch.
+- **Privacy:** unchanged. Anyone may fetch any hint's Hellos; the lease
+  only saves them polling.

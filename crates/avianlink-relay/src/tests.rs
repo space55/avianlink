@@ -305,6 +305,35 @@ fn hellos_are_filed_openly_by_hint() {
 }
 
 #[test]
+fn hellos_are_forwarded_to_whoever_fetched_their_hint_lately() {
+    let mut r = relay(RelayConfig::default());
+    let hint = [0xab, 0xcd];
+    let hello = |n: u8| {
+        let mut h = vec![HELLO_KIND, hint[0], hint[1]];
+        h.extend_from_slice(&[n; 44]);
+        h
+    };
+    let fetch = encode_relay(&RelayMsg::FetchHello { hint, since: 0 });
+    r.handle(B, &fetch, t(0));
+    drain(&mut r);
+    // B is online and has asked: a new Hello reaches it at once.
+    r.handle(A, &hello(1), t(1_000));
+    let out = drain(&mut r);
+    assert!(out.iter().any(|(to, b)| *to == B && *b == hello(1)));
+    // Other hints are not forwarded to B.
+    let mut other = hello(2);
+    other[1] = 0x01;
+    r.handle(A, &other, t(2_000));
+    assert!(!drain(&mut r).iter().any(|(to, _)| *to == B));
+    // After the lease, B waits for its next fetch again.
+    let lease = r.config().lease_ms;
+    r.handle(A, &hello(3), t(lease + 1));
+    assert!(!drain(&mut r).iter().any(|(to, _)| *to == B));
+    r.handle_timeout(t(lease + 2));
+    assert!(r.hello_leases.is_empty());
+}
+
+#[test]
 fn fetches_are_paged() {
     let cfg = RelayConfig {
         page_packets: 4,

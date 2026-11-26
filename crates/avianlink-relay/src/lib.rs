@@ -26,6 +26,10 @@ use avianlink_core::wire::{
 };
 use avianlink_core::{Storage, Timestamp};
 
+/// Fetchers of one hint's Hellos forwarded to at once; beyond this the
+/// oldest lease is dropped (it still gets them at its next fetch).
+const MAX_HELLO_LEASES: usize = 16;
+
 /// Longest retention a relay may be configured with.
 pub const MAX_RETENTION_MS: u64 = 30 * 24 * 3_600_000;
 
@@ -268,6 +272,9 @@ pub struct Relay<S, A> {
     /// Push state of upload sessions (`push.md` §4.4).
     session_push: BTreeMap<(A, PairTag), push::SessionPush>,
     leases: BTreeMap<u64, (A, Timestamp)>,
+    /// Who fetched each hint's Hellos lately: new ones are forwarded to
+    /// them at once, as uploads are to a mailbox's fetcher.
+    hello_leases: BTreeMap<[u8; HELLO_HINT_LEN], Vec<(A, Timestamp)>>,
     buckets: BTreeMap<A, Bucket>,
     out: VecDeque<(A, Vec<u8>)>,
     now: Timestamp,
@@ -356,6 +363,7 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
             sessions: BTreeMap::new(),
             session_push: BTreeMap::new(),
             leases: BTreeMap::new(),
+            hello_leases: BTreeMap::new(),
             buckets: BTreeMap::new(),
             out: VecDeque::new(),
             now: Timestamp::ZERO,
@@ -693,6 +701,21 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
         self.used_bytes += len;
         self.stats.stored += 1;
         self.receipt(from, RelayCode::Ok, hash);
+        let now = self.now;
+        let fetchers: Vec<A> = self
+            .hello_leases
+            .get(&hint)
+            .map(|l| {
+                l.iter()
+                    .filter(|(_, until)| *until > now)
+                    .map(|(a, _)| *a)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for to in fetchers {
+            self.out.push_back((to, bytes.to_vec()));
+            self.stats.delivered += 1;
+        }
         self.hello_stored(&hash);
     }
 
@@ -894,6 +917,15 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
 
     fn fetch_hello(&mut self, from: A, hint: [u8; HELLO_HINT_LEN], since: u64) {
         self.hellos_fetched(hint);
+        // Hint collisions mean several recipients may share a lease list;
+        // each gets the hint's Hellos, as fetching would give them anyway.
+        let until = self.now.saturating_add_millis(self.config.lease_ms);
+        let leases = self.hello_leases.entry(hint).or_default();
+        leases.retain(|(a, _)| *a != from);
+        if leases.len() >= MAX_HELLO_LEASES {
+            leases.remove(0);
+        }
+        leases.push((from, until));
         let page = usize::from(self.config.page_packets);
         let key3 = [hint[0], hint[1], 0];
         let Some(b) = self.hellos.get(&hint) else {
@@ -1003,6 +1035,10 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
         let sessions = &self.sessions;
         self.session_push.retain(|k, _| sessions.contains_key(k));
         self.leases.retain(|_, (_, until)| *until > now);
+        self.hello_leases.retain(|_, l| {
+            l.retain(|(_, until)| *until > now);
+            !l.is_empty()
+        });
     }
 }
 
