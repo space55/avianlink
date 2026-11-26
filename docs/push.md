@@ -232,6 +232,7 @@ The push service sends no content, only the kind:
   PUSH_REGISTER with `FULL`, so clients don't spend proofs on bindings that
   can never fire.
 - **C ABI:** `avl_push_seal` and `avl_relay_set_push` (`ffi.md` §4).
-- **`avianlink-push`** (its own repository) is the push service: `init`
-  prints its key, and `run` reads a TOML file naming the APNs key (`.p8`,
-  team and key ID, bundle ID) and FCM service account per app.
+- **`avianlink-push`** (its own repository) is the push service, on UDP
+  41001 by default: `init` prints its key, and `run` reads a TOML file
+  naming the APNs key (`.p8`, team and key ID, bundle ID) and FCM service
+  account per app.
