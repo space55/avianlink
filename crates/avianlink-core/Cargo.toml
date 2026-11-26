@@ -1,11 +1,14 @@
 [package]
 name = "avianlink-core"
 description = "Sans-IO, no_std engine for encrypted text messaging over lossy packet links"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
 license.workspace = true
+repository = "https://github.com/space55/avianlink"
+readme = "../../README.md"
+keywords = ["messaging", "lora", "no-std", "encryption", "sans-io"]
+categories = ["network-programming", "no-std", "cryptography", "embedded"]
 
 [features]
 default = []

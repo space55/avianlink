@@ -18,7 +18,7 @@ publish = false
 license = "MIT"
 
 [workspace.dependencies]
-avianlink-core = { path = "crates/avianlink-core" }
+avianlink-core = { path = "crates/avianlink-core", version = "0.1.0" }
 avianlink-sim = { path = "crates/avianlink-sim" }
 avianlink-udp = { path = "crates/avianlink-udp" }
 avianlink-relay = { path = "crates/avianlink-relay" }
