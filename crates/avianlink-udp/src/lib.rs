@@ -9,6 +9,8 @@ mod host;
 mod identity;
 mod storage;
 
+/// Push notification settings for [`Command::SetPush`] (`docs/push.md`).
+pub use avianlink_relay::PushConfig;
 pub use host::{
     init_node, init_state, now, os_rng, Command, HostConfig, HostError, HostEvent, StatusReport,
     UdpHost, LINK,

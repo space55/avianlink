@@ -221,7 +221,8 @@ The push service sends no content, only the kind:
   `mailbox_push_bind` (consumes a down proof), `push_bind_hello` (signs),
   and `hello_note`.
 - **`RelayClient::set_push`** takes the secret, the blob and whether to
-  push Hellos. In each session the client sends PUSH_REGISTER, then binds
+  push Hellos; `UdpHost` takes the same as `Command::SetPush`, for the
+  life of the host. In each session the client sends PUSH_REGISTER, then binds
   every incoming mailbox not yet bound by this process, uploads a
   HELLO_NOTE with every Hello, and sends a PUSH_NOTE after each burst of
   uploads that carried a message (`Transmit::carries_message`).

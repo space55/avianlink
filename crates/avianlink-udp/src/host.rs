@@ -12,7 +12,7 @@ use avianlink_core::{
     Config, ContactStatus, ConversationId, Engine, Error, Event, Identity, LinkConfig, LinkId,
     LinkStats, PublicKey, Queued, Received, Stats, Timestamp,
 };
-use avianlink_relay::RelayClient;
+use avianlink_relay::{PushConfig, RelayClient};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 
@@ -110,6 +110,11 @@ pub enum Command {
     },
     /// Connectivity may have changed: probe unreachable contacts now.
     Nudge,
+    /// Turn push notifications on (or update them), or with `None` off
+    /// (`docs/push.md`). Only through a relay; ignored otherwise. The
+    /// setting lasts as long as this host, so send it again after opening
+    /// a new one.
+    SetPush(Option<PushConfig>),
     /// Ask for a [`StatusReport`].
     Status,
     /// Stop the loop.
@@ -388,6 +393,13 @@ impl UdpHost {
                 if let Some((_, client)) = self.relay.as_mut() {
                     // "The network is back": fetch everything again.
                     client.connect(&mut self.engine, now());
+                }
+                return;
+            }
+            Command::SetPush(push) => {
+                if let Some((_, client)) = self.relay.as_mut() {
+                    client.set_push(push);
+                    client.handle_timeout(&mut self.engine, now());
                 }
                 return;
             }

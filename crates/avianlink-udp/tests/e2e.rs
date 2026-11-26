@@ -142,6 +142,15 @@ fn lost_state_refuses_the_old_identity() {
 
 /// Runs an in-process relay on a real UDP socket until `stop`.
 fn spawn_relay(stop: Arc<AtomicBool>) -> (SocketAddr, std::thread::JoinHandle<()>) {
+    spawn_relay_with(stop, RelayConfig::default(), Arc::default())
+}
+
+/// [`spawn_relay`] with `config`, publishing its push handle count.
+fn spawn_relay_with(
+    stop: Arc<AtomicBool>,
+    config: RelayConfig,
+    handles: Arc<std::sync::atomic::AtomicUsize>,
+) -> (SocketAddr, std::thread::JoinHandle<()>) {
     let socket = std::net::UdpSocket::bind(localhost()).unwrap();
     socket
         .set_read_timeout(Some(Duration::from_millis(20)))
@@ -149,12 +158,13 @@ fn spawn_relay(stop: Arc<AtomicBool>) -> (SocketAddr, std::thread::JoinHandle<()
     let addr = socket.local_addr().unwrap();
     let t = std::thread::spawn(move || {
         let mut relay: Relay<MemoryStorage, SocketAddr> =
-            Relay::open(RelayConfig::default(), MemoryStorage::new()).unwrap();
+            Relay::open(config, MemoryStorage::new()).unwrap();
         let mut buf = vec![0u8; 65_536];
         while !stop.load(Ordering::Relaxed) {
             if let Ok((n, from)) = socket.recv_from(&mut buf) {
                 relay.handle(from, &buf[..n], avianlink_udp::now());
             }
+            handles.store(relay.push_handle_count(), Ordering::Relaxed);
             while let Some((to, bytes)) = relay.poll_transmit() {
                 let _ = socket.send_to(&bytes, to);
             }
@@ -390,5 +400,55 @@ fn state_for_a_keychain_identity() {
         Err(e) => panic!("wrong error: {e}"),
         Ok(_) => panic!("opened with the wrong identity"),
     }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// `Command::SetPush` registers with the relay, and `None` deletes it.
+#[test]
+fn push_is_set_through_the_host() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let handles = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let config = RelayConfig {
+        push: true,
+        ..RelayConfig::default()
+    };
+    let (relay, relay_thread) = spawn_relay_with(stop.clone(), config, handles.clone());
+    let d = dir("relay-push");
+    init_node(&d).unwrap();
+    let id = avianlink_udp::load_identity(&d).unwrap().unwrap();
+    let cfg = HostConfig {
+        bind: localhost(),
+        link: LinkConfig {
+            mtu: 48,
+            budget: LinkBudget::Unlimited,
+            cost: 1,
+        },
+        engine: Config::default(),
+        relay: Some(relay),
+    };
+    let host = UdpHost::open(&d, id, cfg).unwrap();
+    let (cmd, rx) = mpsc::channel();
+    let (tx, _events) = mpsc::channel();
+    let t = std::thread::spawn(move || host.run(rx, tx).unwrap());
+    let wait_for = |n: usize| {
+        let start = Instant::now();
+        while handles.load(Ordering::Relaxed) != n && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        handles.load(Ordering::Relaxed)
+    };
+    cmd.send(Command::SetPush(Some(avianlink_udp::PushConfig {
+        secret: [3; 16],
+        blob: b"sealed".to_vec(),
+        hellos: false,
+    })))
+    .unwrap();
+    assert_eq!(wait_for(1), 1, "registered");
+    cmd.send(Command::SetPush(None)).unwrap();
+    assert_eq!(wait_for(0), 0, "deleted");
+    cmd.send(Command::Quit).unwrap();
+    t.join().unwrap();
+    stop.store(true, Ordering::Relaxed);
+    relay_thread.join().unwrap();
     let _ = std::fs::remove_dir_all(&d);
 }
