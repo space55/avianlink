@@ -1,11 +1,14 @@
 [package]
 name = "avianlink-relay"
-description = "Identity-less store-and-forward relay for avianlink (docs/relay.md)"
+description = "Identity-less store-and-forward relay for avianlink, with its sans-IO client"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["messaging", "relay", "store-and-forward", "sans-io"]
+categories = ["network-programming"]
 
 [dependencies]
 avianlink-core = { workspace = true, features = ["std"] }

@@ -4,8 +4,11 @@ description = "Terminal demo: two avianlink peers chatting over UDP"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["messaging", "chat", "cli", "encryption"]
+categories = ["command-line-utilities", "network-programming"]
 
 [[bin]]
 name = "avianlink"
