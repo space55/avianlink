@@ -147,7 +147,9 @@ opt-in (`on`), and why notes carry no more than a hash of the key.
 - **Messages:** when an upload session that is marked by a **PUSH_NOTE**
   stores a packet in a mailbox bound to a handle. Unless that mailbox's
   fetch lease (`relay.md` §4.3) is live: then its owner is online and gets
-  the packet forwarded at once.
+  the packet forwarded at once. A client going offline sends LEAVE, which
+  ends its leases, so pushes start the moment it leaves rather than when
+  the lease runs out.
 
   The relay can't tell a message from an acknowledgement, since both are
   encrypted, and the recipient's own ACKs land in its mailbox after every

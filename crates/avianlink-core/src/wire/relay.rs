@@ -55,6 +55,8 @@ pub const RELAY_REPLY: u8 = 0x18;
 pub const RELAY_RECEIPT: u8 = 0x19;
 /// PUSH_NOTE kind (`push.md` §4.4).
 pub const RELAY_PUSH_NOTE: u8 = 0x1a;
+/// LEAVE kind (`relay.md` §4.3).
+pub const RELAY_LEAVE: u8 = 0x1b;
 
 /// Bytes in a push secret (`push.md` §3).
 pub const PUSH_SECRET_LEN: usize = 16;
@@ -198,6 +200,9 @@ pub enum RelayMsg {
         /// Routing tag of the session.
         tag: PairTag,
     },
+    /// This address is going offline: stop forwarding to it (its fetch
+    /// leases end), so pushes start at once.
+    Leave,
     /// Names the recipient of an uploaded Hello, for push.
     HelloNote {
         /// The Hello's receipt hash.
@@ -241,7 +246,7 @@ pub enum RelayMsg {
 
 /// Whether byte 0 belongs to the relay protocol.
 pub fn is_relay_kind(kind: u8) -> bool {
-    (RELAY_REGISTER..=RELAY_PUSH_NOTE).contains(&kind)
+    (RELAY_REGISTER..=RELAY_LEAVE).contains(&kind)
 }
 
 /// Encodes `msg`, checksum included. Every encoding fits in 48 bytes (a
@@ -303,6 +308,7 @@ pub fn encode_relay(msg: &RelayMsg) -> Vec<u8> {
             v.push(RELAY_PUSH_NOTE);
             v.extend_from_slice(tag);
         }
+        RelayMsg::Leave => v.push(RELAY_LEAVE),
         RelayMsg::HelloNote { hello_hash, detect } => {
             v.push(RELAY_HELLO_NOTE);
             v.extend_from_slice(hello_hash);
@@ -407,6 +413,7 @@ pub fn parse_relay(bytes: &[u8]) -> Result<RelayMsg, DecodeError> {
             sig: r.array()?,
         },
         RELAY_PUSH_NOTE => RelayMsg::PushNote { tag: r.array()? },
+        RELAY_LEAVE => RelayMsg::Leave,
         RELAY_HELLO_NOTE => RelayMsg::HelloNote {
             hello_hash: r.array()?,
             detect: r.array()?,

@@ -117,7 +117,7 @@ only moves datagrams and keeps one timer.
 | `avl_relay_poll_transmit(e, now, buf, cap, &len)` | Datagrams to send to the relay's address. Call until `AVL_STATUS_NONE`. |
 | `avl_relay_handle(e, bytes, len, now, conv_out, key_out)` | Every datagram from the relay. Results as `avl_engine_handle_packet`. |
 | `avl_relay_safe_to_disconnect(e)` | True once everything owed is stored at the relay and everything waiting has been read (`avl_relay_settled` and `avl_relay_caught_up` separately). |
-| `avl_relay_disconnect(e)` | Going offline. Nothing is lost; unstored or undelivered messages stay queued. |
+| `avl_relay_disconnect(e)` | Going offline. Nothing is lost; unstored or undelivered messages stay queued. Then drain `avl_relay_poll_transmit` once more and send what it gives: a LEAVE, which makes the relay push instead of forwarding to an app that has gone (`relay.md` §4.3). |
 
 - **Timers are shared.** `avl_engine_next_timeout` and
   `avl_engine_handle_timeout` also cover the relay client.
@@ -141,6 +141,10 @@ while (!avl_relay_safe_to_disconnect(e)) {
     /* drain avl_engine_poll_event(...) */
 }
 avl_relay_disconnect(e);
+/* One last datagram: the LEAVE. On iOS, send it before the app is
+   suspended (a background task covers the moment). */
+while (avl_relay_poll_transmit(e, now(), buf, sizeof buf, &len) == AVL_STATUS_OK)
+    send_to(relay_addr, buf, len);
 ```
 
 ### 4.1 Push notifications

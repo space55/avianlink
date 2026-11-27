@@ -308,6 +308,17 @@ impl UdpHost {
         &self.engine
     }
 
+    /// Tells the relay this host is going: it stops forwarding here and
+    /// pushes instead (`relay.md` §4.3).
+    fn leave_relay(&mut self) {
+        if let Some((addr, client)) = self.relay.as_mut() {
+            client.disconnect();
+            while let Some(bytes) = client.poll_transmit() {
+                let _ = self.socket.send_to(&bytes, *addr);
+            }
+        }
+    }
+
     /// Runs until [`Command::Quit`] or until either channel closes.
     pub fn run(mut self, commands: Receiver<Command>, events: Sender<HostEvent>) -> io::Result<()> {
         let mut buf = vec![0u8; 65_536];
@@ -317,7 +328,10 @@ impl UdpHost {
         loop {
             loop {
                 match commands.try_recv() {
-                    Ok(Command::Quit) | Err(TryRecvError::Disconnected) => return Ok(()),
+                    Ok(Command::Quit) | Err(TryRecvError::Disconnected) => {
+                        self.leave_relay();
+                        return Ok(());
+                    }
                     Ok(cmd) => self.command(cmd, &events),
                     Err(TryRecvError::Empty) => break,
                 }

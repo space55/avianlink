@@ -1021,3 +1021,31 @@ fn push_through_the_c_abi() {
     relay_session(&b, 2, &mut relay, &mut now);
     assert_eq!(relay.push_handle_count(), 0);
 }
+
+#[test]
+fn disconnecting_leaves_a_leave_to_send() {
+    let a = relay_node(27);
+    let now = 1_793_100_000_000u64;
+    let mut buf = [0u8; 512];
+    let mut len = 0usize;
+    // SAFETY: live engine; sized buffers.
+    unsafe {
+        assert_eq!(avl_relay_connect(a.engine, now), AvlStatus::Ok);
+        while avl_relay_poll_transmit(a.engine, now, buf.as_mut_ptr(), buf.len(), &mut len)
+            == AvlStatus::Ok
+        {}
+        assert_eq!(avl_relay_disconnect(a.engine), AvlStatus::Ok);
+        assert_eq!(
+            avl_relay_poll_transmit(a.engine, now, buf.as_mut_ptr(), buf.len(), &mut len),
+            AvlStatus::Ok
+        );
+        assert_eq!(
+            avianlink_core::wire::parse_relay(&buf[..len]),
+            Ok(avianlink_core::wire::RelayMsg::Leave)
+        );
+        assert_eq!(
+            avl_relay_poll_transmit(a.engine, now, buf.as_mut_ptr(), buf.len(), &mut len),
+            AvlStatus::None
+        );
+    }
+}

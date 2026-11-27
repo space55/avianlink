@@ -121,8 +121,14 @@ impl FetchState {
     }
 
     /// Packets to ask for: when re-reading, just the span covering the gaps
-    /// within one page; otherwise a full page (0).
+    /// within one page; otherwise a full page (0). After a re-read that
+    /// recovered nothing, a full page: the next exchange then has a
+    /// different length, so loss that happens to recur with the same
+    /// period as the exchange cannot hit the same packet every time.
     fn max(&self) -> u8 {
+        if self.rereads % 2 == 1 {
+            return 0;
+        }
         let Some((true, &first)) = self.missing.first().map(|f| (self.at_end, f)) else {
             return 0;
         };
@@ -274,12 +280,19 @@ impl RelayClient {
     }
 
     /// The host is going offline: stop polling (nothing is lost; the engine
-    /// keeps what isn't stored or delivered).
+    /// keeps what isn't stored or delivered). Leaves one datagram to send,
+    /// a LEAVE: until the relay has it, it keeps forwarding to this address
+    /// for the rest of its lease instead of pushing (`relay.md` §4.3), so
+    /// drain [`RelayClient::poll_transmit`] once more and send it.
     pub fn disconnect(&mut self) {
+        let was_online = self.online;
         self.online = false;
         self.pending.clear();
         self.out.clear();
         self.note_due.clear();
+        if was_online {
+            self.out.push_back(encode_relay(&RelayMsg::Leave));
+        }
         for m in self.mailboxes.values_mut() {
             m.session_until = None;
             m.held.clear();
@@ -346,6 +359,10 @@ impl RelayClient {
         tx: Transmit,
         now: Timestamp,
     ) {
+        if !self.online {
+            // Offline: the engine sends it again once the host reconnects.
+            return;
+        }
         let bytes = tx.packet.into_vec();
         if bytes.first() == Some(&wire::HELLO_KIND) {
             // Hellos are filed by hint: no session needed. The note lets
@@ -529,12 +546,16 @@ impl RelayClient {
             // Progress: only re-reads that recover nothing count.
             f.rereads = 0;
         }
+        // A re-read of the gaps ends below what was already read, so the
+        // relay says MORE; but the end is already known, so going on to
+        // read forward again would only cost a round trip.
+        let reread = f.at_end && cursor <= before.1;
         match code {
-            RelayCode::More => {
+            RelayCode::More if !reread => {
                 f.at_end = false;
                 true
             }
-            RelayCode::Ok => {
+            RelayCode::Ok | RelayCode::More => {
                 f.at_end = true;
                 f.done = f.missing.is_empty();
                 if f.done {

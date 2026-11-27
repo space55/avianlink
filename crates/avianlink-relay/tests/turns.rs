@@ -129,7 +129,15 @@ impl World {
             }
             self.now += 250;
         }
+        // Going offline leaves a LEAVE to send, as a real host does.
         node.client.disconnect();
+        while let Some(bytes) = node.client.poll_transmit() {
+            if !self.lost() {
+                self.relay
+                    .handle(addr, &bytes, Timestamp::from_millis(self.now));
+            }
+        }
+        self.collect_pushes();
     }
 
     /// Time passes with both offline.
@@ -380,5 +388,26 @@ fn a_relay_without_push_leaves_clients_unaffected() {
         b.client.stats().requests_failed,
         0,
         "refused once, not retried"
+    );
+}
+
+#[test]
+fn a_push_comes_right_after_the_recipient_leaves() {
+    // B leaves the app; A writes a minute later. B's fetch lease would
+    // have run for ten more minutes, forwarding to an app that is no
+    // longer there; leaving ends it, so B is pushed (D-054).
+    let mut w = push_world();
+    let (mut a, mut b) = (Node::new(1), Node::new(2));
+    let (ab, _) = befriend(&mut a, &mut b);
+    b.client.set_push(Some(push_config(false)));
+    w.session(&mut b, 2, 30, false);
+    w.wait(60);
+    a.engine
+        .send_text(ab, "are you there?", Timestamp::from_millis(w.now))
+        .unwrap();
+    w.session(&mut a, 1, 30, false);
+    assert_eq!(
+        w.pushes.iter().map(|(_, p)| p.kind).collect::<Vec<_>>(),
+        [PushKind::Message]
     );
 }

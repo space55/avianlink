@@ -761,6 +761,7 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
             } => self.push_bind_hello(from, key, handle, on, sig),
             RelayMsg::HelloNote { hello_hash, detect } => self.hello_note(hello_hash, detect),
             RelayMsg::PushNote { tag } => self.push_note(from, tag),
+            RelayMsg::Leave => self.leave(from),
             // Relays don't take replies or receipts.
             RelayMsg::Reply { .. } | RelayMsg::Receipt { .. } => self.stats.dropped += 1,
         }
@@ -916,7 +917,6 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
     }
 
     fn fetch_hello(&mut self, from: A, hint: [u8; HELLO_HINT_LEN], since: u64) {
-        self.hellos_fetched(hint);
         // Hint collisions mean several recipients may share a lease list;
         // each gets the hint's Hellos, as fetching would give them anyway.
         let until = self.now.saturating_add_millis(self.config.lease_ms);
@@ -946,6 +946,25 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
         }
         let code = if more { RelayCode::More } else { RelayCode::Ok };
         self.reply_page(from, RELAY_FETCH_HELLO, code, key3, cursor, page);
+    }
+
+    /// LEAVE: `from` is going offline. Nothing is forwarded to it any more,
+    /// so what arrives for it is pushed instead (`relay.md` §4.3).
+    fn leave(&mut self, from: A) {
+        self.leases.retain(|_, (a, _)| *a != from);
+        self.hello_leases.retain(|_, l| {
+            l.retain(|(a, _)| *a != from);
+            !l.is_empty()
+        });
+    }
+
+    /// Whether someone fetched `hint`'s Hellos lately and is still being
+    /// forwarded them.
+    pub(crate) fn hello_lease_live(&self, hint: &[u8; HELLO_HINT_LEN]) -> bool {
+        let now = self.now;
+        self.hello_leases
+            .get(hint)
+            .is_some_and(|l| l.iter().any(|(_, until)| *until > now))
     }
 
     fn expire(&mut self) {

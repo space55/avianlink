@@ -61,6 +61,7 @@ fn relay_msg() -> impl Strategy<Value = wire::RelayMsg> {
         (any::<[u8; 4]>(), any::<[u8; 8]>())
             .prop_map(|(hello_hash, detect)| RelayMsg::HelloNote { hello_hash, detect }),
         any::<[u8; 3]>().prop_map(|tag| RelayMsg::PushNote { tag }),
+        Just(RelayMsg::Leave),
     ]
 }
 

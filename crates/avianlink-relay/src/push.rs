@@ -19,8 +19,6 @@ const P_BINDING: &[u8] = b"b";
 /// Notes held for a Hello that hasn't arrived yet.
 const MAX_NOTES: usize = 65_536;
 const NOTE_MS: u64 = 600_000;
-/// A FETCH_HELLO this recent means the recipient is online.
-const HELLO_ONLINE_MS: u64 = 600_000;
 
 /// A push for the host to hand to the push service.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,8 +96,6 @@ pub(crate) struct PushState {
     /// HELLO_NOTEs waiting for their Hello: hash → recipient hash.
     notes: BTreeMap<ReceiptHash, [u8; PUSH_DETECT_LEN]>,
     notes_order: VecDeque<(ReceiptHash, Timestamp)>,
-    /// When each hint's Hellos were last fetched.
-    hello_fetched: BTreeMap<[u8; 2], Timestamp>,
     out: VecDeque<PushDue>,
 }
 
@@ -323,11 +319,6 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
         }
     }
 
-    /// Someone fetched `hint`'s Hellos: its owner may be online.
-    pub(crate) fn hellos_fetched(&mut self, hint: [u8; 2]) {
-        self.push.hello_fetched.insert(hint, self.now);
-    }
-
     /// A packet from `from` was stored in mailbox `id` through the
     /// session for `tag`. It pushes only if a PUSH_NOTE says the session
     /// carries a message: ACKs alone never wake anyone.
@@ -390,7 +381,6 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
         let Some(handles) = self.push.by_detect.get(detect).cloned() else {
             return false;
         };
-        let now = self.now;
         let mut matched = false;
         for h in handles {
             let Some(hint) = self
@@ -410,12 +400,8 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
                 continue;
             }
             matched = true;
-            let online = self
-                .push
-                .hello_fetched
-                .get(&hint)
-                .is_some_and(|t| t.saturating_add_millis(HELLO_ONLINE_MS) > now);
-            if !online {
+            // Online and fetching: the Hello was forwarded to it at once.
+            if !self.hello_lease_live(&hint) {
                 self.push_due(h, PushKind::Hello);
             }
         }
@@ -500,9 +486,6 @@ impl<S: Storage, A: Ord + Copy> Relay<S, A> {
             self.push.notes_order.pop_front();
             self.push.notes.remove(&hash);
         }
-        self.push
-            .hello_fetched
-            .retain(|_, t| t.saturating_add_millis(HELLO_ONLINE_MS) > now);
     }
 
     /// Storage removals for mailbox `id`'s bindings, as it expires.

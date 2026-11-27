@@ -194,7 +194,12 @@ fn main() {
                 break;
             }
         }
+        // Going offline: the LEAVE that ends this address's leases.
         c.disconnect();
+        while let Some(bytes) = c.poll_transmit() {
+            pcap.udp(*now, addr, R, &bytes);
+            relay.handle(id, &bytes, ms(*now));
+        }
     };
     now += 60_000;
     session(

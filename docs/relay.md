@@ -122,6 +122,7 @@ no keys (§5). Sizes below include it.
 | `0x13` | FETCH_HELLO | `hint[2] since:varint` | 8–12 |
 | `0x18` | REPLY | `request:u8 code:u8 key[3] retention_s:varint cursor:varint n:u8 hash[4]×n` (n ≤ 6) | 14–44 |
 | `0x19` | RECEIPT | `code:u8 count:u8 hash[4]×count` (count ≤ 10) | 7–47 |
+| `0x1b` | LEAVE | (empty) | 5 |
 
 All fit in 48 bytes while the retention is under 2²⁸ seconds and sequence
 numbers are under 2³⁵. Kinds `0x14`–`0x17` and `0x1a` are for push
@@ -191,6 +192,18 @@ page rarely does, and the client never got past page one.)
   once. Online clients re-fetch every 5 minutes, which keeps the lease
   alive and costs about 290 proofs a day, within an epoch's budget. If both ends happen to be online, traffic flows live. Forwarded
   packets are still stored and fetched normally.
+- **LEAVE** ends every lease held by its source address, mailbox and
+  Hello leases alike. A client sends it as it goes offline, so the relay
+  stops forwarding to an app that is no longer there and pushes instead
+  (`push.md` §4.4); without it, a phone that had just left the app got no
+  push for up to 10 minutes (D-054). It has no answer, and is honoured from
+  the address alone: someone spoofing that address can end a lease early,
+  which costs its owner live forwarding until their next fetch (at most 5
+  minutes) and a push they did not need.
+- **Re-reads cost one round trip.** A re-read below what was already read
+  ends with MORE (there is more beyond the gap), and the client does not
+  read forward again for it. After a re-read that recovered nothing, the
+  next asks for a whole page rather than just the gap.
 
 FETCH_HELLO works the same for a hint, without proof and without deletion,
 and with the same lease: for 10 minutes after a FETCH_HELLO, new Hellos for

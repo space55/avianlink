@@ -607,6 +607,45 @@ mod push_tests {
     }
 
     #[test]
+    fn leaving_ends_the_lease_so_what_arrives_is_pushed() {
+        let (mut r, mut mb) = bound();
+        r.handle(B, &mb.fetch(0), t(1));
+        drain(&mut r);
+        // B's app goes to the background and says so.
+        r.handle(B, &encode_relay(&RelayMsg::Leave), t(2));
+        message(&mut r, 1, t(3));
+        assert!(packets(&drain(&mut r)).is_empty(), "nothing forwarded to B");
+        assert_eq!(pushes(&mut r).len(), 1, "B is pushed instead");
+        // A LEAVE from someone else changes nothing for B.
+        let (mut r, mut mb) = bound();
+        r.handle(B, &mb.fetch(0), t(1));
+        drain(&mut r);
+        r.handle(EVE, &encode_relay(&RelayMsg::Leave), t(2));
+        message(&mut r, 1, t(3));
+        assert_eq!(packets(&drain(&mut r)), [packet(TAG, 1)]);
+        assert!(pushes(&mut r).is_empty());
+    }
+
+    #[test]
+    fn leaving_ends_hello_leases_too() {
+        let (bob, _) = hint_twins();
+        let mut r = push_relay();
+        hello_bound(&bob, SECRET, &mut r);
+        let fetch = encode_relay(&RelayMsg::FetchHello {
+            hint: hello_hint(&bob.public_key()),
+            since: 0,
+        });
+        r.handle(B, &fetch, t(1));
+        r.handle(B, &encode_relay(&RelayMsg::Leave), t(2));
+        drain(&mut r);
+        let hello = hello_to(&bob.public_key(), 1);
+        r.handle(A, &hello, t(3));
+        r.handle(A, &note(&hello, &bob.public_key()), t(3));
+        assert!(!drain(&mut r).iter().any(|(to, _)| *to == B));
+        assert_eq!(pushes(&mut r).len(), 1);
+    }
+
+    #[test]
     fn binding_needs_the_down_proof_and_a_known_handle() {
         let mut r = push_relay();
         let mut mb = Mb::new(TAG, 1);

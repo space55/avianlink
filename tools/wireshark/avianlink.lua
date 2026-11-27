@@ -7,7 +7,7 @@
 --
 -- avianlink has no fixed port, so traffic is recognised by content:
 --   * Hellos (kind 0x02, exactly 47 bytes), relay messages (kinds
---     0x10–0x1a) and relay ↔ push service messages (0x20, 0x21), whose
+--     0x10–0x1b) and relay ↔ push service messages (0x20, 0x21), whose
 --     checksums are verified, are recognised anywhere;
 --   * data packets (kind 0x01) are encrypted and only start with 0x01,
 --     which is too weak alone: they are decoded on the UDP ports set in
@@ -108,7 +108,7 @@ local KINDS = {
   [0x01] = "Data", [0x02] = "Hello",
   [0x10] = "REGISTER", [0x11] = "OPEN", [0x12] = "FETCH", [0x13] = "FETCH_HELLO",
   [0x14] = "PUSH_REGISTER", [0x15] = "PUSH_BIND", [0x16] = "PUSH_BIND_HELLO",
-  [0x17] = "HELLO_NOTE", [0x18] = "REPLY", [0x19] = "RECEIPT", [0x1a] = "PUSH_NOTE",
+  [0x17] = "HELLO_NOTE", [0x18] = "REPLY", [0x19] = "RECEIPT", [0x1a] = "PUSH_NOTE", [0x1b] = "LEAVE",
   [0x20] = "NOTIFY", [0x21] = "NOTIFY_ACK",
 }
 local ACK_CODES = {
@@ -177,7 +177,7 @@ avl.experts = { E.bad_check, E.malformed }
 avl.prefs.ports = Pref.range("UDP ports", "", "UDP ports always decoded as avianlink (e.g. 7000,7400)", 65535)
 
 local function is_relay_kind(k)
-  return k >= 0x10 and k <= 0x1a
+  return k >= 0x10 and k <= 0x1b
 end
 
 local function is_service_kind(k)
@@ -273,6 +273,8 @@ local function dissect_relay(tvb, tree, kind)
   elseif kind == 0x1a and need(3) then
     tree:add(F.tag, tvb(1, 3))
     info = info .. " tag=" .. hex(tvb(1, 3):raw())
+  elseif kind == 0x1b then
+    -- No body.
   elseif kind == 0x20 and need(9) then
     tree:add(F.notify_id, tvb(1, 8)); tree:add(F.push_kind, tvb(9, 1))
     local blob = body - 10

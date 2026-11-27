@@ -1125,3 +1125,32 @@ identity.
   its next fetch.
 - **Privacy:** unchanged. Anyone may fetch any hint's Hellos; the lease
   only saves them polling.
+
+## D-054: LEAVE, so a phone that has just left the app is pushed
+
+- **The problem.** The relay does not push while a mailbox's fetch lease
+  is live, since the owner is online and is forwarded the packet at once.
+  But a lease outlived its app: iOS suspends an app without anything
+  reaching the relay, so for up to 10 minutes after leaving the app,
+  messages were forwarded to a socket nobody read, and no push was sent.
+  Exactly when someone puts the phone down is when a push matters most.
+- **The fix.** `RelayClient::disconnect` (and `avl_relay_disconnect`)
+  leaves a LEAVE to send; the relay drops every lease of that address,
+  mailbox and Hello alike. `UdpHost` sends it when it quits. Hello-push
+  suppression now asks the same question ("is a Hello lease live for this
+  hint?") instead of keeping a timer of its own, so LEAVE ends it too.
+- **Authenticated by address only,** like upload sessions. A spoofed LEAVE
+  costs the victim live forwarding until their next fetch and an
+  unneeded push. Rejected: a down-chain proof per mailbox, which would cost
+  a proof and a datagram per contact at every disconnect.
+- **Found on the way: re-reads cost two round trips.** A re-read below the
+  read position ends with MORE, and the client went on to read forward
+  again for nothing. It no longer does, and after a fruitless re-read it
+  asks for a whole page, so the exchange length varies. The test that
+  found this drops exactly every fifth datagram; once the LEAVE shifted
+  its count, the dropped datagram landed on the same packet in every
+  five-datagram re-read, for ever. Real loss is not that regular, but the
+  fix is right regardless. Every rate from 1 in 4 to 1 in 13 now passes;
+  1 in 3 delivers after two extra rounds; strict alternation (1 in 2)
+  still starves a request–reply exchange, which no real link does (the
+  simulator's bursty 35–60% profiles lose nothing).
